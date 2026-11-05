@@ -19,15 +19,19 @@
 
 #include "reone/game/types.h"
 #include "reone/graphics/animation.h"
+#include "reone/graphics/format/bwmreader.h"
 #include "reone/graphics/camera/orthographic.h"
 #include "reone/graphics/camera/perspective.h"
 #include "reone/graphics/lipanimation.h"
 #include "reone/graphics/mesh.h"
 #include "reone/graphics/options.h"
 #include "reone/gui/sceneinitializer.h"
+#include "reone/scene/collision.h"
 #include "reone/scene/graphs.h"
 #include "reone/scene/node/model.h"
 #include "reone/scene/node/modelnode.h"
+#include "reone/scene/node/walkmesh.h"
+#include "reone/system/stream/memoryinput.h"
 
 #include "../fixtures/audio.h"
 #include "../fixtures/graphics.h"
@@ -944,6 +948,113 @@ TEST(ModelSceneNode, pick_model_at) {
     ModelSceneNode *picked1 =
         scene->pickModelAt(graphicsOpt.width / 2, graphicsOpt.height / 2, nullptr);
     EXPECT_EQ(dummy1.get(), picked1);
+}
+
+namespace {
+
+// A walkmesh holding one Nonwalk wall across the plane x = 1, |y| and |z|
+// up to 5: as a room walkmesh (WOK), or as a door or placeable one.
+std::shared_ptr<Walkmesh> loadWallWalkmesh(bool room) {
+    std::string bytes;
+    auto u32 = [&bytes](uint32_t value) { bytes.append(reinterpret_cast<const char *>(&value), 4); };
+    auto f32 = [&bytes](float value) { bytes.append(reinterpret_cast<const char *>(&value), 4); };
+    const uint32_t kData = 136;
+    bytes.append("BWM V1.0");
+    u32(room ? 1 : 0);
+    for (int i = 0; i < 15; ++i) {
+        f32(0.0f); // use positions and position
+    }
+    u32(3);          // vertices
+    u32(kData);      // offset to vertices
+    u32(1);          // faces
+    u32(kData + 36); // offset to faces
+    u32(kData + 48); // offset to materials
+    u32(kData + 52); // offset to normals
+    u32(0);          // offset to planar distances
+    u32(1);          // AABB nodes
+    u32(kData + 64); // offset to AABB nodes
+    u32(0);          // unknown
+    for (int i = 0; i < 6; ++i) {
+        u32(0); // adjacencies, edges and perimeters: none
+    }
+    for (float v : {1.0f, -5.0f, -5.0f, 1.0f, 5.0f, -5.0f, 1.0f, 0.0f, 5.0f}) {
+        f32(v);
+    }
+    u32(0);
+    u32(1);
+    u32(2);
+    u32(7); // Nonwalk, which blocks line of sight
+    f32(-1.0f);
+    f32(0.0f);
+    f32(0.0f);
+    for (float v : {-10.0f, -10.0f, -10.0f, 10.0f, 10.0f, 10.0f}) {
+        f32(v);
+    }
+    u32(0);          // the leaf's face
+    u32(0);          // unknown
+    u32(0);          // most significant plane
+    u32(0xFFFFFFFF); // no children
+    u32(0xFFFFFFFF);
+    auto stream = MemoryInputStream(bytes);
+    auto reader = BwmReader(stream);
+    reader.load();
+    return reader.walkmesh();
+}
+
+// Whether a model straight ahead at x = 2 is picked with a wall walkmesh at
+// x = 1 between it and the camera.
+bool pickModelBehindWall(bool roomWall) {
+    auto graphicsOpt = GraphicsOptions();
+    auto pipelineFactory = MockRenderPipelineFactory();
+    auto graphicsModule = TestGraphicsModule();
+    graphicsModule.init();
+    auto audioModule = TestAudioModule();
+    audioModule.init();
+    auto resourceModule = TestResourceModule();
+    resourceModule.init();
+    auto scene = std::make_unique<SceneGraph>("test", pipelineFactory, graphicsOpt, graphicsModule.services(), audioModule.services(), resourceModule.services());
+    scene->setLineOfSightSurfaces({7});
+
+    auto rootNode = std::make_shared<ModelNode>(0, "root_node", glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), true, nullptr);
+    std::vector<std::shared_ptr<Animation>> animations;
+    auto model = Model("target", 0, rootNode, animations, "", 1.0f);
+    auto target = std::make_shared<ModelSceneNode>(
+        model, ModelUsage::Placeable, *scene, graphicsModule.services(), audioModule.services(), resourceModule.services());
+    scene->addRoot(target);
+    target->setLocalTransform(glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f)));
+    target->setPickable(true);
+    MockUser targetUser;
+    target->setUser(targetUser);
+
+    auto walkmesh = loadWallWalkmesh(roomWall);
+    EXPECT_EQ(roomWall, walkmesh->isAreaWalkmesh());
+    // Built without init(), which would upload a GPU mesh the test does not need.
+    auto wall = std::make_shared<WalkmeshSceneNode>(
+        *walkmesh, *scene, graphicsModule.services(), audioModule.services(), resourceModule.services());
+    MockUser wallUser;
+    wall->setUser(wallUser);
+    scene->addRoot(wall);
+
+    std::shared_ptr<CameraSceneNode> camera = scene->newCamera();
+    camera->setLocalTransform(glm::lookAt(glm::vec3(0.0f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)));
+    camera->setOrthographicProjection(-1.0f, 1.0f, -1.0f, 1.0f, 0.0f, -3.0f);
+    scene->setActiveCamera(camera.get());
+
+    Collision collision;
+    EXPECT_TRUE(scene->testLineOfSight(glm::vec3(0.0f), glm::vec3(2.0f, 0.0f, 0.0f), collision))
+        << "the wall must block line of sight for the test to mean anything";
+
+    return scene->pickModelAt(graphicsOpt.width / 2, graphicsOpt.height / 2, nullptr) == target.get();
+}
+
+} // namespace
+
+TEST(ModelSceneNode, pick_model_at_reaches_an_object_behind_a_room_walkmesh_barrier) {
+    EXPECT_TRUE(pickModelBehindWall(/*roomWall=*/true));
+}
+
+TEST(ModelSceneNode, pick_model_at_does_not_reach_an_object_behind_a_door_or_placeable_walkmesh) {
+    EXPECT_FALSE(pickModelBehindWall(/*roomWall=*/false));
 }
 
 TEST(ModelSceneNode, should_propagate_animation_object_to_creature_attachment) {

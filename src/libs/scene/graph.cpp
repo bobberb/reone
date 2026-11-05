@@ -820,6 +820,10 @@ std::vector<LightSceneNode *> SceneGraph::computeClosestLights(int count, const 
 }
 
 bool SceneGraph::testLineOfSight(const glm::vec3 &origin, const glm::vec3 &dest, Collision &outCollision) const {
+    return testLineOfSight(origin, dest, /*areaWalkmeshes=*/true, outCollision);
+}
+
+bool SceneGraph::testLineOfSight(const glm::vec3 &origin, const glm::vec3 &dest, bool areaWalkmeshes, Collision &outCollision) const {
     auto originToDest = dest - origin;
     auto dir = glm::normalize(originToDest);
     float maxDistance = glm::length(originToDest);
@@ -832,6 +836,9 @@ bool SceneGraph::testLineOfSight(const glm::vec3 &origin, const glm::vec3 &dest,
         glm::vec3 originLocal;
         glm::vec3 dirLocal;
         if (root->walkmesh().isAreaWalkmesh()) {
+            if (!areaWalkmeshes) {
+                continue;
+            }
             if (!root->walkmesh().contains(origin) &&
                 !root->walkmesh().contains(dest)) {
                 continue;
@@ -1063,8 +1070,14 @@ ModelSceneNode *SceneGraph::pickModelAt(int x, int y, IUser *except) const {
         auto objSpaceInvDir = 1.0f / (model->absoluteTransformInverse() * glm::vec4(dir, 0.0f));
         float distance;
         if (model->aabb().raycast(objSpaceStart, objSpaceInvDir, kMaxCollisionDistanceLineOfSight, distance) && distance > 0.0f) {
+            // Only a door or placeable walkmesh stands between the pointer
+            // and an object. A room walkmesh holds floors and invisible
+            // barriers, not the walls the player sees, and a module can put
+            // an object to use behind such a barrier: the Ebon Hawk's ramp in
+            // Davik's hangar (tar_m08aa) stands behind an 8 m Nonwalk wall
+            // the player cannot pass or see over.
             Collision collision;
-            if (testLineOfSight(start, start + distance * dir, collision) && collision.user != model->user()) {
+            if (testLineOfSight(start, start + distance * dir, /*areaWalkmeshes=*/false, collision) && collision.user != model->user()) {
                 continue;
             }
             distances.push_back(std::make_pair(model.get(), distance));
