@@ -1028,13 +1028,14 @@ void Effect::captureSaveFacingScriptArguments(
             }
             break;
         case script::VariableType::Location: {
-            auto location = std::dynamic_pointer_cast<Location>(
-                argument.engineType);
-            if (!location) {
+            if (argument.engineType && !std::dynamic_pointer_cast<Location>(argument.engineType)) {
                 _saveFacingRepresentable = false;
                 break;
             }
-            const auto &position = location->position();
+            auto location = std::static_pointer_cast<Location>(argument.engineType);
+            // Retail's VM never holds an empty location: an unset one is the
+            // zero location, and its position is what the effect keeps.
+            const glm::vec3 position = location ? location->position() : glm::vec3(0.0f);
             for (float value : {position.x, position.y, position.z}) {
                 if (floatIndex < _saveFacingFloats.size()) {
                     setSaveFacingFloat(floatIndex++, value);

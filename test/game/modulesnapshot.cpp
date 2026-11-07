@@ -26,6 +26,7 @@
 #include "reone/game/action/usefeat.h"
 #include "reone/game/action/usetalentonobject.h"
 #include "reone/game/effect.h"
+#include "reone/game/effect/forcepushtargeted.h"
 #include "reone/game/effect/spellimmunity.h"
 #include "reone/game/d20/class.h"
 #include "reone/game/d20/classes.h"
@@ -43,6 +44,7 @@
 #include "reone/game/object/store.h"
 #include "reone/game/object/trigger.h"
 #include "reone/game/object/waypoint.h"
+#include "reone/game/script/routines.h"
 #include "reone/game/script/savedsituation.h"
 #include "reone/resource/format/erfreader.h"
 #include "reone/resource/format/gffreader.h"
@@ -2591,6 +2593,91 @@ TEST_F(SnapshotFixture, creature_records_carry_the_creation_script_flag) {
     ASSERT_TRUE(unspawnedRecord);
     EXPECT_EQ(1, spawnedRecord->getInt("CreatnScrptFird"));
     EXPECT_EQ(0, unspawnedRecord->getInt("CreatnScrptFird"));
+}
+
+TEST_F(SnapshotFixture, force_push_on_an_unset_location_round_trips_as_the_zero_location) {
+    // EffectForcePushTargeted(lUnset, 1) as a script makes it: an unset
+    // location is the zero location, so the pending command can be saved.
+    Routines routines(GameID::KotOR, &game, &engine.services());
+    routines.init();
+    ExecutionContext ctx;
+    auto &routine = routines.get(routines.getIndexByName("EffectForcePushTargeted"));
+    Variable constructed;
+    ASSERT_NO_THROW(constructed = routine.invoke(
+                        {Variable::ofLocation(nullptr), Variable::ofInt(1)}, ctx));
+    auto forcePush = std::dynamic_pointer_cast<Effect>(constructed.engineType);
+    ASSERT_TRUE(forcePush);
+
+    // A link applies its members through linkedChild, which saves each one.
+    EXPECT_NO_THROW(EffectInstance().linkedChild(forcePush));
+
+    auto program = std::make_shared<ScriptProgram>("force_push_command");
+    program->add(Instruction::newCONSTI(1));
+    uint32_t resume = program->length();
+    program->add(Instruction(InstructionType::RETN));
+    auto state = std::make_shared<ExecutionState>();
+    state->program = program;
+    state->insOffset = resume;
+    state->globals = {constructed};
+    auto continuation = SavedScriptContinuation::fromRuntime(
+        state, "force_push_command", game);
+    std::string error;
+
+    auto exported = exportScriptSituation(*continuation, error);
+
+    ASSERT_TRUE(exported) << error;
+    ASSERT_EQ(exported->stack.size(), 1u);
+    const auto &saved = std::get<EffectInstance>(exported->stack.front().payload);
+    EXPECT_EQ(saved.serializedType, SavedEffectTypes::forcePush);
+    EXPECT_EQ(saved.integerParameter(0), 1);
+    EXPECT_EQ(saved.integerParameter(1), 1);
+    EXPECT_EQ(saved.floatParameters, (std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}));
+
+    ASSERT_TRUE(exported->bindObjectReferences(game));
+    auto imported = SavedScriptSituationImporter(
+                        game, engine.resourceModule().scripts())
+                        .import(*exported);
+    ASSERT_TRUE(imported) << imported.message;
+    auto restored = std::dynamic_pointer_cast<SavedEffectValue>(
+        imported.continuation->executionState().globals.front().engineType);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->instance().serializedType, SavedEffectTypes::forcePush);
+    EXPECT_EQ(restored->instance().integerParameter(0), 1);
+    EXPECT_EQ(restored->instance().integerParameter(1), 1);
+    EXPECT_EQ(restored->instance().floatParameters, saved.floatParameters);
+    auto executable = restored->instance();
+    executable.materialize();
+    EXPECT_TRUE(std::dynamic_pointer_cast<ForcePushTargetedEffect>(executable.effect));
+}
+
+TEST(ModuleSnapshot, unserializable_live_effect_is_reported_not_thrown) {
+    TestEngine &engine = testEngine();
+    StubConsole console;
+    Game game(GameID::KotOR, "", engine.options(), engine.services(), console);
+    // Only a link may take an effect argument; any other effect given one
+    // has no save-facing value.
+    auto effect = std::make_shared<Effect>(EffectType::Haste);
+    effect->captureSaveFacingScriptArguments(
+        {Variable::ofEffect(std::make_shared<Effect>(EffectType::Slow))}, game);
+    auto program = std::make_shared<ScriptProgram>("bad_effect");
+    program->add(Instruction::newCONSTI(1));
+    uint32_t resume = program->length();
+    program->add(Instruction(InstructionType::RETN));
+    auto state = std::make_shared<ExecutionState>();
+    state->program = program;
+    state->insOffset = resume;
+    state->globals = {Variable::ofInt(3)};
+    state->locals = {Variable::ofEffect(effect)};
+    auto continuation = SavedScriptContinuation::fromRuntime(
+        state, "bad_effect", game);
+    std::string error;
+
+    std::optional<SerializedScriptSituation> exported;
+    ASSERT_NO_THROW(exported = exportScriptSituation(*continuation, error));
+
+    EXPECT_FALSE(exported);
+    EXPECT_THAT(error, HasSubstr("live VM locals[0] effect"));
+    EXPECT_THAT(error, HasSubstr("no serializable value"));
 }
 
 } // namespace

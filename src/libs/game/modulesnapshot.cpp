@@ -659,8 +659,17 @@ std::optional<SerializedScriptSituation> exportScriptSituation(
                 return std::nullopt;
             }
             saved.type = static_cast<int8_t>(SavedVmStackType::Effect);
-            saved.payload = effect ? effect->instance()
-                                   : liveEffect->saveFacingInstance();
+            if (effect) {
+                saved.payload = effect->instance();
+                break;
+            }
+            try {
+                saved.payload = liveEffect->saveFacingInstance();
+            } catch (const std::exception &ex) {
+                error = str(boost::format("live VM %s[%d] effect: %s") %
+                            scope % index % ex.what());
+                return std::nullopt;
+            }
             break;
         }
         case script::VariableType::Event: {

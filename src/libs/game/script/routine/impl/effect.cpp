@@ -520,7 +520,10 @@ static Variable EffectAssuredDeflection(const std::vector<Variable> &args, const
 
 static Variable EffectForcePushTargeted(const std::vector<Variable> &args, const RoutineContext &ctx) {
     // Load
-    auto lCentre = getLocationArgument(args, 0);
+    // Retail reads the centre of an unset location as the zero location.
+    auto lCentre = args.size() > 0 && args[0].type == VariableType::Location && !args[0].engineType
+                       ? std::make_shared<Location>(glm::vec3(0.0f), 0.0f)
+                       : getLocationArgument(args, 0);
     auto nIgnoreTestDirectLine = getIntOrElse(args, 1, 0);
 
     // Transform
