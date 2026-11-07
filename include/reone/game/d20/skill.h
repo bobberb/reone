@@ -35,6 +35,10 @@ struct Skill {
     bool allClassesCanUse {false};
     /** The ability whose modifier the skill adds. */
     Ability keyAbility {Ability::Strength};
+    /** A character other than the player character may spend recommended points on the skill. */
+    bool npcCanUse {false};
+    /** A droid other than the player character may spend recommended points on the skill. */
+    bool droidCanUse {false};
 };
 
 } // namespace game

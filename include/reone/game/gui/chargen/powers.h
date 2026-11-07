@@ -109,6 +109,8 @@ private:
     void updateCharacter();
     void toggleSelectedPower(SpellType power);
     void removeInvalidSelectedPowers();
+    /** Chooses the level's powers afresh by light or dark side priority, and lists them in a message box. */
+    void recommend();
     void showPowerDescription(SpellType type);
     void resetFocusedPowerName();
     void onPowerFocused(const std::string &power);

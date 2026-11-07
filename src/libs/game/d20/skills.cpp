@@ -51,6 +51,8 @@ void Skills::init() {
         // The untrained and all-classes flags are the low bits of their cells.
         skill->untrained = (skills->getInt(row, "untrained", 0) & 1) != 0;
         skill->allClassesCanUse = (skills->getInt(row, "allclassescanuse", 0) & 1) != 0;
+        skill->npcCanUse = (skills->getInt(row, "npccanuse", 0) & 1) != 0;
+        skill->droidCanUse = (skills->getInt(row, "droidcanuse", 0) & 1) != 0;
         const auto key = skills->getString(row, "keyability");
         if (key == "DEX") {
             skill->keyAbility = Ability::Dexterity;

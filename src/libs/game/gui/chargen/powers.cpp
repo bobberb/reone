@@ -20,8 +20,11 @@
 #include "reone/game/gui/chargen/iconselection.h"
 
 #include "reone/game/d20/classes.h"
+#include "reone/game/d20/recommended.h"
 #include "reone/game/game.h"
 #include "reone/game/gui/chargen.h"
+#include "reone/game/object/creature.h"
+#include "reone/game/party.h"
 #include "reone/gui/control/button.h"
 #include "reone/gui/control/iconchain.h"
 #include "reone/gui/control/listbox.h"
@@ -38,6 +41,12 @@ using namespace reone::resource;
 namespace reone {
 
 namespace game {
+
+// The heading of the message box that lists the recommended powers.
+static constexpr int kRecommendedPowersStrRef = 42257;
+
+// The alignment of a character not yet in the party: a new character's.
+static constexpr int kNewCharacterGoodEvil = 50;
 
 // The message for accepting while powers can still be chosen.
 static constexpr int kK1PowersLeftStrRef = 48210;
@@ -137,8 +146,9 @@ void CharGenPowers::onGUILoaded() {
         activateFocusedPower();
     });
     _controls.SELECT_BTN->setVisible(true);
-    _controls.RECOMMENDED_BTN->setDisabled(true);
-    _controls.RECOMMENDED_BTN->setVisible(false);
+    _controls.RECOMMENDED_BTN->setOnClick([this]() {
+        recommend();
+    });
     _controls.ACCEPT_BTN->setOnClick([this]() {
         accept();
     });
@@ -156,6 +166,42 @@ void CharGenPowers::reset() {
     resetFocusedPowerName();
     loadDisplayEntries();
     refreshControls();
+
+    // Only a Force user is recommended powers.
+    const CreatureAttributes &attributes = _charGen.character().attributes;
+    std::shared_ptr<CreatureClass> clazz(_services.game.classes.get(attributes.getEffectiveClass()));
+    const bool forceUser = clazz && clazz->isJedi();
+    _controls.RECOMMENDED_BTN->setVisible(forceUser);
+    _controls.RECOMMENDED_BTN->setDisabled(!forceUser);
+}
+
+void CharGenPowers::recommend() {
+    _selectedPowers.clear();
+    const CreatureAttributes &attributes = _charGen.character().attributes;
+    std::shared_ptr<CreatureClass> clazz(_services.game.classes.get(attributes.getEffectiveClass()));
+    if (!clazz) {
+        return;
+    }
+    // The powers are chosen for the character with the level it gains, as
+    // the screen counts the level's powers.
+    CreatureAttributes levelled(attributes);
+    levelled.addClassLevels(clazz.get(), 1);
+    std::shared_ptr<Creature> leader(_charGen.isLevelUp() ? _game.party().getLeader() : nullptr);
+    const int goodEvil = leader ? leader->goodEvil() : kNewCharacterGoodEvil;
+    auto powers = recommended::recommendPowers(_services.game.spells, levelled, *clazz, _powerGain, goodEvil);
+    _selectedPowers.insert(powers.begin(), powers.end());
+
+    loadDisplayEntries();
+    refreshSelectionControls();
+    refreshIconChainSelection();
+
+    std::string message(_services.resource.strings.getText(kRecommendedPowersStrRef));
+    for (auto power : powers) {
+        if (auto spell = _services.game.spells.get(power)) {
+            message += "\n" + spell->name;
+        }
+    }
+    _game.showMessagePopup(message);
 }
 
 void CharGenPowers::loadDisplayEntries() {

@@ -172,6 +172,11 @@ private:
 
     void onGUILoaded() override;
 
+    /** Asks whether to level the leader up automatically, from its level to the one its experience reaches. */
+    void confirmAutoLevelUp();
+    /** Levels the leader up by the recommended choices until its experience reaches no further level. */
+    void autoLevelUp();
+
     /** Load the AI script panel, one row per aiscripts row, and wire its buttons. */
     void loadScriptSelectPanel();
     /** Open the AI script panel for the leader, its current style marked and focused. */

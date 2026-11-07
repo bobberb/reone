@@ -114,7 +114,13 @@ void CharGenAbilities::onGUILoaded() {
     _controls.BTN_RECOMMENDED->setOnClick([this]() {
         ClassType classType = _charGen.character().attributes.getEffectiveClass();
         std::shared_ptr<CreatureClass> clazz(_services.game.classes.get(classType));
-        _attributes = clazz->defaultAttributes();
+        if (!_charGen.isLevelUp()) {
+            _attributes = clazz->defaultAttributes();
+        } else if (auto ability = clazz->primaryAbility()) {
+            // As in the original, the primary ability gains a point on every
+            // press, whatever was spent before.
+            _attributes.setAbilityScore(*ability, _attributes.getAbilityScore(*ability) + 1);
+        }
         _points = 0;
         refreshControls();
     });

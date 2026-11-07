@@ -142,6 +142,32 @@ public:
      */
     bool isPCGrantedFeat(FeatType feat) const { return _pcGrantedFeats.count(feat) > 0; }
 
+    /** A skill or a feat with the priority Recommended gives it. */
+    template <class T>
+    struct Recommendation {
+        T type;
+        int priority;
+    };
+
+    /**
+     * @return a priority for every skills.2da row, in row order, from the
+     *         class's _reco column; -1 for a blank cell
+     */
+    const std::vector<Recommendation<SkillType>> &skillRecommendations() const { return _skillRecommendations; }
+
+    /**
+     * @return a priority for every feat.2da row with a name that is on the
+     *         class's list (list value other than 4), in row order, from the
+     *         class's _recom column; 0 for a blank cell
+     */
+    const std::vector<Recommendation<FeatType>> &featRecommendations() const { return _featRecommendations; }
+
+    /** @return the rows of feat.2da, the last priority Recommended tries for a feat */
+    int featRowCount() const { return _featRowCount; }
+
+    /** @return the ability a recommended level-up raises; none for a blank primaryabil */
+    std::optional<Ability> primaryAbility() const { return _primaryAbility; }
+
 private:
     ClassType _type;
     std::string _name;
@@ -156,6 +182,10 @@ private:
     std::unordered_map<FeatType, int> _featListValues;
     std::unordered_map<FeatType, int> _featGrantedLevels;
     std::unordered_set<FeatType> _pcGrantedFeats;
+    std::vector<Recommendation<SkillType>> _skillRecommendations;
+    std::vector<Recommendation<FeatType>> _featRecommendations;
+    int _featRowCount {0};
+    std::optional<Ability> _primaryAbility;
     /** Per-level tables, by row: row n holds class level n + 1. */
     std::vector<SavingThrows> _savingThrows;
     std::vector<int> _featGains;

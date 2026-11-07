@@ -19,7 +19,9 @@
 
 #include <optional>
 
+#include "reone/game/combattables.h"
 #include "reone/game/d20/classes.h"
+#include "reone/game/d20/recommended.h"
 #include "reone/game/di/services.h"
 #include "reone/game/game.h"
 #include "reone/game/gui/ingame.h"
@@ -49,6 +51,13 @@ namespace game {
 
 // The tutorial window (tutorial.2da row) the AI script panel asks for.
 static constexpr int kScriptSelectTutorial = 10;
+
+// The question Auto Level-Up asks: from level <CUSTOM0> to level <CUSTOM1>.
+static constexpr int kAutoLevelUpQuestionStrRef = 36811;
+
+// The highest character levels, past which no level-up is pending.
+static constexpr int kK1MaxCharacterLevel = 20;
+static constexpr int kTSLMaxCharacterLevel = 50;
 
 /** The experience table's amount for a level no experience reaches. */
 static constexpr uint32_t kUnreachableExperience = 0xFFFFFFFF;
@@ -132,7 +141,9 @@ void CharacterMenu::onGUILoaded() {
     }
 
     turnK1PartyArrowRight();
-    _controls.BTN_AUTO->setDisabled(true);
+    _controls.BTN_AUTO->setOnClick([this]() {
+        confirmAutoLevelUp();
+    });
     // The level-up buttons' texts pulse until the pointer first leaves them.
     _controls.BTN_AUTO->setTextPulsing(true);
     _controls.BTN_LEVELUP->setTextPulsing(true);
@@ -157,6 +168,61 @@ void CharacterMenu::onGUILoaded() {
         });
         loadScriptSelectPanel();
     }
+}
+
+void CharacterMenu::confirmAutoLevelUp() {
+    std::shared_ptr<Creature> leader(_game.party().getLeader());
+    if (!leader || !leader->isLevelUpPending()) {
+        return;
+    }
+    const int level = leader->attributes().getAggregateLevel();
+    const int maxLevel = _game.isTSL() ? kTSLMaxCharacterLevel : kK1MaxCharacterLevel;
+    int target = level;
+    while (target < maxLevel &&
+           static_cast<uint32_t>(leader->xp()) >= _services.game.combatTables.experienceThreshold(target)) {
+        ++target;
+    }
+    std::string question(_game.getInterfaceText(
+        kAutoLevelUpQuestionStrRef,
+        {{0, std::to_string(level)}, {1, std::to_string(target)}}));
+    _game.showConfirmPopup(question, [this]() {
+        autoLevelUp();
+    });
+}
+
+void CharacterMenu::autoLevelUp() {
+    std::shared_ptr<Creature> leader(_game.party().getLeader());
+    if (!leader) {
+        return;
+    }
+    while (leader->isLevelUpPending() && !leader->attributes().classLevels().empty()) {
+        CreatureClass &clazz = *leader->attributes().classLevels().back().first;
+        recommended::AutoLevelUp character {
+            _services.game.feats,
+            _services.game.skills,
+            _services.game.spells,
+            leader->racialType(),
+            leader->xp(),
+            leader->tag(),
+            _game.isTSL(),
+            leader->isPlayerCreated(),
+            leader->goodEvil(),
+            leader->effectFeats(),
+            [&leader](SpellType power, ClassType owner) {
+                return leader->canLearnPower(power, owner);
+            }};
+        leader->applyLevelUp(recommended::chooseAutoLevel(leader->attributes(), character), clazz);
+    }
+    // As after a level-up on the screens, the player character's new level
+    // moves every companion with a creature through its influence.
+    if (leader->isPlayerCreated()) {
+        for (int npc = 0; npc < static_cast<int>(Party::kK2NpcCount); ++npc) {
+            if (auto companion = _game.party().getAvailableMember(npc)) {
+                companion->recomputeInfluenceAlignment();
+            }
+        }
+    }
+    refreshControls();
 }
 
 bool CharacterMenu::handle(const input::Event &event) {

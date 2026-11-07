@@ -49,6 +49,18 @@ static bool hasColumn(const TwoDA &twoDa, const std::string &column) {
     return twoDa.getColumnIndex(column) != -1;
 }
 
+static std::optional<Ability> parsePrimaryAbility(const std::string &alias) {
+    static const std::unordered_map<std::string, Ability> abilities {
+        {"str", Ability::Strength},
+        {"dex", Ability::Dexterity},
+        {"con", Ability::Constitution},
+        {"int", Ability::Intelligence},
+        {"wis", Ability::Wisdom},
+        {"cha", Ability::Charisma}};
+    auto maybeAbility = abilities.find(boost::to_lower_copy(alias));
+    return maybeAbility != abilities.end() ? std::optional<Ability>(maybeAbility->second) : std::nullopt;
+}
+
 void CreatureClass::load(const TwoDA &twoDa, int row) {
     _name = _strings.getText(twoDa.getInt(row, "name"));
     _description = _strings.getText(twoDa.getInt(row, "description"));
@@ -56,6 +68,7 @@ void CreatureClass::load(const TwoDA &twoDa, int row) {
     _hitdie = twoDa.getInt(row, "hitdie");
     _forcedie = twoDa.getInt(row, "forcedie");
     _skillPointBase = twoDa.getInt(row, "skillpointbase");
+    _primaryAbility = parsePrimaryAbility(twoDa.getString(row, "primaryabil"));
 
     _defaultAttributes.addClassLevels(this, 1);
     _defaultAttributes.setAbilityScore(Ability::Strength, twoDa.getInt(row, "str"));
@@ -99,6 +112,7 @@ void CreatureClass::loadClassSkills(const std::string &skillsTable) {
         if (skills->getInt(row, skillsTable + "_class") == 1) {
             _classSkills.insert(static_cast<SkillType>(row));
         }
+        _skillRecommendations.push_back({static_cast<SkillType>(row), skills->getInt(row, skillsTable + "_reco", -1)});
     }
 }
 
@@ -141,6 +155,11 @@ void CreatureClass::loadFeatListValues(const std::string &featsPrefix) {
         return;
     }
 
+    _featRowCount = feats->getRowCount();
+    // As the feats service does, a table without a name column names its
+    // feats in its feat column, and a row without a name is not a feat.
+    const std::string nameColumn = hasColumn(*feats, "name") ? "name" : "feat";
+    const std::string recommendationColumn(featsPrefix + "_recom");
     std::string listColumn(featsPrefix + "_list");
     auto grantedColumn = featsPrefix + "_granted";
     auto pcGrantedColumn = featsPrefix + "_pc_granted";
@@ -150,6 +169,9 @@ void CreatureClass::loadFeatListValues(const std::string &featsPrefix) {
         // cell, or a column the table lacks, reads as 0.
         int listValue = feats->getInt(row, listColumn) & 0xff;
         _featListValues.insert(std::make_pair(feat, listValue));
+        if (listValue != kOffListFeatListValue && feats->getIntOpt(row, nameColumn)) {
+            _featRecommendations.push_back({feat, feats->getInt(row, recommendationColumn, 0)});
+        }
 
         // List value 3, or one above 4, marks a feat the class grants at the
         // level in its granted column. A new TSL player character also starts

@@ -136,6 +136,9 @@ public:
 
     const Character &character() const { return _character; }
 
+    /** @return whether the screens level up the party leader rather than create a character */
+    bool isLevelUp() const { return _type == Type::LevelUp; }
+
     /** The level-up character's attributes with its coming level. */
     CreatureAttributes levelledAttributes() const;
 

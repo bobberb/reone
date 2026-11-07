@@ -20,9 +20,12 @@
 #include "reone/game/gui/chargen/iconselection.h"
 
 #include "reone/game/d20/classes.h"
+#include "reone/game/d20/recommended.h"
 #include "reone/game/di/services.h"
 #include "reone/game/game.h"
 #include "reone/game/gui/chargen.h"
+#include "reone/game/object/creature.h"
+#include "reone/game/party.h"
 #include "reone/gui/control/button.h"
 #include "reone/gui/control/label.h"
 #include "reone/gui/control/listbox.h"
@@ -37,6 +40,16 @@ using namespace reone::resource;
 namespace reone {
 
 namespace game {
+
+static const std::array<SkillType, 8> kSkills {
+    SkillType::ComputerUse,
+    SkillType::Demolitions,
+    SkillType::Stealth,
+    SkillType::Awareness,
+    SkillType::Persuade,
+    SkillType::Repair,
+    SkillType::Security,
+    SkillType::TreatInjury};
 
 static const std::unordered_map<SkillType, int> g_descStrRefBySkill {
     {SkillType::ComputerUse, 244},
@@ -93,8 +106,10 @@ void CharGenSkills::onGUILoaded() {
     _controls.SECURITY_POINTS_BTN->setDisabled(true);
     _controls.TREAT_INJURY_POINTS_BTN->setDisabled(true);
 
-    _controls.BTN_RECOMMENDED->setDisabled(true);
     _controls.COST_POINTS_LBL->setTextMessage("");
+    _controls.BTN_RECOMMENDED->setOnClick([this]() {
+        recommend();
+    });
 
     _controls.BTN_ACCEPT->setOnClick([this]() {
         updateCharacter();
@@ -185,12 +200,14 @@ void CharGenSkills::reset(bool newGame) {
     const CreatureAttributes &attributes = _charGen.character().attributes;
     std::shared_ptr<CreatureClass> clazz(_services.game.classes.get(attributes.getEffectiveClass()));
 
-    _points = glm::max(1, (clazz->skillPointBase() + attributes.getAbilityModifier(Ability::Intelligence)) / 2);
+    _newGame = newGame;
     _allocationLevel = attributes.getAggregateLevel() + (newGame ? 0 : 1);
+    _points = recommended::getSkillPointGain(
+        clazz->skillPointBase(),
+        attributes.getAbilityModifier(Ability::Intelligence),
+        _allocationLevel);
 
     if (newGame) {
-        _points *= 4;
-
         _attributes.setSkillRank(SkillType::ComputerUse, 0);
         _attributes.setSkillRank(SkillType::Demolitions, 0);
         _attributes.setSkillRank(SkillType::Stealth, 0);
@@ -202,7 +219,31 @@ void CharGenSkills::reset(bool newGame) {
     } else {
         _attributes = attributes;
     }
+    _openingAttributes = _attributes;
+    _openingPoints = _points;
 
+    refreshControls();
+}
+
+void CharGenSkills::recommend() {
+    // The ranks are spent on the character, whose classes decide the class
+    // skills and the priorities.
+    CreatureAttributes spending(_charGen.character().attributes);
+    for (auto skill : kSkills) {
+        spending.setSkillRank(skill, _openingAttributes.getSkillRank(skill));
+    }
+    std::shared_ptr<Creature> leader(_newGame ? nullptr : _game.party().getLeader());
+    recommended::SkillSpending rules {
+        _services.game.skills,
+        _allocationLevel,
+        !leader || leader->isPlayerCreated(),
+        leader && leader->racialType() == RacialType::Droid};
+    _points = recommended::recommendSkills(spending, _openingPoints, rules);
+
+    _attributes = _openingAttributes;
+    for (auto skill : kSkills) {
+        _attributes.setSkillRank(skill, spending.getSkillRank(skill));
+    }
     refreshControls();
 }
 

@@ -164,6 +164,8 @@ private:
     void removeChosenFeat(FeatType feat);
     /** Shows the message in a message box. */
     void showMessage(int strRef);
+    /** Chooses the screen's feats afresh by the class's priorities, and lists them in a message box. */
+    void recommend();
     void refreshControls();
     void refreshSelectionControls();
     void refreshIconChain();

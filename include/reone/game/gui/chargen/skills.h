@@ -109,6 +109,10 @@ private:
     CreatureAttributes _attributes;
     int _points {0};
     int _allocationLevel {1};
+    /** The ranks and the points the screen opened with, which Recommended starts from. */
+    CreatureAttributes _openingAttributes;
+    int _openingPoints {0};
+    bool _newGame {true};
 
     void onGUILoaded() override;
 
@@ -163,6 +167,8 @@ private:
 
     void refreshControls();
     void updateCharacter();
+    /** Spends the screen's points from the opening ranks, by the class's priorities. */
+    void recommend();
 
     bool canIncreaseSkill(SkillType skill) const;
 

@@ -21,6 +21,7 @@
 
 #include "reone/game/d20/classes.h"
 #include "reone/game/d20/feats.h"
+#include "reone/game/d20/recommended.h"
 #include "reone/game/game.h"
 #include "reone/game/gui/chargen.h"
 #include "reone/game/party.h"
@@ -54,6 +55,9 @@ static constexpr int kNoPicksLeftStrRef = 42530;
 static constexpr int kGrantedFeatStrRef = 42183;
 static constexpr int kOwnedFeatStrRef = 42182;
 static constexpr int kUnavailableFeatStrRef = 42184;
+
+// The heading of the message box that lists the recommended feats.
+static constexpr int kRecommendedFeatsStrRef = 42256;
 
 // The message for an accept while a feat can still be chosen.
 static constexpr int kK1FeatsLeftStrRef = 48215;
@@ -172,7 +176,9 @@ void CharGenFeats::onGUILoaded() {
         activateFocusedFeat();
     });
     _controls.BTN_SELECT->setDisabled(true);
-    _controls.BTN_RECOMMENDED->setDisabled(true);
+    _controls.BTN_RECOMMENDED->setOnClick([this]() {
+        recommend();
+    });
 }
 
 void CharGenFeats::reset(bool levelUp, bool bonus, std::set<FeatType> originalFeats, const std::vector<FeatType> &grantedFeats) {
@@ -208,7 +214,6 @@ void CharGenFeats::reset(bool levelUp, bool bonus, std::set<FeatType> originalFe
 
     refreshControls();
     _controls.BTN_SELECT->setDisabled(true);
-    _controls.BTN_RECOMMENDED->setDisabled(true);
 }
 
 CreatureAttributes CharGenFeats::choiceAttributes() const {
@@ -315,6 +320,38 @@ void CharGenFeats::removeChosenFeat(FeatType feat) {
 
 void CharGenFeats::showMessage(int strRef) {
     _game.showMessagePopup(_services.resource.strings.getText(strRef));
+}
+
+void CharGenFeats::recommend() {
+    _selectedFeats.clear();
+    _remaining = _points;
+    _availableFeats.clear();
+    buildAvailableFeats();
+
+    // Each screen fills only its own feats: the normal or the bonus ones.
+    CreatureAttributes attributes(choiceAttributes());
+    recommended::FeatSpending spending {
+        attributes,
+        *attributes.classLevels().back().first,
+        _bonus ? 0 : _normalFeats,
+        _bonus ? _bonusFeats : 0,
+        _effectFeats,
+        _levelUp ? _game.party().getLeader()->tag() : kObjectTagPlayer,
+        _game.isTSL()};
+    auto feats = recommended::recommendFeats(_services.game.feats, spending);
+    for (auto feat : feats) {
+        addChosenFeat(feat);
+    }
+    refreshSelectionControls();
+    refreshIconChainStates();
+
+    std::string message(_services.resource.strings.getText(kRecommendedFeatsStrRef));
+    for (auto feat : feats) {
+        if (auto featInfo = _services.game.feats.get(feat)) {
+            message += "\n" + featInfo->name;
+        }
+    }
+    _game.showMessagePopup(message);
 }
 
 void CharGenFeats::accept() {
