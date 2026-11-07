@@ -138,6 +138,16 @@ bool InGameMenuHost::handle(const input::Event &event) {
     return false;
 }
 
+std::optional<glm::ivec2> InGameMenuHost::clickPoint(const std::string &tag, int row) const {
+    // The active tab takes input first, as in handle().
+    if (auto tabGui = getActiveTabGUI()) {
+        if (auto point = tabGui->clickPoint(tag, row)) {
+            return point;
+        }
+    }
+    return PresentationGUI::clickPoint(tag, row);
+}
+
 void InGameMenuHost::update(float dt) {
     PresentationGUI::update(dt);
 
@@ -223,6 +233,9 @@ void InGameMenuHost::refreshK2Footer() {
     hide(_controls.LBL_DEBILATATED1);
     hide(_controls.LBL_DEBILATATED2);
     hide(_controls.LBL_DEBILATATED3);
+    hide(_controls.LBL_DISABLED1);
+    hide(_controls.LBL_DISABLED2);
+    hide(_controls.LBL_DISABLED3);
     hide(_controls.LBL_DISABLE1);
     hide(_controls.LBL_DISABLE2);
     hide(_controls.LBL_DISABLE3);

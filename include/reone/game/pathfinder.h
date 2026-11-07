@@ -19,6 +19,7 @@
 
 #include <array>
 #include <functional>
+#include <optional>
 
 #include "reone/graphics/aabb.h"
 #include "reone/graphics/walkmesh.h"
@@ -120,6 +121,14 @@ void uniwalkFinalize(struct Uniwalk &uni);
 std::optional<Path> createPath(Pathfinder &pf, const glm::vec3 &from, const glm::vec3 &to);
 /** Whether the walkmesh joins two points, without holding a path. */
 bool pathExists(const Pathfinder &pf, const glm::vec3 &from, const glm::vec3 &to);
+/**
+ * The height of the walkmesh under a point, at any height: where floors lie
+ * over each other, the one nearest \p nearZ. None where no walkable face lies
+ * under the point. A point given by x and y alone, as a scripted walk's is,
+ * needs it: faces are looked up within their rooms' bounds, height included,
+ * so a target at the walker's own height misses a room lower or higher.
+ */
+std::optional<float> walkmeshHeightAt(const Pathfinder &pf, const glm::vec2 &point, float nearZ);
 bool updatePath(Pathfinder &pf, Path p, const glm::vec3 &current);
 void releasePath(Pathfinder &pf, Path path);
 
@@ -192,6 +201,11 @@ void insertAvoidanceWay(std::vector<glm::vec3> &points, uint32_t &next, int entr
                         const std::vector<glm::vec3> &way);
 
 glm::vec3 computeKeepoutForce(const Uniwalk &uni, const glm::vec3 &position);
+
+/// Height of the walkable face under (x, y) that lies nearest to \p nearZ,
+/// searched over every room of the unified walkmesh. Empty when no face lies
+/// under (x, y).
+std::optional<float> walkmeshElevationAt(const Uniwalk &uni, const glm::vec2 &xy, float nearZ);
 
 } // namespace game
 

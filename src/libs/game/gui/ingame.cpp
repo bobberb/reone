@@ -223,10 +223,13 @@ void InGameMenu::openOptions() {
 void InGameMenu::clearSelection() { if (_host) _host->clearSelection(); }
 
 bool InGameMenu::handle(const input::Event &event) { return _host->handle(event); }
+std::optional<glm::ivec2> InGameMenu::clickPoint(const std::string &tag, int row) const { return _host->clickPoint(tag, row); }
 void InGameMenu::update(float dt) { _host->update(dt); }
 void InGameMenu::render() { _host->render(); }
 std::shared_ptr<Button> InGameMenu::getBtnChange2() { return _host->getBtnChange2(); }
 std::shared_ptr<Button> InGameMenu::getBtnChange3() { return _host->getBtnChange3(); }
+
+InGameMenuTab InGameMenu::activeTab() const { return _host ? _host->activeTab() : InGameMenuTab::None; }
 
 void InGameMenu::navigate(InGameMenuTab tab) {
     switch (tab) {
@@ -277,6 +280,29 @@ InGameMenuFooter InGameMenu::footer() const {
     int hp = leader->maxHitPoints();
     view.vitalityPercent = hp > 0 ? std::clamp(100 * leader->currentHitPoints() / hp, 0, 100) : 0;
     return view;
+}
+
+int subScreenId(InGameMenuTab tab) {
+    switch (tab) {
+    case InGameMenuTab::Equipment:
+        return 1;
+    case InGameMenuTab::Inventory:
+        return 2;
+    case InGameMenuTab::Character:
+        return 3;
+    case InGameMenuTab::Abilities:
+        return 4;
+    case InGameMenuTab::Map:
+        return 5;
+    case InGameMenuTab::Journal:
+        return 6;
+    case InGameMenuTab::Options:
+        return 7;
+    case InGameMenuTab::Messages:
+        return 8;
+    default:
+        return 0;
+    }
 }
 
 } // namespace game

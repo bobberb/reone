@@ -114,6 +114,28 @@ void ListBox::load(const resource::generated::GUI_BASECONTROL &gui, bool protoIt
     _leftScrollBar = controlStruct.LEFTSCROLLBAR != 0;
 }
 
+bool ListBox::handleKeyDown(input::KeyCode key) {
+    if (!_itemsInteractive)
+        return false;
+    if (_selectionMode == SelectionMode::OnHover)
+        return false;
+
+    if (key == input::KeyCode::Up) {
+        selectPreviousItem();
+        return true;
+    }
+    if (key == input::KeyCode::Down) {
+        selectNextItem();
+        return true;
+    }
+    if (key == input::KeyCode::Return) {
+        _onItemDoubleClick(_items[_selectedItemIndex].tag);
+        return true;
+    }
+
+    return false;
+}
+
 bool ListBox::handleMouseMotion(int x, int y) {
     if (_itemsInteractive && _selectionMode == SelectionMode::OnHover) {
         const int index = getItemIndex(y);
@@ -144,6 +166,26 @@ int ListBox::getItemIndex(int y) const {
     }
 
     return -1;
+}
+
+std::optional<int> ListBox::itemCenterY(int index) const {
+    if (!_protoItem || index < _itemOffset || index >= static_cast<int>(_items.size())) {
+        return std::nullopt;
+    }
+    float itemy = static_cast<float>(_protoItem->extent().top);
+    for (int i = _itemOffset; i < index; ++i) {
+        itemy += getItemPitch(_items[i]);
+    }
+    int center = static_cast<int>(std::lround(itemy + getItemPitch(_items[index]) / 2.0f));
+    if (center >= _extent.top + _extent.height) {
+        return std::nullopt;
+    }
+    // Whatever the row's padding, the point must be one the hit test gives
+    // back as this row.
+    if (getItemIndex(center) != index) {
+        return std::nullopt;
+    }
+    return center;
 }
 
 bool ListBox::handleMouseWheel(int x, int y) {
@@ -527,6 +569,26 @@ void ListBox::setItemOffset(int offset) {
     }
 }
 
+void ListBox::selectNextItem() {
+    if (_items.empty()) {
+        return;
+    }
+
+    _selectedItemIndex = (_selectedItemIndex == getItemCount() - 1) ? 0 : (_selectedItemIndex + 1);
+    _onItemClick(_items[_selectedItemIndex].tag);
+    scrollToSelectedItem();
+}
+
+void ListBox::selectPreviousItem() {
+    if (_items.empty()) {
+        return;
+    }
+
+    _selectedItemIndex = (_selectedItemIndex == 0) ? (getItemCount() - 1) : (_selectedItemIndex - 1);
+    _onItemClick(_items[_selectedItemIndex].tag);
+    scrollToSelectedItem();
+}
+
 void ListBox::scrollToItem(int index) {
     if (index < _itemOffset) {
         _itemOffset = index;
@@ -561,6 +623,10 @@ void ListBox::scrollToBottom() {
 
     _itemOffset = static_cast<int>(offset);
     updateItemSlots();
+}
+
+void ListBox::scrollToSelectedItem() {
+    scrollToItem(_selectedItemIndex);
 }
 
 void ListBox::updateItemsLayout() {

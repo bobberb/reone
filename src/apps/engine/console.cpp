@@ -25,6 +25,7 @@
 #include "reone/resource/di/services.h"
 #include "reone/resource/provider/fonts.h"
 #include "reone/system/checkutil.h"
+#include "reone/system/logutil.h"
 #include "reone/system/stringutil.h"
 
 using namespace reone::graphics;
@@ -85,6 +86,9 @@ void Console::setPrompt() {
 }
 
 void Console::printLine(const std::string &text) {
+    if (_echoToLog) {
+        info("console: " + text);
+    }
     _buffer.write(text);
     _buffer.write('\n');
     _scrollOffset = 0;
@@ -201,19 +205,17 @@ void Console::executeInputText() {
         _historyIndex = _history.size();
     }
 
-    while (cmdBegin < cmdEnd) {
-        _buffer.seekSet(cmdBegin);
-        std::string_view line = _buffer.readline();
-        cmdBegin = _buffer.tell();
-
-        assert(!line.empty() && "missing \n terminator");
-        line = string_strip(line);
-        if (line.empty()) {
+    // Commands write to the buffer and `clear` empties it, so offsets and views
+    // into the buffer go stale. Lines are taken from the copy instead.
+    std::vector<std::string> lines;
+    boost::split(lines, multiline, boost::is_any_of("\n"));
+    for (const auto &line : lines) {
+        std::string_view command = string_strip(line);
+        if (command.empty()) {
             continue;
         }
-
         _buffer.seekEnd(0);
-        execute(line);
+        execute(command);
     }
     setPrompt();
 }
@@ -230,7 +232,7 @@ void Console::execute(std::string_view command) {
     }
 
     if (tokens[0] == "batch") {
-        if (tokens.size() != 2 && tokens[1] != "{") {
+        if (tokens.size() != 2 || tokens[1] != "{") {
             printLine("batch must be followed by {");
             return;
         }
@@ -252,6 +254,7 @@ void Console::execute(std::string_view command) {
 
     auto commandByName = _nameToCommand.find(tokens[0]);
     if (commandByName == _nameToCommand.end()) {
+        error("Unrecognized command: " + tokens[0]);
         printLine("Unrecognized command: " + tokens[0]);
         return;
     }
@@ -259,6 +262,8 @@ void Console::execute(std::string_view command) {
     try {
         handler(std::move(tokens));
     } catch (const std::exception &ex) {
+        // Logged as well: a scripted, headless run has no console to read.
+        error("Command failed: " + std::string(command) + ": " + ex.what());
         printLine("Command failed: " + std::string(ex.what()));
     }
 }
