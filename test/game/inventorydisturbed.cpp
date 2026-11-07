@@ -29,9 +29,11 @@
 #include "reone/game/object/area.h"
 #include "reone/game/object/creature.h"
 #include "reone/game/object/item.h"
+#include "reone/game/object/module.h"
 #include "reone/game/object/placeable.h"
 #include "reone/game/party.h"
 #include "reone/game/script/routines.h"
+#include "reone/resource/gff.h"
 #include "reone/script/program.h"
 
 using namespace reone;
@@ -53,13 +55,22 @@ std::map<std::string, int> &probeRuns() {
     return runs;
 }
 
-// A script that stores, in locals on OBJECT_SELF, whether GetLastDisturbed is
-// \p disturber, whether GetInventoryDisturbItem is \p item, and what
-// GetInventoryDisturbType returns.
-std::shared_ptr<script::ScriptProgram> makeProbe(const Routines &routines, const std::string &resRef, uint32_t disturber, uint32_t item) {
+// Locals the module's acquire probe writes what it saw to, on the module.
+constexpr int kLocalAcquired = 43;
+constexpr int kLocalAcquiredFrom = 44;
+
+struct Observation {
+    std::string routine;
+    std::optional<uint32_t> equals;
+    int local;
+};
+
+// A script that stores, in a local on OBJECT_SELF, what each routine returns,
+// or whether it returns the object an observation names.
+std::shared_ptr<script::ScriptProgram> makeObserver(const Routines &routines, const std::string &resRef, const std::vector<Observation> &observations) {
     auto program = std::make_shared<script::ScriptProgram>(resRef);
     const int setLocalNumber = routines.getIndexByName("SetLocalNumber");
-    const auto observe = [&](const std::string &routine, std::optional<uint32_t> equals, int local) {
+    for (const auto &[routine, equals, local] : observations) {
         program->add(script::Instruction::newACTION(routines.getIndexByName(routine), 0));
         if (equals) {
             program->add(script::Instruction::newCONSTO(static_cast<int>(*equals)));
@@ -69,12 +80,19 @@ std::shared_ptr<script::ScriptProgram> makeProbe(const Routines &routines, const
         program->add(script::Instruction::newCONSTI(local));
         program->add(script::Instruction::newCONSTO(static_cast<int>(script::kObjectSelf)));
         program->add(script::Instruction::newACTION(setLocalNumber, 3));
-    };
-    observe("GetLastDisturbed", disturber, kLocalDisturber);
-    observe("GetInventoryDisturbItem", item, kLocalItem);
-    observe("GetInventoryDisturbType", std::nullopt, kLocalType);
+    }
     program->add(script::Instruction(script::InstructionType::RETN));
     return program;
+}
+
+// A script that stores, in locals on OBJECT_SELF, whether GetLastDisturbed is
+// \p disturber, whether GetInventoryDisturbItem is \p item, and what
+// GetInventoryDisturbType returns.
+std::shared_ptr<script::ScriptProgram> makeProbe(const Routines &routines, const std::string &resRef, uint32_t disturber, uint32_t item) {
+    return makeObserver(routines, resRef,
+                        {{"GetLastDisturbed", disturber, kLocalDisturber},
+                         {"GetInventoryDisturbItem", item, kLocalItem},
+                         {"GetInventoryDisturbType", std::nullopt, kLocalType}});
 }
 
 struct DisturbedFixture {
@@ -112,6 +130,27 @@ struct DisturbedFixture {
     void probe(const std::string &resRef, uint32_t disturber, uint32_t item) {
         probeRuns()[resRef] = 0;
         auto program = makeProbe(routines, resRef, disturber, item);
+        EXPECT_CALL(engine.resourceModule().scripts(), get(resRef))
+            .Times(AnyNumber())
+            .WillRepeatedly(Invoke([program](const std::string &key) {
+                ++probeRuns()[key];
+                return program;
+            }));
+    }
+
+    // The module's acquire script is \p resRef, a probe of whether
+    // GetModuleItemAcquired is \p item and GetModuleItemAcquiredFrom is
+    // \p from; its runs are counted.
+    void probeAcquire(const std::string &resRef, uint32_t item, uint32_t from) {
+        auto ifo = Gff::Builder()
+                       .field(Gff::Field::newResRef("Mod_Entry_Area", "area"))
+                       .field(Gff::Field::newResRef("Mod_OnAcquirItem", resRef))
+                       .build();
+        TestGameModule::loadModuleInfo(*game.module(), "module", *ifo);
+        probeRuns()[resRef] = 0;
+        auto program = makeObserver(routines, resRef,
+                                    {{"GetModuleItemAcquired", item, kLocalAcquired},
+                                     {"GetModuleItemAcquiredFrom", from, kLocalAcquiredFrom}});
         EXPECT_CALL(engine.resourceModule().scripts(), get(resRef))
             .Times(AnyNumber())
             .WillRepeatedly(Invoke([program](const std::string &key) {
@@ -246,4 +285,101 @@ TEST(InventoryDisturbed, a_take_within_the_party_inventory_is_not_a_disturbance)
 
     ASSERT_EQ(player->id(), item->owner());
     EXPECT_EQ(0, probeRuns()["disturbed_party_take"]);
+}
+
+// The module's acquire script runs, as a queued event, for an item a creature
+// is given: the game names the item, and as where it was acquired from, the
+// creature that now holds it.
+TEST(InventoryDisturbed, give_item_to_a_creature_runs_the_modules_acquire_script) {
+    DisturbedFixture fixture;
+    auto giver = fixture.game.newPlaceable();
+    auto receiver = fixture.addCreature();
+    auto item = fixture.addItemTo(*giver);
+    fixture.probeAcquire("acquire_give", item->id(), receiver->id());
+
+    auto action = fixture.game.newAction<GiveItemAction>(item, receiver, GiveItemAction::kWholeStack, false);
+    action->execute(action, *giver, 0.0f);
+    EXPECT_EQ(0, probeRuns()["acquire_give"]);
+    fixture.game.module()->dispatchDueSavedEvents();
+
+    auto &module = *fixture.game.module();
+    EXPECT_EQ(1, probeRuns()["acquire_give"]);
+    EXPECT_EQ(1, module.getLocalNumber(kLocalAcquired));
+    EXPECT_EQ(1, module.getLocalNumber(kLocalAcquiredFrom));
+}
+
+TEST(InventoryDisturbed, take_item_from_a_placeable_runs_the_modules_acquire_script) {
+    DisturbedFixture fixture;
+    auto container = fixture.game.newPlaceable();
+    auto taker = fixture.addCreature();
+    auto item = fixture.addItemTo(*container);
+    fixture.probeAcquire("acquire_take", item->id(), taker->id());
+
+    auto action = fixture.game.newAction<TakeItemAction>(item, container);
+    action->execute(action, *taker, 0.0f);
+    fixture.game.module()->dispatchDueSavedEvents();
+
+    auto &module = *fixture.game.module();
+    EXPECT_EQ(1, probeRuns()["acquire_take"]);
+    EXPECT_EQ(1, module.getLocalNumber(kLocalAcquired));
+    EXPECT_EQ(1, module.getLocalNumber(kLocalAcquiredFrom));
+}
+
+// An item merged into a stack is gone: the module is told of the stack.
+TEST(InventoryDisturbed, an_item_merged_into_a_stack_is_acquired_as_the_stack) {
+    DisturbedFixture fixture;
+    auto owner = fixture.addCreature();
+    auto taker = fixture.addCreature();
+    auto item = fixture.addItemTo(*owner);
+    auto stack = fixture.addItemTo(*taker);
+    fixture.probeAcquire("acquire_merge", stack->id(), taker->id());
+
+    auto action = fixture.game.newAction<TakeItemAction>(item, owner);
+    action->execute(action, *taker, 0.0f);
+    fixture.game.module()->dispatchDueSavedEvents();
+
+    ASSERT_EQ(2, stack->stackSize());
+    EXPECT_EQ(1, probeRuns()["acquire_merge"]);
+    EXPECT_EQ(1, fixture.game.module()->getLocalNumber(kLocalAcquired));
+}
+
+// The party inventory is the player character's: an item given to a companion
+// is acquired by the player character.
+TEST(InventoryDisturbed, an_item_given_to_a_companion_is_acquired_by_the_player) {
+    DisturbedFixture fixture;
+    auto player = fixture.addCreature();
+    auto companion = fixture.addCreature();
+    auto &party = fixture.game.party();
+    party.addMember(kNpcPlayer, player);
+    party.setPlayer(player);
+    party.addAvailableMember(0, companion);
+    party.addMember(0, companion);
+    auto giver = fixture.game.newPlaceable();
+    auto item = fixture.addItemTo(*giver);
+    fixture.probeAcquire("acquire_party", item->id(), player->id());
+
+    auto action = fixture.game.newAction<GiveItemAction>(item, companion, GiveItemAction::kWholeStack, false);
+    action->execute(action, *giver, 0.0f);
+    fixture.game.module()->dispatchDueSavedEvents();
+
+    ASSERT_EQ(player->id(), item->owner());
+    EXPECT_EQ(1, probeRuns()["acquire_party"]);
+    EXPECT_EQ(1, fixture.game.module()->getLocalNumber(kLocalAcquired));
+    EXPECT_EQ(1, fixture.game.module()->getLocalNumber(kLocalAcquiredFrom));
+}
+
+// Only creatures acquire: an item a placeable takes tells the module nothing.
+TEST(InventoryDisturbed, an_item_a_placeable_takes_is_not_acquired) {
+    DisturbedFixture fixture;
+    auto owner = fixture.addCreature();
+    auto container = fixture.game.newPlaceable();
+    auto item = fixture.addItemTo(*owner);
+    fixture.probeAcquire("acquire_none", item->id(), container->id());
+
+    auto action = fixture.game.newAction<TakeItemAction>(item, owner);
+    action->execute(action, *container, 0.0f);
+    fixture.game.module()->dispatchDueSavedEvents();
+
+    ASSERT_EQ(container->id(), item->owner());
+    EXPECT_EQ(0, probeRuns()["acquire_none"]);
 }

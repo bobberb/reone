@@ -6521,6 +6521,23 @@ void Game::signalItemEquipped(Creature &wearer, int slot, const std::shared_ptr<
     queueScriptEvent(*_module, wearer, *newEvent(kItemEquippedEvent, std::vector<int32_t> {}, std::vector<float> {}, std::vector<std::string> {}, std::vector<std::shared_ptr<Object>> {item}));
 }
 
+// The game's possessor change sends the item as the event's source, and names
+// the creature now holding it, not the one it came from, in the second object.
+void Game::signalItemAcquired(const Object &receiver, const std::shared_ptr<Item> &item) {
+    if (!_module || !item) {
+        return;
+    }
+    uint32_t acquirerId = receiver.id();
+    if (receiver.type() == ObjectType::Item) {
+        acquirerId = static_cast<const Item &>(receiver).owner();
+    }
+    auto acquirer = getObjectById<Creature>(acquirerId);
+    if (!acquirer) {
+        return;
+    }
+    queueScriptEvent(*_module, *item, *newEvent(static_cast<int>(SavedSignalEventType::ItemAcquired), std::vector<int32_t> {}, std::vector<float> {}, std::vector<std::string> {}, std::vector<std::shared_ptr<Object>> {item, acquirer}));
+}
+
 void Game::recordEquippedOnLoad(int slot, const std::shared_ptr<Item> &item) {
     assert(_stagedRuntimeObjectGraph && "equipment is read inside a runtime object graph");
     _stagedRuntimeObjectGraph->equippedOnLoad.push_back({slot, item});
@@ -6559,8 +6576,9 @@ void Game::signalEquippedOnLoad(const Creature &wearer) {
 
 // The party arrives in every module as if read anew: the player character,
 // then each other member, then each puppet, tells the module of every item it
-// wears, in slot order. What any of them was read wearing during the load is
-// not told twice.
+// wears, in slot order, as acquired and then as equipped, and then of every
+// item it carries as acquired. What any of them was read wearing during the
+// load is not told twice.
 void Game::signalPartyEquipment() {
     std::vector<std::shared_ptr<Creature>> arriving;
     auto player = _party.player();
@@ -6585,7 +6603,11 @@ void Game::signalPartyEquipment() {
                 [&](const EquippedOnLoad &kept) { return equippedOnLoadWearer(kept) == creature; }),
             _equippedOnLoad.end());
         for (const auto &[slot, item] : creature->equipment()) {
+            signalItemAcquired(*creature, item);
             signalItemEquipped(*creature, slot, item);
+        }
+        for (const auto &item : creature->items()) {
+            signalItemAcquired(*creature, item);
         }
     }
 }

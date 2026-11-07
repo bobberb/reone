@@ -25,6 +25,7 @@
 #include "reone/game/object/area.h"
 #include "reone/game/types.h"
 #include "reone/game/object/creature.h"
+#include "reone/game/object/item.h"
 #include "reone/game/object/module.h"
 #include "reone/game/object/trigger.h"
 #include "reone/game/party.h"
@@ -50,6 +51,7 @@ namespace {
 constexpr char kEntryArea[] = "area_x";
 constexpr char kOnLoadScript[] = "hook_onload";
 constexpr char kOnEnterScript[] = "hook_onenter";
+constexpr char kOnAcquireScript[] = "hook_onacquire";
 constexpr int kDelayedMutationLocal = 42;
 
 std::shared_ptr<ScriptProgram> delayedSelfMutation(
@@ -216,6 +218,7 @@ struct EntryLifecycleFixture : TestWithParam<GameID> {
         auto ifo = Gff::Builder()
                        .field(Gff::Field::newResRef("Mod_Entry_Area", kEntryArea))
                        .field(Gff::Field::newCExoString("Mod_OnModLoad", kOnLoadScript))
+                       .field(Gff::Field::newCExoString("Mod_OnAcquirItem", kOnAcquireScript))
                        .field(Gff::Field::newByte("Mod_IsSaveGame", savedModuleSnapshot ? 1 : 0));
         if (savedModuleSnapshot) {
             auto area = Gff::Builder()
@@ -338,6 +341,25 @@ TEST_P(EntryLifecycleFixture, a_fresh_entry_runs_both_hooks_outside_a_restore) {
     EXPECT_EQ(1, dispatchCount(kOnEnterScript));
     EXPECT_THAT(observedDuring(kOnLoadScript), Optional(false));
     EXPECT_THAT(observedDuring(kOnEnterScript), Optional(false));
+}
+
+// The game reads the arriving player character's items with the module told
+// of each as acquired, so the module's acquire script runs once for every item
+// the party carries in.
+TEST_P(EntryLifecycleFixture, the_party_arrives_acquiring_what_it_carries) {
+    serveModule(/*savedModuleSnapshot=*/false);
+    auto carried = game->newItem();
+    player->addItem(carried);
+    auto other = game->newItem();
+    other->setTag("other");
+    player->addItem(other);
+    ASSERT_EQ(2u, player->items().size());
+
+    game->loadModule("module_b");
+    EXPECT_EQ(0, dispatchCount(kOnAcquireScript));
+    game->module()->update(0.0f);
+
+    EXPECT_EQ(2, dispatchCount(kOnAcquireScript));
 }
 
 // Coming back to a module reone has persisted state for is still an entry, and

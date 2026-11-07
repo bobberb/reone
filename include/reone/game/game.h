@@ -955,6 +955,14 @@ public:
      */
     void signalItemEquipped(Creature &wearer, int slot, const std::shared_ptr<Item> &item);
     /**
+     * Signals the module that \p item came to be held by \p receiver (event
+     * 19), when the receiver is a creature or an item a creature holds: the
+     * module's acquire script runs on it, with the item and that creature as
+     * the acquired item and what GetModuleItemAcquiredFrom answers. An item
+     * gained by a placeable or store tells the module nothing.
+     */
+    void signalItemAcquired(const Object &receiver, const std::shared_ptr<Item> &item);
+    /**
      * An item put on while its wearer is read. The module is told once the
      * wearer and the item are live.
      */
@@ -2158,7 +2166,7 @@ private:
     void releaseEquippedOnLoad(const std::vector<EquippedOnLoad> &equipped);
     /** The live creature wearing equipment read on load, if any. */
     std::shared_ptr<Creature> equippedOnLoadWearer(const EquippedOnLoad &equipped) const;
-    /** The arriving party tells the module of everything it wears. */
+    /** The arriving party tells the module of everything it wears and carries. */
     void signalPartyEquipment();
     /** The equipment read during a load that no announcement has told yet tells the module. */
     void signalKeptEquippedOnLoad();

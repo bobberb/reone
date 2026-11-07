@@ -646,6 +646,11 @@ bool releaseAreaOwnedItem(
     return area && area->releaseObject(item);
 }
 
+static ItemTransfer acquiredBy(Game &game, const Object &receiver, std::shared_ptr<Item> held) {
+    game.signalItemAcquired(receiver, held);
+    return {true, std::move(held)};
+}
+
 ItemTransfer transferItemTo(
     Game &game,
     const std::shared_ptr<Item> &item,
@@ -674,7 +679,7 @@ ItemTransfer transferItemTo(
         if (!releaseAreaOwnedItem(game, item)) {
             return {};
         }
-        return {true, receiver.addItem(item)};
+        return acquiredBy(game, receiver, receiver.addItem(item));
     }
 
     auto owner = game.getObjectById(ownerId);
@@ -689,7 +694,12 @@ ItemTransfer transferItemTo(
         return {};
     }
 
-    return {true, receiver.addItem(item)};
+    auto held = receiver.addItem(item);
+    // An item taken off into its wearer's own inventory changes no hands.
+    if (ownerId == receiver.id()) {
+        return {true, held};
+    }
+    return acquiredBy(game, receiver, std::move(held));
 }
 
 } // namespace game

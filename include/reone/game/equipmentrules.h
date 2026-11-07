@@ -217,7 +217,8 @@ struct ItemTransfer {
 
 /**
  * Move one complete runtime Item from its current nested or Area ownership
- * edge to receiver. An ownerless nonresident Item is not transferable.
+ * edge to receiver. An ownerless nonresident Item is not transferable. A
+ * move into other hands tells the module the Item was acquired.
  *
  * @return whether it moved, and the receiver's stack that holds it
  */

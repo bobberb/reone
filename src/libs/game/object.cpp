@@ -1583,7 +1583,8 @@ void Object::handOverItem(const std::shared_ptr<Item> &item, Object &other) {
         creature->itemAttributes().removeItem(item);
     }
     item->clearOwner();
-    _game.party().sharedInventoryReceiver(_game.getObjectById(other.id()))->addItem(item);
+    auto receiver = _game.party().sharedInventoryReceiver(_game.getObjectById(other.id()));
+    _game.signalItemAcquired(*receiver, receiver->addItem(item));
 }
 
 int Object::damageImmunity(int flags) const {

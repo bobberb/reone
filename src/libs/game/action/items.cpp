@@ -108,7 +108,9 @@ void GiveItemAction::execute(std::shared_ptr<Action> self, Object &actor, float 
     }
     const auto deliver = [&](Object &receiver) -> ItemTransfer {
         if (split) {
-            return {true, receiver.addItem(split)};
+            auto held = receiver.addItem(split);
+            _game.signalItemAcquired(receiver, held);
+            return {true, held};
         }
         return transferItemTo(_game, _item, receiver);
     };
