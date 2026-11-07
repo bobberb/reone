@@ -22,7 +22,15 @@
 #include <string>
 #include <vector>
 
+#include "reone/graphics/keyframetrack.h"
+
 namespace reone {
+
+namespace graphics {
+
+class Model;
+
+}
 
 namespace resource {
 
@@ -106,18 +114,42 @@ struct MinigameSoundSpec {
     std::string engine;
 };
 
-struct MinigamePlayerScriptSpec {
+/**
+ * Script slots of a player or enemy (a "follower"). Each holds a script
+ * resref; empty means the slot is unused. OnAccelerate and OnBrake are the
+ * accelerate and brake (jump) keys of the K2 swoop races.
+ */
+struct MinigameFollowerScriptSpec {
     std::string onCreate;
-    std::string onDeath;
-    std::string onTrackLoop;
-    std::string onDamage;
-    std::string onAccelerate;
-    std::string onHeartbeat;
-    std::string onFire;
     std::string onHitBullet;
     std::string onHitFollower;
+    std::string onAnimEvent;
+    std::string onHeartbeat;
+    std::string onDamage;
+    std::string onDeath;
+    std::string onFire;
     std::string onHitObstacle;
+    std::string onTrackLoop;
+    std::string onAccelerate;
+    std::string onBrake;
+    std::string onHitWorld;
 };
+
+// Script slots of an obstacle: a subset of the follower slots.
+struct MinigameObstacleScriptSpec {
+    std::string onCreate;
+    std::string onHitBullet;
+    std::string onHitFollower;
+    std::string onAnimEvent;
+    std::string onHeartbeat;
+};
+
+/**
+ * Player acceleration in speed units per second, from the authored speed
+ * range and Accel_Secs (the seconds to go from minimum to maximum speed).
+ * Accel_Secs 0 gives the whole range in one second; a negative value gives 1.
+ */
+float minigameAccelerationPerSecond(float minimumSpeed, float maximumSpeed, float accelSecs);
 
 struct MinigamePlayerSpec {
     std::string cameraResRef;
@@ -127,6 +159,11 @@ struct MinigamePlayerSpec {
     float minimumSpeed {0.0f};
     float maximumSpeed {0.0f};
     float accelSecs {0.0f};
+
+    // Derived from the speed range and accelSecs at parse time, see
+    // minigameAccelerationPerSecond.
+    float accelPerSecond {0.0f};
+
     float sphereRadius {0.0f};
     uint32_t hitPoints {0};
     uint32_t maxHitPoints {0};
@@ -135,7 +172,7 @@ struct MinigamePlayerSpec {
     int numLoops {0};
     bool cameraRotate {false};
     MinigameSoundSpec sounds;
-    MinigamePlayerScriptSpec scripts;
+    MinigameFollowerScriptSpec scripts;
 
     // Placement of the player actor relative to its track hook, and of the
     // aim/target point relative to the actor.
@@ -158,14 +195,6 @@ struct MinigamePlayerSpec {
     glm::vec3 tunnelInfinite {0.0f};
 };
 
-struct MinigameEnemyScriptSpec {
-    std::string onCreate;
-    std::string onDeath;
-    std::string onDamage;
-    std::string onHeartbeat;
-    std::string onTrackLoop;
-};
-
 struct MinigameEnemySpec {
     std::string trackResRef;
     std::vector<MinigameModelSpec> models;
@@ -178,7 +207,7 @@ struct MinigameEnemySpec {
     int numLoops {0};
     bool trigger {false};
     MinigameSoundSpec sounds;
-    MinigameEnemyScriptSpec scripts;
+    MinigameFollowerScriptSpec scripts;
 
     // Kept for call sites that only need the creation hook.
     std::string onCreate;
@@ -186,7 +215,7 @@ struct MinigameEnemySpec {
 
 struct MinigameObstacleSpec {
     std::string name;
-    std::string onCreate;
+    MinigameObstacleScriptSpec scripts;
 };
 
 /**
@@ -212,6 +241,7 @@ struct MinigameSpec {
     uint32_t bumpPlane {0};
     uint32_t depthOfField {0};
     bool doBumping {false};
+    std::string music; // resref of the music played during the minigame
     MinigameMouseSpec mouse;
     MinigamePlayerSpec player;
     std::vector<MinigameEnemySpec> enemies;
@@ -228,6 +258,64 @@ struct MinigameSpec {
  * Returns nullopt when the area declares no minigame (Type 0).
  */
 std::optional<MinigameSpec> parseMinigameSpec(const resource::generated::ARE &are);
+
+/**
+ * The path of a minigame track: where the track model's "modelhook" node is
+ * at each time of the model's "track" animation. Actors ride the hook.
+ *
+ * Position keys are offsets from the hook's rest position and orientation
+ * keys replace its rest orientation, as when the animation plays on the
+ * model. Times before the first key give the first key, and times past the
+ * last key give the last key.
+ */
+class MinigameTrack {
+public:
+    MinigameTrack() = default;
+
+    /**
+     * @param base world transform of the hook's parent: the track placement
+     *             times the rest pose of the hook's ancestors
+     * @param restPosition rest position of the hook in its parent
+     * @param restOrientation rest orientation of the hook in its parent
+     * @param positions position keys of the hook in the "track" animation
+     * @param orientations orientation keys of the hook in the "track" animation
+     * @param length length of the "track" animation in seconds
+     */
+    MinigameTrack(glm::mat4 base,
+                  glm::vec3 restPosition,
+                  glm::quat restOrientation,
+                  graphics::KeyframeTrack<glm::vec3> positions,
+                  graphics::KeyframeTrack<glm::quat> orientations,
+                  float length);
+
+    /** World transform of the hook at a time of the track animation. */
+    glm::mat4 hookAt(float time) const;
+
+    float length() const { return _length; }
+
+private:
+    glm::mat4 _base {1.0f};
+    glm::vec3 _restPosition {0.0f};
+    glm::quat _restOrientation {1.0f, 0.0f, 0.0f, 0.0f};
+    graphics::KeyframeTrack<glm::vec3> _positions;
+    graphics::KeyframeTrack<glm::quat> _orientations;
+    float _length {0.0f};
+};
+
+/**
+ * Build the path of the "modelhook" node of a track model placed at
+ * \p placement (the LYT track position). A model without a "track" animation
+ * gives a track of length 0, whose hook stays at its rest pose.
+ *
+ * Returns nullopt when the model has no "modelhook" node.
+ */
+std::optional<MinigameTrack> buildMinigameTrack(const graphics::Model &model, const glm::vec3 &placement);
+
+/**
+ * A minigame track plays at speed / 100: at speed 100 an actor rides the
+ * hook at the rate the animation was authored.
+ */
+constexpr float kMinigameTrackRateDivisor = 100.0f;
 
 } // namespace game
 
