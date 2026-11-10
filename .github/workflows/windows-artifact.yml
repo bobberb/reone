@@ -1,0 +1,29 @@
+name: Windows build artifact
+on:
+  push:
+    branches: ["bobberb/win-build-*"]
+  workflow_dispatch:
+env:
+  VCPKG_ROOT: C:/vcpkg
+  RELEASE: reone-pr464-a23ebf354
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-windows
+
+      - name: Zip
+        shell: bash
+        working-directory: ${{github.workspace}}/build
+        run: |-
+          mkdir $RELEASE
+          mv bin $RELEASE/
+          7z a -r $RELEASE.zip $RELEASE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE }}
+          path: ${{github.workspace}}/build/${{ env.RELEASE }}.zip
+          retention-days: 30
