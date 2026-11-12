@@ -1,6 +1,6 @@
 # reone
 
-[![Build Status](https://github.com/modawan/reone/actions/workflows/build-test-linux.yml/badge.svg)](https://github.com/modawan/reone/actions/workflows/build-test-linux.yml)
+[![Build Status](https://github.com/modawan/reone/actions/workflows/build-test-nix.yml/badge.svg)](https://github.com/modawan/reone/actions/workflows/build-test-nix.yml)
 
 reone is a free and open source game engine, capable of running Star Wars: Knights of the Old Republic and its sequel, The Sith Lords. We aim to provide an engine that can be used to:
 
@@ -64,11 +64,11 @@ ninja -C build/darwin engine               # named targets only; the default tar
 nix build .#reone-shaderpack -o result-shaderpack && cp result-shaderpack/share/reone/shaderpack.erf build/darwin/bin/
 ```
 
-The "Build for macOS on Linux" workflow does the first line on an ordinary Linux runner for every pull request and keeps `result/bin` as the `reone-macos-arm64` artifact of the run. With the repository variable `CACHIX_NAME` and the secret `CACHIX_AUTH_TOKEN` set, it keeps the toolchain, the SDK and the cross-built libraries in that [Cachix](https://www.cachix.org) cache between runs.
+The `macos-cross` job of the "Build and test with Nix" workflow does the first line on an ordinary Linux runner for every pull request and keeps `result/bin` as the `reone-macos-arm64` artifact of the run. With the repository variable `CACHIX_NAME` and the secret `CACHIX_AUTH_TOKEN` set, it keeps the toolchain, the SDK and the cross-built libraries in that [Cachix](https://www.cachix.org) cache between runs. The same workflow's `linux` job builds and tests in the flake's dev shell with ccache, so CI and `nix develop` share one compiler and one set of libraries.
 
 Copy `engine` and `shaderpack.erf` into one folder on the Mac and run `./engine --game /path/to/swkotor` there; nothing built this way can run on the Linux machine, the tests included. The binaries carry the ad-hoc signature zig's linker writes, which is what Apple silicon requires for a local run; they are not notarized, so a copy that arrives through a browser or AirDrop is quarantined and Gatekeeper blocks it until `xattr -d com.apple.quarantine engine` (scp does not set the attribute).
 
-The SDK's licence: Apple's Xcode and Apple SDKs Agreement grants its installation on Apple-branded computers only (section 2.2.A) and forbids using it on any other computer, or enabling others to (sections 2.5 and 2.7). Every build with it on Linux is outside that licence, the workflow's included; osxcross works the same way and says so in its README, while nixpkgs uses the SDK on Darwin only. Removing `.github/workflows/build-macos-cross.yml` is all it takes to stop doing it in CI; `nix flake check` does not build this package.
+The SDK's licence: Apple's Xcode and Apple SDKs Agreement grants its installation on Apple-branded computers only (section 2.2.A) and forbids using it on any other computer, or enabling others to (sections 2.5 and 2.7). Every build with it on Linux is outside that licence, the workflow's included; osxcross works the same way and says so in its README, while nixpkgs uses the SDK on Darwin only. Removing the `macos-cross` job from `.github/workflows/build-test-nix.yml` is all it takes to stop doing it in CI; `nix flake check` does not build this package.
 
 ## Usage
 

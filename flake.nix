@@ -70,12 +70,12 @@
                 bash ${./nix/reone-run-test.sh} ${./nix/reone-run.sh}
                 touch $out
               '';
-          # reone-aarch64-darwin is not a check: its own workflow
-          # (build-macos-cross.yml) builds it, with its install check, on every
-          # pull request, and the full check that runs for release tags would
-          # only build it a second time. Keeping it out of the check also
-          # keeps the SDK licence question (nix/darwin-cross/default.nix) in
-          # one place, that workflow.
+          # reone-aarch64-darwin is not a check: the Nix workflow's macos-cross
+          # job builds it, with its install check, on every pull request, and
+          # the full check that runs for release tags would only build it a
+          # second time. Keeping it out of the check also keeps the SDK
+          # licence question (nix/darwin-cross/default.nix) in one place,
+          # that job.
         }
       );
 

@@ -15,7 +15,8 @@
 # 2.7). Every build with it on Linux is outside that licence, the CI
 # workflow's included. osxcross works the same way and says so in its README;
 # nixpkgs does not (its apple-sdk is darwin-only, only its download is reused
-# here). Removing .github/workflows/build-macos-cross.yml stops CI doing it.
+# here). Removing the macos-cross job from .github/workflows/build-test-nix.yml
+# stops CI doing it.
 {
   pkgs,
   version,
