@@ -55,6 +55,7 @@ class SaveWorkingState;
 
 namespace scene {
 class SceneNode;
+class WalkmeshSceneNode;
 }
 
 namespace game {
@@ -65,8 +66,10 @@ struct Pathfinder;
 class Door;
 class Game;
 class Item;
+class Placeable;
 class Module;
 class SaveLoad;
+class Sound;
 class MainMenu;
 class Conversation;
 class DialogGUI;
@@ -79,12 +82,18 @@ struct SaveResult;
 
 class MockCameraStyles : public ICameraStyles, boost::noncopyable {
 public:
+    MockCameraStyles();
+    ~MockCameraStyles() override;
+
     MOCK_METHOD(std::shared_ptr<CameraStyle>, get, (int index), (const override));
     MOCK_METHOD(std::shared_ptr<CameraStyle>, get, (const std::string &name), (const override));
 };
 
 class MockClasses : public IClasses, boost::noncopyable {
 public:
+    MockClasses();
+    ~MockClasses() override;
+
     MOCK_METHOD(void, clear, (), (override));
     MOCK_METHOD(std::shared_ptr<CreatureClass>, get, (ClassType key), (override));
 };
@@ -113,6 +122,10 @@ public:
         return static_cast<int>(_options.size());
     }
 
+    bool keepsPlayerCharacterAtOneHitPoint() const override {
+        return false;
+    }
+
 private:
     std::vector<DifficultyOption> _options {
         {-1, "Easy", 0.5f},
@@ -124,44 +137,69 @@ private:
 
 class MockFeats : public IFeats, boost::noncopyable {
 public:
+    MockFeats();
+    ~MockFeats() override;
+
     MOCK_METHOD(void, init, (), (override));
     MOCK_METHOD(std::shared_ptr<Feat>, get, (FeatType type), (const override));
     MOCK_METHOD(int, getLevelUpChoiceCount, (const CreatureAttributes &attributes, const CreatureClass &clazz), (const override));
     MOCK_METHOD(std::vector<FeatType>, getChoosableFeats, (const FeatChoice &choice), (const override));
     MOCK_METHOD(bool, hasPrerequisites, (FeatType type, const CreatureAttributes &attributes, const std::set<FeatType> &effectFeats, const std::set<FeatType> &chosen), (const override));
     MOCK_METHOD(std::vector<FeatDisplayEntry>, getLevelUpDisplayEntries, (const CreatureAttributes &attributes, const CreatureClass &clazz), (const override));
-    MOCK_METHOD(std::vector<FeatType>, addGrantedFeats, (CreatureAttributes & attributes, RacialType race, const std::string &tag, bool tsl, bool newCharacter), (const override));
+    MOCK_METHOD(std::vector<FeatType>, addGrantedFeats, (CreatureAttributes & attributes, RacialType race, int experience, const std::string &tag, bool tsl, bool newCharacter), (const override));
 };
 
 class MockFootstepSounds : public IFootstepSounds, boost::noncopyable {
 public:
+    MockFootstepSounds();
+    ~MockFootstepSounds() override;
+
     MOCK_METHOD(void, clear, (), (override));
     MOCK_METHOD(std::shared_ptr<FootstepTypeSounds>, get, (uint32_t key), (override));
 };
 
 class MockGUISounds : public IGUISounds, boost::noncopyable {
 public:
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getOnClick, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getOnEnter, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getActionAccepted, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getActionUnavailable, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getActionMenuScroll, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getOnLevelUpNotify, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getCheckboxCheck, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getInventorySelect, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getInventoryDrop, (), (const override));
-    MOCK_METHOD(std::shared_ptr<audio::AudioClip>, getAlignmentShift, (bool light), (const override));
+    MockGUISounds();
+    ~MockGUISounds() override;
+
+    MOCK_METHOD(GUISound, getOnClick, (), (const override));
+    MOCK_METHOD(GUISound, getOnEnter, (), (const override));
+    MOCK_METHOD(GUISound, getActionAccepted, (), (const override));
+    MOCK_METHOD(GUISound, getActionUnavailable, (), (const override));
+    MOCK_METHOD(GUISound, getActionMenuScroll, (), (const override));
+    MOCK_METHOD(GUISound, getOnLevelUpNotify, (), (const override));
+    MOCK_METHOD(GUISound, getQuestNewNotify, (), (const override));
+    MOCK_METHOD(GUISound, getQuestCompleteNotify, (), (const override));
+    MOCK_METHOD(GUISound, getCheckboxCheck, (), (const override));
+    MOCK_METHOD(GUISound, getInventoryAdd, (), (const override));
+    MOCK_METHOD(GUISound, getInventorySelect, (), (const override));
+    MOCK_METHOD(GUISound, getUpgrade, (), (const override));
+    MOCK_METHOD(GUISound, getInventoryDrop, (), (const override));
+    MOCK_METHOD(GUISound, getAlignmentShift, (bool light), (const override));
+    MOCK_METHOD(GUISound, getPanelAdded, (), (const override));
+    MOCK_METHOD(GUISound, getPanelRemoved, (), (const override));
+    MOCK_METHOD(std::shared_ptr<audio::AudioSource>, play, (GUISound sound), (override));
 };
 
 class MockPortraits : public IPortraits, boost::noncopyable {
 public:
+    MockPortraits();
+    ~MockPortraits() override;
+
     MOCK_METHOD(std::shared_ptr<graphics::Texture>, getTextureByIndex, (int index), (const override));
     MOCK_METHOD(std::shared_ptr<graphics::Texture>, getTextureByAppearance, (int appearance), (const override));
     MOCK_METHOD(const std::vector<Portrait> &, portraits, (), (const override));
+
+private:
+    std::vector<Portrait> _portraits;
 };
 
 class MockReputes : public IReputes, boost::noncopyable {
 public:
+    MockReputes();
+    ~MockReputes() override;
+
     MOCK_METHOD(State, baseState, (), (const override));
     MOCK_METHOD(State, state, (), (const override));
     MOCK_METHOD(std::optional<State>, parse, (const resource::Gff &gff), (const override));
@@ -175,16 +213,17 @@ public:
 
 class MockSkills : public ISkills, boost::noncopyable {
 public:
+    MockSkills();
+    ~MockSkills() override;
+
     MOCK_METHOD(std::shared_ptr<Skill>, get, (SkillType type), (const override));
 };
 
 class MockSpells : public ISpells, boost::noncopyable {
 public:
     /** Every range reads as blank, as from an empty ranges table. */
-    MockSpells() {
-        ON_CALL(*this, range(testing::_)).WillByDefault(testing::ReturnRef(_blankRange));
-        ON_CALL(*this, findRange(testing::_)).WillByDefault(testing::Return(std::nullopt));
-    }
+    MockSpells();
+    ~MockSpells() override;
 
     MOCK_METHOD(std::shared_ptr<Spell>, get, (SpellType type), (const override));
     MOCK_METHOD(const RangeRow &, range, (int row), (const override));
@@ -200,6 +239,9 @@ private:
 
 class MockSurfaces : public ISurfaces, boost::noncopyable {
 public:
+    MockSurfaces();
+    ~MockSurfaces() override;
+
     MOCK_METHOD(bool, isWalkable, (int index), (const override));
     MOCK_METHOD(const Surface &, getSurface, (int index), (const override));
 
@@ -207,10 +249,14 @@ public:
     MOCK_METHOD(std::set<uint32_t>, getWalkableSurfaces, (), (const override));
     MOCK_METHOD(std::set<uint32_t>, getWalkcheckSurfaces, (), (const override));
     MOCK_METHOD(std::set<uint32_t>, getLineOfSightSurfaces, (), (const override));
+    MOCK_METHOD(std::set<uint32_t>, getCameraSurfaces, (), (const override));
 };
 
 class MockProjectiles : public IProjectiles, boost::noncopyable {
 public:
+    MockProjectiles();
+    ~MockProjectiles() override;
+
     MOCK_METHOD(void, clear, (), (override));
     MOCK_METHOD(void, launchLightsaberThrow,
                 (Creature &, const EffectInstance &, Game &, ServicesView &),
@@ -233,6 +279,9 @@ public:
 
 class MockAnimations : public IAnimations, boost::noncopyable {
 public:
+    MockAnimations();
+    ~MockAnimations() override;
+
     MOCK_METHOD(void, clear, (), (override));
     MOCK_METHOD(std::string, getNameById, (uint32_t id), (const override));
     MOCK_METHOD(std::string, getReactionAnimation, (const std::string &attackAnim, CreatureWieldType targetWield, AttackReaction reaction), (const override));
@@ -248,6 +297,9 @@ public:
 
 class MockVisualEffects : public IVisualEffects, boost::noncopyable {
 public:
+    MockVisualEffects();
+    ~MockVisualEffects();
+
     MOCK_METHOD(std::optional<std::reference_wrapper<const VisualEffectDesc>>, get, (uint32_t id), (const override));
     MOCK_METHOD(int, hitVisual, (int damageSlot, bool ranged), (const override));
 };
@@ -264,11 +316,18 @@ public:
         std::function<void(const std::string &, uint32_t)> continuation);
     static void setCurrentScreen(Game &game, int screen);
     static void setConversation(Game &game, Conversation *conversation);
+    /** Let conversations speak at once, as a second after arriving in a module. */
+    static void letConversationsSpeak(Game &game);
     static void setDialogGUI(Game &game, std::unique_ptr<DialogGUI> dialog);
     static void raiseTimingDiscontinuity(Game &game);
     static void initConsole(Game &game);
     static void setActiveModule(Game &game, bool active);
     static void setActiveModuleArea(Game &game, std::shared_ptr<Area> area);
+    static void configurePointerSelection(
+        Game &game,
+        Area &area,
+        StaticCamera &camera,
+        const std::vector<std::shared_ptr<Object>> &objects);
     static void prepareFadeArrival(Game &game);
     static void cacheActiveModule(Game &game, std::string name);
     static std::pair<glm::vec3, float> resolveModuleEntry(
@@ -279,6 +338,9 @@ public:
     static size_t objectRegistrySize(const Game &game);
     static size_t loadedModuleCount(const Game &game);
     static uint32_t nextObjectId(const Game &game);
+    // The autosave timer is private and only advances in a running module.
+    static void advancePlayedTime(Game &game, float dt);
+    static bool autosavesOnEntering(Game &game, const std::string &module);
     static std::shared_ptr<Item> newItemAtRuntimeId(Game &game, uint32_t id);
     static uint64_t runtimeSessionGeneration(const Game &game);
     static uint64_t savedGraphGeneration(const Game &game);
@@ -307,6 +369,8 @@ public:
     // without the area/scene machinery a full load would need.
     static void loadModuleInfo(Module &module, std::string name, const resource::Gff &ifo);
     static void clickCreature(Module &module, const std::shared_ptr<Creature> &creature);
+    static void clickPlaceable(Module &module, const std::shared_ptr<Placeable> &placeable);
+    static void addLevelStats(Creature &creature, int hitDie, int forcePoints);
     static void setPerceptionRanges(
         Creature &creature,
         float sight,
@@ -382,9 +446,15 @@ public:
     // Stand in for a save record that reports the creature as already spawned.
     static void markSpawnScriptFired(Creature &creature);
     static void setSnapshotDoorState(Door &door, DoorState state);
+    // A one-shot the door is playing holds back any swing it is given.
+    static void setSnapshotDoorOneShot(Door &door, std::string clip);
+    static void registerSavedPartyIdentities(
+        Game &game, const resource::Gff &ifo,
+        const SerializedIdentityContext &identityContext);
+    static std::optional<int> savedScriptLoop(const Creature &creature);
+    static void setDoorClosedWalkmesh(Door &door, std::shared_ptr<scene::WalkmeshSceneNode> walkmesh);
     static void configureSnapshotLinkedDoor(
         Door &door, std::string module, std::string entry);
-    static void markSnapshotLinkedDoorHelper(Trigger &trigger);
     static void configureSnapshotCamera(
         StaticCamera &camera, int cameraId, glm::vec3 position,
         glm::quat orientation, float pitch, float height,
@@ -393,8 +463,9 @@ public:
         Game &game, SaveOrchestrationSeams seams);
     static void processPendingSave(Game &game);
     static std::shared_ptr<const resource::SaveWorkingState>
-    prepareCurrentModuleWorkingState(Game &game);
+    prepareCurrentModuleWorkingState(Game &game, const std::string &destination = {});
     static void setSnapshotModuleName(Game &game, std::string name);
+    static void setSoundPitchVariation(Sound &sound, float pitchVariation);
     static bool hasPendingSave(const Game &game);
     static void setRuntimeSessionPlayable(Game &game, bool playable);
     static MainMenu &installMainMenu(Game &game);

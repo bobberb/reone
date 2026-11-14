@@ -23,21 +23,34 @@
 #include <typeinfo>
 #include <vector>
 
+#include <boost/algorithm/string.hpp>
+
+#include "reone/audio/di/services.h"
+#include "reone/audio/mixer.h"
 #include "reone/game/action/castspell.h"
 #include "reone/game/action/startconversation.h"
 #include "reone/game/action/usefeat.h"
 #include "reone/game/di/services.h"
 #include "reone/game/effect/damage.h"
+#include "reone/game/effect/damageresistance.h"
 #include "reone/game/equipmentrules.h"
+#include "reone/game/event.h"
 #include "reone/game/game.h"
 #include "reone/game/object/area.h"
 #include "reone/game/object/creature.h"
 #include "reone/game/object/item.h"
+#include "reone/game/object/lock.h"
 #include "reone/game/object/module.h"
 #include "reone/game/room.h"
+#include "reone/game/savedruntime.h"
+#include "reone/game/script/runner.h"
 #include "reone/game/script/savedsituation.h"
+#include "reone/resource/di/services.h"
 #include "reone/resource/gff.h"
+#include "reone/resource/provider/audioclips.h"
+#include "reone/resource/provider/gffs.h"
 #include "reone/resource/provider/scripts.h"
+#include "reone/resource/strings.h"
 #include "reone/system/exception/validation.h"
 #include "reone/system/logutil.h"
 
@@ -166,7 +179,8 @@ void Object::deserialize(
     gff.readResRef(_onHeartbeat, "ScriptHeartbeat");
     gff.readResRef(_onUserDefined, "ScriptUserDefine");
     gff.readBool(_minOneHP, "Min1HP");
-    gff.readBool(_plot, "Plot");
+    // A creature reads Invulnerable before Plot; an item reads Plot alone.
+    deserializePlot(gff, _type == ObjectType::Creature);
     gff.readBool(_commandable, "Commandable");
     gff.readBool(_interruptable, "Interruptable");
     const bool hasBaseHitPoints = gff.readShort(_hitPoints, "HitPoints");
@@ -185,6 +199,23 @@ void Object::deserialize(
             gff, identityContext, SaveRecordOriginKind::ContainedItem);
     }
     deserializeRuntimeState(gff, identityContext);
+}
+
+// Any value but 0 makes the object plot.
+void Object::deserializePlot(const resource::Gff &gff, bool readInvulnerable) {
+    bool plot = false;
+    if ((readInvulnerable && gff.readBool(plot, "Invulnerable")) || gff.readBool(plot, "Plot")) {
+        _plot = plot;
+    }
+}
+
+void Object::placeAtEntryPosition(const resource::Gff &entry) {
+    _position = glm::vec3(entry.getFloat("XPosition", 0.0f), entry.getFloat("YPosition", 0.0f), entry.getFloat("ZPosition", 0.0f));
+}
+
+void Object::placeAtEntryPoint(const resource::Gff &entry) {
+    _orientation = glm::quat(glm::vec3(0.0f, 0.0f, entry.getFloat("Bearing", 0.0f)));
+    _position = glm::vec3(entry.getFloat("X", 0.0f), entry.getFloat("Y", 0.0f), entry.getFloat("Z", 0.0f));
 }
 
 void Object::deserializePlacement(const resource::Gff &gff) {
@@ -211,23 +242,35 @@ std::vector<std::shared_ptr<Object>> Object::ownedRuntimeObjects() const {
     return {_items.begin(), _items.end()};
 }
 
+size_t Object::itemInsertPosition(const std::vector<std::shared_ptr<Item>> &items, const Item &item) const {
+    if (!keepsItemsInOrder()) {
+        return _loadingItems ? items.size() : 0;
+    }
+    for (size_t i = 0; i < items.size(); ++i) {
+        const auto &existing = *items[i];
+        if (item.baseItemType() < existing.baseItemType()) {
+            return i;
+        }
+        if (item.baseItemType() == existing.baseItemType() && item.localizedName() < existing.localizedName()) {
+            return i;
+        }
+    }
+    return items.size();
+}
+
+void Object::placeItem(std::vector<std::shared_ptr<Item>> &items, std::shared_ptr<Item> item) const {
+    const auto position = static_cast<std::ptrdiff_t>(itemInsertPosition(items, *item));
+    items.insert(items.begin() + position, std::move(item));
+}
+
 std::shared_ptr<Item> Object::appendOwnedItemCandidate(
     std::vector<std::shared_ptr<Item>> &items,
-    const std::shared_ptr<Item> &item,
-    bool preserveSerializedIdentities) {
+    const std::shared_ptr<Item> &item) {
     if (!item) {
         throw ValidationException("Cannot stage a null owned Item");
     }
     for (const auto &existing : items) {
-        if (!existing || existing.get() == item.get()) {
-            continue;
-        }
-        if (preserveSerializedIdentities &&
-            (existing->serializedObjectIdentity() ||
-             item->serializedObjectIdentity())) {
-            continue;
-        }
-        if (!existing->isStackCompatibleWith(*item)) {
+        if (!existing || existing.get() == item.get() || !existing->isStackCompatibleWith(*item)) {
             continue;
         }
         if (existing->mergeStackFrom(*item)) {
@@ -236,7 +279,7 @@ std::shared_ptr<Item> Object::appendOwnedItemCandidate(
             return existing;
         }
     }
-    items.push_back(item);
+    placeItem(items, item);
     return item;
 }
 
@@ -244,8 +287,9 @@ void Object::deserializeOwnedItems(
     const resource::Gff &gff,
     const SerializedIdentityContext &identityContext,
     SaveRecordOriginKind originKind,
-    bool forceDropable,
-    std::string originOwner) {
+    std::string originOwner,
+    bool placedTemplate) {
+    const ItemLoadScope loading(*this);
     if (!identityContext.isSerializedState()) {
         if (!gff.has("ItemList")) return;
         std::vector<std::shared_ptr<Object>> obsolete(
@@ -257,15 +301,27 @@ void Object::deserializeOwnedItems(
             obsolete,
             [&]() {
                 for (const auto &itemGff : gff.getList("ItemList")) {
-                    // An entry naming a missing template makes no item.
-                    if (Item::namesMissingTemplate(*itemGff, _services.resource.gffs)) {
-                        continue;
+                    std::shared_ptr<Item> item;
+                    if (placedTemplate) {
+                        // The template of an object an area places makes each
+                        // entry its InventoryRes template and nothing more of
+                        // the entry; an entry without one makes no item.
+                        std::string resRef;
+                        if (!itemGff->readResRef(resRef, "InventoryRes") ||
+                            !_services.resource.gffs.get(resRef, resource::ResType::Uti)) {
+                            continue;
+                        }
+                        item = _game.newItemFromBlueprint(resRef);
+                    } else {
+                        // An entry naming a missing template makes no item.
+                        if (Item::namesMissingTemplate(*itemGff, _services.resource.gffs)) {
+                            continue;
+                        }
+                        item = _game.newOwnedItem(*itemGff, identityContext);
                     }
-                    auto item = _game.newOwnedItem(*itemGff, identityContext);
-                    if (forceDropable) item->setDropable(true);
-                    item->setOwner(_id);
+                    item->setOwner(*this);
                     appendOwnedItemCandidate(
-                        replacement, item, true);
+                        replacement, item);
                 }
                 if (creature) {
                     for (const auto &item : replacement) {
@@ -297,12 +353,9 @@ void Object::deserializeOwnedItems(
                     identityContext,
                     {originKind,
                      originOwner.empty() ? std::to_string(_id) : originOwner});
-                if (forceDropable) {
-                    item->setDropable(true);
-                }
-                item->setOwner(_id);
+                item->restoreOwner(*this);
                 appendOwnedItemCandidate(
-                    replacement, item, true);
+                    replacement, item);
             }
             if (creature) {
                 for (const auto &item : replacement) {
@@ -346,11 +399,24 @@ void Object::runActions() {
     executeActionsIfAble(0.0f);
 }
 
+// Actions run in turn for as long as each ends at once. An action still under
+// way ends the run, as does a walk to a point, a jump or a drive, a move made
+// by the action, or a run of 64 actions.
 void Object::executeActionsIfAble(float dt) {
-    // An action that can no longer be cleared runs on whatever holds the object.
-    const auto current = getCurrentAction();
-    if (!isDead() && (takesUpActions() || (current && !current->isClearable()))) {
-        executeActions(dt);
+    static constexpr int kMaxActionsPerUpdate = 64;
+    for (int run = 1;; ++run) {
+        // An action that can no longer be cleared runs on whatever holds the object.
+        const auto current = getCurrentAction();
+        if (isDead() || !(takesUpActions() || (current && !current->isClearable()))) {
+            return;
+        }
+        if (!executeActions(dt)) {
+            return;
+        }
+        removeCompletedActions();
+        if (_actions.nodes.empty() || run == kMaxActionsPerUpdate) {
+            return;
+        }
     }
 }
 
@@ -411,6 +477,13 @@ void Object::receiveConversationEvent(ConversationEvent event) {
     _lastSpeaker = event.speaker;
     _listenPatternNumber = event.patternNumber;
     _matchedSubstrings = std::move(event.matchedPieces);
+    _lastConversation = event.conversation;
+    _privateConversation = event.privateConversation;
+    // Every conversation event sets whether the conversation ignores its
+    // start range; one that matched a pattern carries no such flag.
+    _game.setConversationIgnoresStartRange(event.ignoreStartRange);
+    _game.setLastConversation(std::move(event.conversation));
+    _game.admitConversationRequest();
     runConversationScript();
 }
 
@@ -461,6 +534,11 @@ void Object::deserializeRuntimeState(
             SavedCreatureRound saved;
             saved.clock = SavedRoundClock::fromGff(*entry, identityContext);
             saved.spellRound = entry->getUint("SpellCastRound") != 0;
+            saved.target = SavedObjectReference::fromSerializedId(
+                entry->getUint("RoundTarget", kSavedRuntimeInvalidObjectId), identityContext);
+            if (const auto command = entry->findStruct("Command")) {
+                saved.command = SavedActionRecord::fromGff(*command, identityContext);
+            }
             _savedRounds.push_back(std::move(saved));
         }
         if (round->getUint("RoundPaused") != 0 && round->getInt("PauseTimer") > 0) {
@@ -471,6 +549,7 @@ void Object::deserializeRuntimeState(
     }
     if (auto *creature = dyn_cast<Creature>(this)) {
         creature->setWeaponIneffectiveReported(round && round->getUint("WeaponSucks") != 0);
+        creature->setRoundMaster(round && round->getInt("Master") != 0);
     }
     _savedRuntimePublished = false;
     if (_savedRuntimeParsed) {
@@ -568,6 +647,10 @@ void Object::bindSavedRuntimeState() {
         _game.bindSavedObjectReference(saved.clock.pauseOwner);
         _game.bindSavedObjectReference(saved.clock.master);
         _game.bindSavedObjectReference(saved.clock.engaged);
+        _game.bindSavedObjectReference(saved.target);
+        if (saved.command) {
+            saved.command->bindObjectReferences(_game);
+        }
     }
 }
 
@@ -624,9 +707,22 @@ void Object::captureSaveRecord(
 }
 
 void Object::captureAuthoredRecord(const resource::Gff &blueprint, const resource::Gff &placement) {
+    std::vector<std::string> placementFields;
+    for (const auto &field : placement.fields()) {
+        placementFields.push_back(field.label);
+    }
+    captureAuthoredRecord(blueprint, placement, placementFields);
+}
+
+void Object::captureAuthoredRecord(
+    const resource::Gff &blueprint,
+    const resource::Gff &placement,
+    const std::vector<std::string> &placementFields) {
     auto record = blueprint.deepCopy();
     for (const auto &field : placement.fields()) {
-        replaceSaveField(*record, field.deepCopy());
+        if (std::find(placementFields.begin(), placementFields.end(), field.label) != placementFields.end()) {
+            replaceSaveField(*record, field.deepCopy());
+        }
     }
     _saveRecordProvenance = SaveRecordProvenance {SaveGffShadow::capture(*record), SaveRecordOrigin {}, std::nullopt};
 }
@@ -728,6 +824,10 @@ std::vector<SavedActionRecord> Object::saveActionSnapshot() const {
             continue;
         }
         if (auto saved = saveAction(*action, index)) {
+            for (auto &command : action->rangeCheckCommands(*this)) {
+                command.groupActionId = node->groupId;
+                result.push_back(std::move(command));
+            }
             saved->groupActionId = node->groupId;
             saved->round = _game.combat().saveRound(*action);
             saved->scheduled = action->isScheduledCommand();
@@ -898,6 +998,7 @@ void Object::setLastHostileActor(uint32_t actor, bool force) {
         }
         return;
     }
+    // A plot object keeps no record.
     if (_plot) {
         _lastHostileActor.reset();
         return;
@@ -1015,11 +1116,12 @@ void Object::discardHostileActionGroups() {
 void Object::discardGroupNode(const OrdinaryActionQueue::Node &node) {
     if (node->action) {
         node->action->markCancelled();
-        // Nothing else of the cast is undone; only its conjuring projectile,
-        // which belongs to the action, goes with it.
+        // Nothing else of the cast is undone; only what belongs to the action
+        // goes with it: its conjuring projectile and visuals, and its holds on
+        // its caster's movement, pose and spell target.
         auto &command = node->action->combatAction();
         if (auto *cast = dyn_cast<CastSpellAction>(&command)) {
-            cast->dropPresentation();
+            cast->drop(*this);
         }
     }
     auto &queue = _actions.nodes;
@@ -1047,6 +1149,13 @@ void Object::updateStampedHeartbeat(const std::string &script, bool runnable) {
     }
     const bool running = _heartbeatTime != 0 && runnable;
     stampHeartbeat();
+    // A lock takes the PC level on a running heartbeat, whether or not the
+    // object has a script.
+    if (running) {
+        if (auto objectLock = findLock()) {
+            objectLock->get().takePCLevel(_game);
+        }
+    }
     // The script may drop itself while it runs.
     const std::string resRef = script;
     if (running && !resRef.empty()) {
@@ -1122,17 +1231,20 @@ void Object::addActionOnTop(std::shared_ptr<Action> action, std::optional<int> g
     action->onQueued(*this);
 }
 
+void Object::addGroupOnTop(std::vector<std::shared_ptr<Action>> actions) {
+    std::optional<int> group;
+    for (auto action = actions.rbegin(); action != actions.rend(); ++action) {
+        addActionOnTop(std::move(*action), group);
+        group = _actions.lastGroup();
+    }
+}
+
 bool Object::addActionBefore(const Action &parent, std::shared_ptr<Action> action) {
     if (!isRuntimeLive() || !action) {
         return false;
     }
     auto &nodes = _actions.nodes;
-    auto executing = _executingActionNode.lock();
-    auto position = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
-        return executing && executing->action.get() == &parent
-                   ? node == executing
-                   : node->action.get() == &parent;
-    });
+    const auto position = findActionNode(parent);
     if (position == nodes.end()) {
         return false;
     }
@@ -1143,6 +1255,23 @@ bool Object::addActionBefore(const Action &parent, std::shared_ptr<Action> actio
     nodes.insert(position, node);
     action->onQueued(*this);
     return true;
+}
+
+OrdinaryActionQueue::Nodes::const_iterator Object::findActionNode(const Action &action) const {
+    const auto executing = _executingActionNode.lock();
+    return std::find_if(_actions.nodes.begin(), _actions.nodes.end(), [&](const auto &node) {
+        return executing && executing->action.get() == &action
+                   ? node == executing
+                   : node->action.get() == &action;
+    });
+}
+
+std::optional<int> Object::actionGroup(const Action &action) const {
+    const auto position = findActionNode(action);
+    if (position == _actions.nodes.end()) {
+        return std::nullopt;
+    }
+    return (*position)->groupId;
 }
 
 void Object::removeActionsBehind(const Action &action, const std::function<bool(const Action &)> &matches) {
@@ -1226,7 +1355,7 @@ void Object::moveActionNodeToBack(const OrdinaryActionQueue::Node &node) {
 
 void Object::delayAction(std::shared_ptr<Action> action, float seconds) {
     if (!isRuntimeLive()) return;
-    _game.postDelayedCommand(*this, std::move(action), seconds);
+    _game.postDelayedCommand(*this, *this, std::move(action), seconds);
 }
 
 void Object::updateActions(float dt) {
@@ -1249,26 +1378,31 @@ void Object::removeCompletedActions() {
     }
 }
 
-void Object::executeActions(float dt) {
+// Runs the action at the front of the queue; true when it has ended and the
+// next may run now.
+bool Object::executeActions(float dt) {
     if (_actions.nodes.empty()) {
         _spellScriptContext.clearActiveTarget();
         if (auto *creature = dyn_cast<Creature>(this)) {
             creature->setAttemptedAttackTarget(script::kObjectInvalid);
+            creature->setAttemptedSpellTarget(script::kObjectInvalid);
             creature->resetAttemptedMovementTarget();
             creature->resetBlockingCreature();
         }
-        return;
+        return false;
     }
     auto node = _actions.nodes.front();
     auto action = node->action;
     auto *creature = dyn_cast<Creature>(this);
     if (creature && _game.combat().blocksOwnerActions(*creature)) {
-        return;
+        return false;
     }
-    // An action that cannot be cleared is refused only to a party member at
-    // zero vitality.
-    const bool refused = creature && (action->isClearable() || creature->isTemporarilyDead()) &&
-                         !creature->permitsAction(*action);
+    // What a creature does with its body waits while a stun, paralysis or
+    // sleep holds it; the rest of the queue waits behind it.
+    if (creature && creature->waitsForBody(*action)) {
+        return false;
+    }
+    const bool refused = creature && !creature->permitsAction(*action);
     // A physical attack its creature is no longer able to make fails, and
     // ends the creature's combat modes.
     Action &command = action->combatAction();
@@ -1282,8 +1416,9 @@ void Object::executeActions(float dt) {
         if (!action->isCompleted()) {
             action->complete();
         }
-        return;
+        return true;
     }
+    const glm::vec3 position {_position};
     _executingActionNode = node;
     try {
         action->execute(action, *this, dt);
@@ -1292,8 +1427,25 @@ void Object::executeActions(float dt) {
         throw;
     }
     _executingActionNode.reset();
-    // A round an attack asked to settle ends now, before events are delivered.
-    _game.combat().settleRequested();
+    if (!action->isCompleted()) {
+        return false;
+    }
+    // An action that completes behind the actions it queued ahead of itself
+    // leaves the queue now.
+    auto &nodes = _actions.nodes;
+    const auto queued = std::find(nodes.begin(), nodes.end(), node);
+    if (queued != nodes.end() && queued != nodes.begin()) {
+        nodes.erase(queued);
+    }
+    switch (node->type()) {
+    case SavedActionType::MoveToPoint:
+    case SavedActionType::JumpToLocation:
+    case SavedActionType::JumpToObject:
+    case SavedActionType::Drive:
+        return false;
+    default:
+        return _position == position;
+    }
 }
 
 bool Object::hasUserActionsPending(const Action *excluded) const {
@@ -1335,6 +1487,8 @@ std::shared_ptr<Action> Object::getCurrentAction() const {
 std::shared_ptr<Item> Object::addItem(const std::string &resRef, int stackSize, std::optional<bool> dropable) {
     std::shared_ptr<Item> result;
     std::shared_ptr<Item> counted;
+    bool joined = false;
+    bool newlyAcquired = false;
     std::vector<std::shared_ptr<Object>> noObsolete;
     std::vector<std::shared_ptr<Item>> replacement(_items);
     ItemAttributes replacementAttributes;
@@ -1348,15 +1502,18 @@ std::shared_ptr<Item> Object::addItem(const std::string &resRef, int stackSize, 
             if (dropable) {
                 candidate->setDropable(*dropable);
             }
-            if (creature && _game.party().isCountedItem(*candidate)) {
+            if (_game.party().countsReceivedItem(*this, *candidate)) {
                 counted = candidate;
                 _game.discardStagedRuntimeObjects({candidate});
                 return;
             }
-            candidate->setOwner(_id);
+            _game.party().noteItemReceived(*candidate, *this, nullptr);
+            newlyAcquired = candidate->isNewlyAcquired();
+            candidate->setOwner(*this);
             result = appendOwnedItemCandidate(
-                replacement, candidate, false);
-            if (creature && result.get() == candidate.get()) {
+                replacement, candidate);
+            joined = result.get() != candidate.get();
+            if (creature && !joined) {
                 replacementAttributes.addItem(candidate, _services.game);
             }
         },
@@ -1368,12 +1525,16 @@ std::shared_ptr<Item> Object::addItem(const std::string &resRef, int stackSize, 
             }
         });
     if (counted) {
-        _game.party().acquireCountedItem(*creature, *counted);
+        _game.party().acquireReceivedItem(*this, *counted);
+    }
+    // In KotOR a stack a new item joins is marked new too.
+    if (joined && newlyAcquired && !_game.isTSL()) {
+        result->setNewlyAcquired(true);
     }
     return result;
 }
 
-std::shared_ptr<Item> Object::addItem(const std::shared_ptr<Item> &item) {
+std::shared_ptr<Item> Object::addItem(const std::shared_ptr<Item> &item, ItemStacking stacking) {
     if (!item || (!item->isRuntimeLive() && !item->isPresentationOnly())) {
         throw ValidationException("Cannot own a non-live runtime item");
     }
@@ -1397,31 +1558,37 @@ std::shared_ptr<Item> Object::addItem(const std::shared_ptr<Item> &item) {
         return *alreadyOwned;
     }
     auto creature = dyn_cast<Creature>(this);
-    if (creature && _game.party().isCountedItem(*item)) {
+    if (_game.party().countsReceivedItem(*this, *item)) {
         item->clearOwner();
-        _game.party().acquireCountedItem(*creature, *item);
+        _game.party().acquireReceivedItem(*this, *item);
         _game.destroyRuntimeObjectGraph(item);
         return nullptr;
     }
-    for (const auto &existing : _items) {
-        if (!existing->isStackCompatibleWith(*item)) {
-            continue;
-        }
-        if (existing->mergeStackFrom(*item)) {
-            item->clearOwner();
-            _game.destroyRuntimeObjectGraph(item);
-            return existing;
+    if (stacking == ItemStacking::Join) {
+        for (const auto &existing : _items) {
+            if (!existing->isStackCompatibleWith(*item)) {
+                continue;
+            }
+            if (existing->mergeStackFrom(*item)) {
+                // In KotOR a stack a new item joins is marked new too.
+                if (item->isNewlyAcquired() && !_game.isTSL()) {
+                    existing->setNewlyAcquired(true);
+                }
+                item->clearOwner();
+                _game.destroyRuntimeObjectGraph(item);
+                return existing;
+            }
         }
     }
     std::vector<std::shared_ptr<Item>> replacement(_items);
-    replacement.push_back(item);
+    placeItem(replacement, item);
     ItemAttributes replacementAttributes;
     if (creature) {
         replacementAttributes = creature->itemAttributes();
         replacementAttributes.addItem(item, _services.game);
     }
     _items = std::move(replacement);
-    item->setOwner(_id);
+    item->setOwner(*this);
     if (creature) {
         creature->itemAttributes() = std::move(replacementAttributes);
     }
@@ -1520,33 +1687,26 @@ void Object::faceAwayFrom(const Object &other) {
     setFacing(-glm::atan(dir.x, dir.y));
 }
 
-void Object::moveDropableItemsTo(Object &other) {
-    for (auto it = _items.begin(); it != _items.end();) {
-        if ((*it)->isDropable()) {
-            std::shared_ptr<Item> item(*it);
-            it = _items.erase(it);
-            handOverItem(item, other);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void Object::moveAllItemsTo(Object &other) {
+std::vector<Object::HandedOverItem> Object::moveAllItemsTo(Object &other) {
+    std::vector<HandedOverItem> result;
     while (!_items.empty()) {
         auto item = _items.back();
         _items.pop_back();
-        handOverItem(item, other);
+        auto held = handOverItem(item, other);
+        result.push_back({std::move(item), std::move(held)});
     }
+    return result;
 }
 
 // An item a party member is handed goes to the party's inventory.
-void Object::handOverItem(const std::shared_ptr<Item> &item, Object &other) {
+std::shared_ptr<Item> Object::handOverItem(const std::shared_ptr<Item> &item, Object &other) {
     if (Creature *creature = dyn_cast<Creature>(this)) {
         creature->itemAttributes().removeItem(item);
     }
     item->clearOwner();
-    _game.party().sharedInventoryReceiver(_game.getObjectById(other.id()))->addItem(item);
+    auto receiver = _game.party().sharedInventoryReceiver(_game.getObjectById(other.id()));
+    _game.party().noteItemReceived(*item, *receiver, this);
+    return receiver->addItem(item);
 }
 
 int Object::damageImmunity(int flags) const {
@@ -1596,6 +1756,21 @@ bool Object::applyEffect(const std::shared_ptr<Effect> &effect,
     }
     _linkAwaitingLastingEffect = false;
     return applied;
+}
+
+void Object::applyHardness(int hardness) {
+    if (hardness == 0) {
+        return;
+    }
+    auto effect = _game.newEffect<DamageResistanceEffect>(static_cast<DamageType>(kAllDamageTypeFlags), hardness, 0);
+    EffectInstance instance = effect->saveFacingInstance();
+    instance.effect = std::move(effect);
+    instance.exposed = 0;
+    instance.setDuration(DurationType::Permanent, 0.0f);
+    // It is given as the object loads, before the object is live.
+    instance.id = _game.allocateEffectId();
+    instance.materialize();
+    admitEffect(std::move(instance));
 }
 
 bool Object::applyEffect(EffectInstance effect) {
@@ -1878,27 +2053,30 @@ void Object::setFacing(float facing) {
     updateTransform();
 }
 
+void Object::updateSceneNodeEnabled() {
+    if (_sceneNode) {
+        _sceneNode->setEnabled(_present);
+        _sceneNode->setRendered(_visible);
+    }
+}
+
 void Object::setVisible(bool visible) {
     if (_visible == visible)
         return;
 
     _visible = visible;
 
-    if (_sceneNode) {
-        _sceneNode->setEnabled(_visible && _clientPresent);
-    }
+    updateSceneNodeEnabled();
 }
 
-void Object::setClientPresent(bool present) {
-    if (_clientPresent == present) {
+void Object::setPresent(bool present) {
+    if (_present == present) {
         return;
     }
 
-    _clientPresent = present;
+    _present = present;
 
-    if (_sceneNode) {
-        _sceneNode->setEnabled(_visible && _clientPresent);
-    }
+    updateSceneNodeEnabled();
 }
 
 std::shared_ptr<Item> Object::getFirstItem() {
@@ -1918,6 +2096,21 @@ std::shared_ptr<Item> Object::getItemByTag(const std::string &tag) {
     for (auto &item : _items) {
         if (item->tag() == tag)
             return item;
+        if (auto held = item->getItemByTag(tag)) {
+            return held;
+        }
+    }
+    return nullptr;
+}
+
+std::shared_ptr<Item> Object::getItemByItemType(int itemType) const {
+    for (const auto &item : _items) {
+        if (auto held = item->getItemByItemType(itemType)) {
+            return held;
+        }
+        if (item->itemType() == itemType) {
+            return item;
+        }
     }
     return nullptr;
 }
@@ -2077,6 +2270,7 @@ std::shared_ptr<Effect> Object::getNextEffect() {
 
 void Object::applyDamageEffect(
     int amount,
+    int,
     const std::shared_ptr<Object> &damager,
     std::optional<DamageReaction>) {
 
@@ -2109,6 +2303,126 @@ void Object::setFeedbackText(std::string text, float duration) {
         _feedbackText.clear();
     }
 }
+
+static constexpr int kLockedTextStrRef = 1439;
+static constexpr int kLockedLogStrRef = 1437;
+static constexpr float kLockedTextSeconds = 5.0f;
+
+void Object::presentLocked(const Lock &lock, float soundHeight) {
+    if (!lock.lockedSound().empty()) {
+        if (auto clip = _services.resource.audioClips.get(lock.lockedSound())) {
+            _services.audio.mixer.play(std::move(clip), audio::AudioType::Sound, kSingleShotPositionalSoundGroup, 1.0f, false,
+                                       _position + glm::vec3 {0.0f, 0.0f, soundHeight});
+        }
+    }
+    setFeedbackText(_services.resource.strings.getText(kLockedTextStrRef), kLockedTextSeconds);
+    _game.addFeedbackMessage(kLockedLogStrRef);
+}
+
+// Lock
+
+// TSL's standard DC to open a lock, before the difficulty shift.
+static constexpr int kStandardUnlockDC = 21;
+// A lock scaled to the PC level asks this much more than the level.
+static constexpr int kPCLevelUnlockBonus = 7;
+// An open-lock DC counts from 0 to 255; a count past 255 starts again from 0.
+static constexpr int kUnlockDCRange = 256;
+static constexpr int kUnlockedEvent = static_cast<int>(SavedSignalEventType::Unlocked);
+
+void Lock::deserialize(const resource::Gff &gff, bool tsl, bool placeable) {
+    if (placeable) {
+        _locked = false;
+        _lockable = false;
+        _keyRequired = false;
+        _autoRemoveKey = false;
+        _keyName.clear();
+        _openDC = 0;
+        _closeDC = 0;
+        _difficulty = LockDifficulty::None;
+        _difficultyModifier = 0;
+        _onLock.clear();
+        _onUnlock.clear();
+    } else if (tsl) {
+        _openDC = 0;
+        _pcLevelAtSpawn = 0;
+    }
+    gff.readBool(_locked, "Locked");
+    gff.readBool(_lockable, "Lockable");
+    gff.readBool(_keyRequired, "KeyRequired");
+    gff.readBool(_autoRemoveKey, "AutoRemoveKey");
+    gff.readString(_keyName, "KeyName");
+    uint8_t dc = 0;
+    if (gff.readByte(dc, "OpenLockDC")) {
+        _openDC = dc;
+    }
+    if (gff.readByte(dc, "CloseLockDC")) {
+        _closeDC = dc;
+    }
+    gff.readResRef(_onLock, "OnLock");
+    gff.readResRef(_onUnlock, "OnUnlock");
+    if (!tsl) {
+        return;
+    }
+    uint8_t difficulty = 0;
+    if (gff.readByte(difficulty, "OpenLockDiff")) {
+        _difficulty = static_cast<LockDifficulty>(difficulty);
+    }
+    int8_t modifier = 0;
+    if (gff.readChar(modifier, "OpenLockDiffMod")) {
+        _difficultyModifier = modifier;
+    }
+    uint8_t level = 0;
+    if (gff.readByte(level, "PCLevelAtSpawn")) {
+        _pcLevelAtSpawn = level;
+    }
+}
+
+int Lock::unlockDC(const Game &game) const {
+    if (!game.isTSL()) {
+        return _openDC;
+    }
+    const int shift = game.trapDifficultyModifier();
+    int dc = 0;
+    if (_difficulty == LockDifficulty::Set) {
+        dc = std::max(0, _openDC + shift);
+    } else {
+        dc = kStandardUnlockDC + shift + _difficultyModifier;
+        if (_difficulty == LockDifficulty::ScaledToPCLevel) {
+            dc += _pcLevelAtSpawn + kPCLevelUnlockBonus;
+        }
+    }
+    return (dc % kUnlockDCRange + kUnlockDCRange) % kUnlockDCRange;
+}
+
+void Lock::takePCLevel(Game &game) {
+    if (game.isTSL() && _pcLevelAtSpawn == 0) {
+        _pcLevelAtSpawn = game.getGlobalNumber("G_PC_LEVEL");
+    }
+}
+
+void Lock::onLocked(Object &owner, uint32_t lockerId) {
+    _lastLockedBy = lockerId;
+    if (!_onLock.empty()) {
+        owner.game().scriptRunner().run(_onLock, owner.id());
+    }
+}
+
+void Lock::signalUnlocked(Object &owner, const std::shared_ptr<Creature> &unlocker) const {
+    std::optional<std::reference_wrapper<const Object>> caller;
+    if (unlocker) {
+        caller = *unlocker;
+    }
+    owner.game().queueScriptEvent(owner, caller, Event(kUnlockedEvent));
+}
+
+void Lock::onUnlocked(Object &owner, uint32_t unlockerId) {
+    _lastUnlockedBy = unlockerId;
+    if (!_onUnlock.empty()) {
+        owner.game().scriptRunner().run(_onUnlock, owner.id());
+    }
+}
+
+// END Lock
 
 } // namespace game
 

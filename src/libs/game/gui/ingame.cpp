@@ -45,11 +45,11 @@ static constexpr int kEquipSlotTutorial = 11;
 static constexpr int kMessagesTutorial = 12;
 static constexpr int kMapTutorial = 13;
 static constexpr int kInventoryTutorial = 20;
-static constexpr int kSkillsViewTutorial = 36;
 
 void InGameMenu::init() {
     _host = std::make_unique<InGameMenuHost>(_game.gameId(), _game.options().graphics,
-        _presentation, [this](InGameMenuTab tab) { navigate(tab); }, [this]() { return footer(); });
+        _presentation, [this](InGameMenuTab tab) { navigate(tab); }, [this]() { return footer(); },
+        [this](int member) { changeCharacter(member); });
     _host->init();
     loadEquipment();
     loadInventory();
@@ -121,9 +121,24 @@ void InGameMenu::loadMap() {
 }
 
 void InGameMenu::loadOptions() {
-    _options = std::make_shared<OptionsMenu>(_game, _services);
+    _options = std::make_shared<OptionsMenu>(_game, _services, true);
     _options->init();
     _host->registerScreen(InGameMenuTab::Options, _options);
+}
+
+void InGameMenu::leaveTab(InGameMenuTab next) {
+    if (next != InGameMenuTab::Equipment) {
+        closeEquipment();
+    }
+    const InGameMenuTab left = activeTab();
+    if (left == next) {
+        return;
+    }
+    if (left == InGameMenuTab::Inventory) {
+        _inventory->markViewedItemsSeen();
+    } else if (left == InGameMenuTab::Journal) {
+        _journal->markReadQuestsSeen();
+    }
 }
 
 void InGameMenu::closeEquipment() {
@@ -145,6 +160,7 @@ std::shared_ptr<Creature> InGameMenu::equipmentCharacter() const {
 }
 
 void InGameMenu::openEquipment() {
+    leaveTab(InGameMenuTab::Equipment);
     if (!_equipmentOpen) {
         _equip->beginSession();
         _equipmentOpen = true;
@@ -154,6 +170,7 @@ void InGameMenu::openEquipment() {
 }
 
 void InGameMenu::openEquipmentItems() {
+    leaveTab(InGameMenuTab::Equipment);
     if (!_equipmentOpen) {
         _equip->beginSession();
         _equipmentOpen = true;
@@ -163,7 +180,7 @@ void InGameMenu::openEquipmentItems() {
 }
 
 void InGameMenu::openInventory() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Inventory);
     _inventory->refreshPortraits();
     _inventory->refreshItems();
     _host->changeTab(InGameMenuTab::Inventory);
@@ -171,23 +188,19 @@ void InGameMenu::openInventory() {
 }
 
 void InGameMenu::openCharacter() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Character);
     _character->refreshControls();
     _host->changeTab(InGameMenuTab::Character);
 }
 
 void InGameMenu::openAbilities() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Abilities);
     _abilities->refreshControls();
     _host->changeTab(InGameMenuTab::Abilities);
-    // TSL opens abilities on the skills view.
-    if (_game.isTSL()) {
-        _game.requestTutorialWindow(kSkillsViewTutorial);
-    }
 }
 
 void InGameMenu::openPartySelection() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Party);
     // The tab being left lets go of what it showed before the party screen
     // brings its companions into being.
     _host->changeTab(InGameMenuTab::Party);
@@ -195,7 +208,7 @@ void InGameMenu::openPartySelection() {
 }
 
 void InGameMenu::openMessages() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Messages);
     _messages->refresh();
     _messages->resetFilter();
     _host->changeTab(InGameMenuTab::Messages);
@@ -203,20 +216,20 @@ void InGameMenu::openMessages() {
 }
 
 void InGameMenu::openJournal() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Journal);
     _journal->refresh();
     _host->changeTab(InGameMenuTab::Journal);
 }
 
 void InGameMenu::openMap() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Map);
     _map->refreshControls();
     _host->changeTab(InGameMenuTab::Map);
     _game.requestTutorialWindow(kMapTutorial);
 }
 
 void InGameMenu::openOptions() {
-    closeEquipment();
+    leaveTab(InGameMenuTab::Options);
     _host->changeTab(InGameMenuTab::Options);
 }
 
@@ -227,6 +240,8 @@ void InGameMenu::update(float dt) { _host->update(dt); }
 void InGameMenu::render() { _host->render(); }
 std::shared_ptr<Button> InGameMenu::getBtnChange2() { return _host->getBtnChange2(); }
 std::shared_ptr<Button> InGameMenu::getBtnChange3() { return _host->getBtnChange3(); }
+
+InGameMenuTab InGameMenu::activeTab() const { return _host ? _host->activeTab() : InGameMenuTab::None; }
 
 void InGameMenu::navigate(InGameMenuTab tab) {
     switch (tab) {
@@ -240,6 +255,22 @@ void InGameMenu::navigate(InGameMenuTab tab) {
     case InGameMenuTab::Map: openMap(); break;
     case InGameMenuTab::Options: openOptions(); break;
     default: break;
+    }
+}
+
+void InGameMenu::changeCharacter(int member) {
+    if (!_game.party().selectStandingMember(member)) {
+        return;
+    }
+    switch (activeTab()) {
+    case InGameMenuTab::Equipment:
+    case InGameMenuTab::Inventory:
+    case InGameMenuTab::Character:
+    case InGameMenuTab::Abilities:
+        navigate(activeTab());
+        break;
+    default:
+        break;
     }
 }
 
@@ -277,6 +308,29 @@ InGameMenuFooter InGameMenu::footer() const {
     int hp = leader->maxHitPoints();
     view.vitalityPercent = hp > 0 ? std::clamp(100 * leader->currentHitPoints() / hp, 0, 100) : 0;
     return view;
+}
+
+int subScreenId(InGameMenuTab tab) {
+    switch (tab) {
+    case InGameMenuTab::Equipment:
+        return 1;
+    case InGameMenuTab::Inventory:
+        return 2;
+    case InGameMenuTab::Character:
+        return 3;
+    case InGameMenuTab::Abilities:
+        return 4;
+    case InGameMenuTab::Map:
+        return 5;
+    case InGameMenuTab::Journal:
+        return 6;
+    case InGameMenuTab::Options:
+        return 7;
+    case InGameMenuTab::Messages:
+        return 8;
+    default:
+        return 0;
+    }
 }
 
 } // namespace game

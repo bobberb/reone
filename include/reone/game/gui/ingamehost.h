@@ -47,8 +47,9 @@ public:
     InGameMenuHost(resource::GameID gameId, const graphics::GraphicsOptions &options,
                    PresentationServices services,
                    std::function<void(InGameMenuTab)> navigate,
-                   std::function<InGameMenuFooter()> footer = {}) :
-        PresentationGUI(gameId, options, services), _navigate(std::move(navigate)), _footer(std::move(footer)) {
+                   std::function<InGameMenuFooter()> footer = {},
+                   std::function<void(int)> changeCharacter = {}) :
+        PresentationGUI(gameId, options, services), _navigate(std::move(navigate)), _footer(std::move(footer)), _changeCharacter(std::move(changeCharacter)) {
         _resRef = guiResRef("top");
     }
 
@@ -102,6 +103,9 @@ private:
         std::shared_ptr<gui::Label> LBL_DEBILATATED1;
         std::shared_ptr<gui::Label> LBL_DEBILATATED2;
         std::shared_ptr<gui::Label> LBL_DEBILATATED3;
+        std::shared_ptr<gui::Label> LBL_DISABLED1;
+        std::shared_ptr<gui::Label> LBL_DISABLED2;
+        std::shared_ptr<gui::Label> LBL_DISABLED3;
         std::shared_ptr<gui::Label> LBL_DISABLE1;
         std::shared_ptr<gui::Label> LBL_DISABLE2;
         std::shared_ptr<gui::Label> LBL_DISABLE3;
@@ -129,6 +133,8 @@ private:
     InGameMenuTab _tab {InGameMenuTab::None};
     std::function<void(InGameMenuTab)> _navigate;
     std::function<InGameMenuFooter()> _footer;
+    /** Hands control to the party member a footer portrait shows. */
+    std::function<void(int)> _changeCharacter;
 
     void preload(gui::IGUI &gui) override;
     void onGUILoaded() override;
@@ -167,6 +173,9 @@ private:
         _controls.LBL_DEBILATATED1 = findControl<gui::Label>("LBL_DEBILATATED1");
         _controls.LBL_DEBILATATED2 = findControl<gui::Label>("LBL_DEBILATATED2");
         _controls.LBL_DEBILATATED3 = findControl<gui::Label>("LBL_DEBILATATED3");
+        _controls.LBL_DISABLED1 = findControl<gui::Label>("LBL_DISABLED1");
+        _controls.LBL_DISABLED2 = findControl<gui::Label>("LBL_DISABLED2");
+        _controls.LBL_DISABLED3 = findControl<gui::Label>("LBL_DISABLED3");
         _controls.LBL_DISABLE1 = findControl<gui::Label>("LBL_DISABLE1");
         _controls.LBL_DISABLE2 = findControl<gui::Label>("LBL_DISABLE2");
         _controls.LBL_DISABLE3 = findControl<gui::Label>("LBL_DISABLE3");

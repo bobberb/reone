@@ -27,6 +27,13 @@
 
 namespace reone {
 
+namespace audio {
+
+class AudioClip;
+class AudioSource;
+
+} // namespace audio
+
 namespace game {
 
 class Creature;
@@ -59,6 +66,8 @@ public:
             game,
             services) {
     }
+
+    ~AreaOfEffect();
 
     static bool classof(const Object *from) {
         return from->type() == ObjectType::AreaOfEffect;
@@ -100,6 +109,8 @@ public:
     /** Radius of the circle, or of the circle around the rectangle. */
     float boundingRadius() const { return _radius; }
     bool contains(const glm::vec3 &point) const;
+    /** Whether the step from \p from to \p to crosses the edge of the shape. */
+    bool crosses(const glm::vec3 &from, const glm::vec3 &to) const;
     /**
      * Fix a rectangle's corners where it is placed, its length along the
      * facing and centred on the position; they stay there when it later jumps.
@@ -108,14 +119,22 @@ public:
 
     /** Test the creatures of the area against the shape, signalling each entry and exit when announce is set. */
     void scanOccupants(bool announce = true);
-    /** Note where a creature now stands, signalling an entry or exit when announce is set. */
-    void updateOccupancy(const std::shared_ptr<Creature> &creature, bool announce);
+    /**
+     * Note where a creature now stands, signalling an entry or exit when
+     * announce is set. A step from \p from that crosses the edge and ends on
+     * the side it began on signals an entry and an exit: an exit first for a
+     * creature inside.
+     */
+    void updateOccupancy(const std::shared_ptr<Creature> &creature, bool announce,
+                         std::optional<glm::vec3> from = std::nullopt);
     /** Forget a creature leaving the world, without running OnExit. */
     void forgetOccupant(uint32_t objectId) { _occupants.erase(objectId); }
     /** The carrier jumped: occupants leave, the shape moves to it, and the creatures there enter. */
     void jumpToCarrier();
     /** The area of effect is going: OnExit runs at once for every occupant still inside. */
     void releaseOccupants();
+    /** The area of effect is going: its cessation sound plays and its duration sound stops. */
+    void stopSounds();
 
     /** A creature entered: it is the last to enter and the enter script runs. */
     void receiveEnteredSignal(const std::shared_ptr<Object> &entering);
@@ -155,6 +174,13 @@ private:
     std::set<uint32_t> _occupants;
     std::array<glm::vec2, 4> _corners {};
 
+    /** The row's sounds have started, on the first update. */
+    bool _soundsStarted {false};
+    /** The effect was restored from a save, so its impact sound has played already. */
+    bool _restored {false};
+    std::shared_ptr<audio::AudioSource> _durationSound;
+    std::shared_ptr<audio::AudioClip> _cessationSound;
+
     void setShape(Shape shape, float radiusOrWidth, float length);
     /** A reference to a live object, or an invalid one for none. */
     SavedObjectReference referenceTo(const std::shared_ptr<Object> &object) const;
@@ -163,6 +189,10 @@ private:
     bool isOccupantInside(const Object &object) const;
     void followCarrier();
     void destroy();
+    /** The row's impact sound plays and its duration sound starts looping. */
+    void startSounds();
+    /** Where the sounds of the area of effect play: above its position. */
+    glm::vec3 soundPosition() const;
 };
 
 } // namespace game

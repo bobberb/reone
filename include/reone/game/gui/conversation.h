@@ -18,6 +18,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <map>
 
 #include "reone/audio/source.h"
@@ -42,6 +43,14 @@ class ListBox;
 
 namespace game {
 
+/**
+ * \p speaker voices the first start entry of dialog \p resRef that names no
+ * speaker, whose condition holds with the speaker as caller and that has no
+ * replies, showing no text, then runs the entry's first script as the
+ * speaker. False when no entry qualifies.
+ */
+bool speakOneLiner(Game &game, ServicesView &services, Object &speaker, const std::string &resRef);
+
 class Conversation : public GameGUI {
     friend class TestConversation;
 
@@ -50,22 +59,36 @@ public:
         GameGUI(game, services) {
     }
 
+    /** Input waits until the first line is spoken. */
     bool handle(const input::Event &event) override;
+    /** Nothing is drawn until the first line is spoken. */
+    void render() override;
     void update(float dt) override;
 
     /**
      * Start \p dialog owned by \p owner. \p listener is the object that
-     * started the conversation with the owner, when there is one.
+     * started the conversation with the owner, when there is one. A
+     * conversation that opens calls \p opening before its first entry shows;
+     * one that starts on a one-liner barks it without opening, and one with no
+     * active start entry ends without opening.
      */
     void start(const std::shared_ptr<resource::Dialog> &dialog, const std::shared_ptr<Object> &owner,
                GlobalFade::DialogTicket admission = {},
-               const std::shared_ptr<Object> &listener = nullptr);
+               const std::shared_ptr<Object> &listener = nullptr,
+               const std::function<void()> &opening = {});
     void cleanupForModuleTransition();
 
     /** True from start() until the conversation has finished or been cleaned up. */
     bool isRunning() const { return _dialog && _fadeDialog; }
 
     CameraType getCamera(int &cameraId) const;
+    /**
+     * A script shows placed camera \p cameraId until the next entry or reply
+     * takes its own shot; the entry under way keeps it over its own shot. A
+     * computer conversation shows the camera's feed in the security-camera
+     * look, and a cinematic one only a camera its area places.
+     */
+    void showPlacedCamera(int cameraId);
 
     void pause();
 
@@ -88,8 +111,36 @@ public:
     /** The conversation's dialog is an animated cutscene. */
     bool isAnimatedCutscene() const { return _dialog && _dialog->isAnimatedCutscene(); }
 
+    /**
+     * The time a line of \p text takes to speak, in seconds: a second, and a
+     * little more for each character.
+     */
+    static float spokenLineSeconds(const std::string &text);
+
 protected:
+    /** The video effect values a shot can carry besides a videoeffects.2da row. */
+    static constexpr int kNoShotVideoEffect = -1;
+    static constexpr int kKeepShotVideoEffect = -2;
+
     std::shared_ptr<Object> owner() const { return _owner.resolve(); }
+    /** Where a participant's name is read, which decides the names that stand for someone. */
+    enum class ParticipantSite {
+        /** An entry's or a reply's speaker or listener: OWNER, and in KotOR PLAYER, whatever their case. */
+        Speaker,
+        /** An animation's participant: PLAYER, OWNER, NPC1 and NPC2, as written. */
+        Animation,
+        /** A stunt's participant: PLAYER, and OWNER or nothing, as written. */
+        Stunt
+    };
+    /**
+     * The object a participant name names at \p site: one the site's names
+     * stand for (the owner, the player, the party's second or third member),
+     * or else the object with the tag nearest the owner, the owner itself
+     * first, dead or alive. Tags match whatever their case.
+     */
+    std::shared_ptr<Object> resolveParticipantObject(const std::string &participant, ParticipantSite site) const;
+    /** The current entry's speaker: the participant its speaker tag names, or else the owner. */
+    std::shared_ptr<Object> currentEntrySpeaker() const;
     std::shared_ptr<resource::Dialog> _dialog;
     RuntimeObjectRef<Object> _owner;
     /** The object that started the conversation with the owner. */
@@ -117,8 +168,16 @@ protected:
     void takeCameraShot(const resource::Dialog::EntryReply &shot, int angle);
     /** The dialog camera shows the shot, as for a placed camera the area lacks. */
     void showShotOnDialogCamera() { _shotCamera = CameraType::Dialog; }
+    /**
+     * The view takes placed camera \p cameraId at a script's request.
+     *
+     * @return false when there is no such camera to show
+     */
+    virtual bool takePlacedCameraView(int cameraId);
     /** The camera shot of \p shot, an entry or a reply, keeps the previous speaker pair. */
     static bool keepsPreviousSpeakerPair(const resource::Dialog::EntryReply &shot);
+    /** Set or clear the video effect for the cinematic camera shot of \p shot, an entry or a reply. */
+    void applyCinematicShotVideoEffect(const resource::Dialog::EntryReply &shot);
 
     /** The current entry's sole reply is taken when the entry ends, rather than its replies listed. */
     bool autoPicksFirstReply() const { return _autoPickFirstReply; }
@@ -157,8 +216,11 @@ protected:
     /** One line per reply, in reply order; an empty line stands for a reply that is not listed. */
     virtual void setReplyLines(std::vector<std::string> lines) = 0;
 
-    // How a one-liner presents its entry, alongside setMessage/setReplyLines.
-    virtual void setBarkText(std::string text, float duration);
+    /**
+     * How a one-liner presents its entry, alongside setMessage/setReplyLines:
+     * barked by \p speaker, or with no speaker, near it unless \p ignoresDistance.
+     */
+    virtual void setBarkText(std::string text, float duration, uint32_t speaker, bool ignoresDistance);
 
     virtual void onStart();
     virtual void onFinish();
@@ -200,6 +262,8 @@ private:
     int _waitFlags {0};
     /** The entry that follows a reply taken without a choice, once the reply's delay and waits are over. */
     std::optional<int> _pendingEntry;
+    /** The start entry waiting until conversations may speak (Game::passDialogGate). */
+    std::optional<int> _unspokenStartEntry;
     /** A skip of the shown entry has been asked for and not yet honoured. */
     bool _entrySkipped {false};
     EntryFade _entryFade;
@@ -210,8 +274,12 @@ private:
     AutoSkip *_autoSkip {nullptr};
     GlobalFade::DialogTicket _fadeDialog;
     uint64_t _generation {0};
+    /** Steps whose scripts run, or wait at a movie, before the rest of the step goes on (see runScripts). */
+    int _heldSteps {0};
     /** The objects this conversation has made its participants. */
     std::vector<RuntimeObjectRef<Object>> _dialogParticipants;
+    /** The creatures this conversation has put items away for. */
+    std::vector<RuntimeObjectRef<Creature>> _unequippedCreatures;
 
     /**
      * A walk through a cycle of values, which starts where the dialog's name
@@ -265,15 +333,32 @@ private:
 
     /** Make \p object a participant of this conversation, unless another conversation still holds it. */
     void attachDialogParticipant(const std::shared_ptr<Object> &object);
-    /** Release the participants that \p owner's conversation still holds. */
+    /**
+     * Release the participants that \p owner's conversation still holds, and
+     * give back the items it put away.
+     */
     void releaseDialogParticipants(const std::shared_ptr<Object> &owner);
+    /**
+     * A dialog that unequips puts away the items of the creatures a node
+     * shows: an entry's speaker and listener, the player character, and the
+     * creatures it animates; a reply's listener and the creatures it animates.
+     */
+    void unequipEntryParticipants();
+    void unequipReplyParticipants();
+    void unequipNodeParticipant(const std::shared_ptr<Object> &object);
+    void unequipNodeAnimationParticipants(const resource::Dialog::EntryReply &node);
     /** Run the end-dialogue scripts of the creatures and placeables in \p owner's area. */
     void runAreaEndDialogScripts(const Object &owner);
 
     bool isCurrent(uint64_t generation) const;
 
     void loadCameraModel();
-    void loadStartEntry();
+    void loadStartEntry(const std::function<void()> &opening);
+    /**
+     * Whether the conversation, starting on \p entry, is a one-liner: an
+     * entry with no replies, or with one reply that leads to no entry.
+     */
+    bool isOneLiner(const resource::Dialog::EntryReply &entry) const;
     /** Plays the current entry's voice: \p sound, or else its voice-over. */
     void loadVoiceOver(const std::string &sound);
     void scheduleEndOfEntry();
@@ -320,7 +405,13 @@ private:
     bool isLinkActive(const resource::Dialog::EntryReplyLink &link);
     bool evaluateCondition(const std::string &scriptResRef, const resource::Dialog::EntryReplyLink::ConditionParams &params);
     void runScript(const std::string &scriptResRef, const resource::Dialog::EntryReply::ActionParams &params);
-    void runScripts(const resource::Dialog::EntryReply &node);
+    /**
+     * Runs the node's first and second scripts, then \p rest, while the
+     * conversation stays current. What follows a script that stops to wait at
+     * a movie goes on once no runs wait, as though the movie played inside
+     * the call.
+     */
+    void runScripts(const resource::Dialog::EntryReply &node, std::function<void()> rest = nullptr);
     void applyStatusSummaryEntries(const resource::Dialog::EntryReply &node);
     /** Set or clear the video effect for the current entry's camera shot. */
     void applyShotVideoEffect();

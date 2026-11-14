@@ -17,6 +17,10 @@
 
 #pragma once
 
+#include <array>
+#include <map>
+#include <optional>
+
 #include "reone/graphics/font.h"
 #include "reone/graphics/texture.h"
 #include "reone/gui/control.h"
@@ -51,14 +55,27 @@ public:
 
     bool handle(const input::Event &event);
     void update(float dt);
-    void render();
+    /** Draw the reticles and the target menu, whose icons all grey while \p leaderDown. */
+    void render(bool leaderDown);
 
 private:
+    /** The target menu's columns. */
+    static constexpr int kNumActionSlots = 3;
+
     enum class ActionBand {
         None,
         Previous,
         Icon,
         Next
+    };
+
+    /** Targets that share a column memory. */
+    enum class SelectionGroup {
+        HostileCreature,
+        OtherCreatureOrFixture,
+        DoorOrContainer,
+        Mine,
+        None
     };
 
     Game &_game;
@@ -81,14 +98,31 @@ private:
     std::vector<ActionSlot> _actionSlots;
     glm::vec3 _hilightedScreenCoords {0.0f};
     glm::vec3 _selectedScreenCoords {0.0f};
+    /** Where the action menu of the selected object stands on screen. */
+    glm::vec3 _menuScreenCoords {0.0f};
+    /** The object the action menu last stood over. */
+    uint32_t _menuObjectId {0};
+    /** How much longer the action menu stays where it is after the pointer left it. */
+    float _menuHoldSeconds {0.0f};
     int _reticleHeight {0};
     /** The hover reticle's size in pixels, by the object's distance from the leader. */
     int _hilightedReticleSize {0};
     int _selectedActionSlot {-1};
     ActionBand _hilightedActionBand {ActionBand::None};
     bool _hilightedHostile {false};
+    /**
+     * Whether the selected target is a creature shown and offered as hostile:
+     * one hostile to the leader, or any while the dead-target hold runs.
+     */
     bool _selectedHostile {false};
     bool _hasActions {false};
+    /** The group of the selected target, whose entries the columns show. */
+    SelectionGroup _selectionGroup {SelectionGroup::None};
+    /**
+     * For each group of targets, the entry each column is set to. While a
+     * column does not offer its entry, it shows its first.
+     */
+    std::map<SelectionGroup, std::array<std::optional<EntryIdentity>, kNumActionSlots>> _selections;
     ActionMenuFeedback _feedback;
 
     bool handleMouseMotion(const input::MouseMotionEvent &event);
@@ -96,14 +130,17 @@ private:
     bool handleMouseWheel(const input::MouseWheelEvent &event);
 
     void renderReticle(graphics::Texture &texture, const glm::vec3 &screenCoords, float width, float height, float alpha);
+    void updateMenuScreenCoords(const Object &object, const glm::mat4 &projection, const glm::mat4 &view, float dt);
     void renderTitleBar();
+    /** The name the title bar gives \p object. */
+    std::string nameLabel(const Object &object) const;
     void renderHealthBar();
-    void renderActionBar();
+    void renderActionBar(bool leaderDown);
 
     void renderActionFrame(int index);
     void renderActionArrows(int index);
     void renderActionArrow(int index, bool previous);
-    void renderActionIcon(int index);
+    void renderActionIcon(int index, bool leaderDown);
 
     bool getActionScreenCoords(int index, float &x, float &y) const;
     float layoutScale() const;

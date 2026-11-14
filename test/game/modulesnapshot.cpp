@@ -43,6 +43,7 @@
 #include "reone/game/object/store.h"
 #include "reone/game/object/trigger.h"
 #include "reone/game/object/waypoint.h"
+#include "reone/game/savedruntime.h"
 #include "reone/game/script/savedsituation.h"
 #include "reone/resource/format/erfreader.h"
 #include "reone/resource/format/gffreader.h"
@@ -179,6 +180,11 @@ void reone::game::TestGameModule::setSnapshotDoorState(
     door._state = state;
 }
 
+void reone::game::TestGameModule::setSnapshotDoorOneShot(
+    Door &door, std::string clip) {
+    door._stateOneShot = std::move(clip);
+}
+
 void reone::game::TestGameModule::configureSnapshotLinkedDoor(
     Door &door, std::string module, std::string entry) {
     door._appearance = 0;
@@ -186,14 +192,9 @@ void reone::game::TestGameModule::configureSnapshotLinkedDoor(
     door._linkedToFlags = 2;
     door._linkedToModule = std::move(module);
     door._linkedTo = std::move(entry);
-    door._linkedTransitionGeometry = {
+    door._outline = {
         {-1.0f, -0.5f, 0.0f}, {-1.0f, 0.5f, 0.0f},
         {1.0f, 0.5f, 0.0f}, {1.0f, -0.5f, 0.0f}};
-}
-
-void reone::game::TestGameModule::markSnapshotLinkedDoorHelper(
-    Trigger &trigger) {
-    trigger._linkedDoorTransition = true;
 }
 
 void reone::game::TestGameModule::configureSnapshotCamera(
@@ -407,7 +408,9 @@ TEST_F(TslPartySnapshotFixture, retained_npc_and_puppet_are_not_git_creatures) {
         ASSERT_EQ(1u, creatures.size());
         EXPECT_EQ("remote", creatures.front()->getString("Tag"));
         EXPECT_EQ(worldCreature->id(), creatures.front()->getUint("ObjectId"));
-        EXPECT_EQ(puppet->id(), saved.snapshot->ifo->getUint("Mod_NextObjId0"));
+        // The puppet is not a GIT record, but the graph names its identity so
+        // saved values can point at it, so the cursor sits past it.
+        EXPECT_EQ(puppet->id() + 1, saved.snapshot->ifo->getUint("Mod_NextObjId0"));
 
         EXPECT_TRUE(game.party().isPuppet(0));
         EXPECT_EQ(
@@ -646,8 +649,9 @@ TEST_F(SnapshotFixture, writes_and_reopens_complete_deterministic_module_state) 
     ASSERT_EQ(e2Creature.savedEffects().size(), 1);
     ASSERT_EQ(e2Creature.savedActionQueue().actions.size(), 1);
 
+    ASSERT_TRUE(git->findStruct("AreaProperties"));
     EXPECT_TRUE(git->findStruct("AreaProperties")->getBool("Unescapable"));
-    EXPECT_EQ(are->getUint("StealthXPCurrent"), 30u);
+    EXPECT_EQ(git->findStruct("AreaProperties")->getUint("StealthXPCurrent"), 30u);
     EXPECT_EQ(are->getString("FutureArea"), "preserve-area");
     EXPECT_EQ(git->getString("FutureGit"), "preserve-git");
     EXPECT_EQ(git->getList("Creature List").size(), 0);
@@ -853,35 +857,40 @@ TEST_F(SnapshotFixture, writes_creature_vitality_on_the_retail_base_axis) {
     EXPECT_EQ(26, record->getInt("CurrentHitPoints"));
 }
 
-TEST_F(SnapshotFixture, linked_door_helpers_are_derived_not_saved_git_members) {
+// Current hit points are a Short in the save. Damage can take them far below
+// what a Short holds; saved as they are, -99975 would read back as 31097 and
+// a dead creature or door would come back alive.
+TEST_F(SnapshotFixture, hit_points_far_below_a_short_save_as_the_lowest_short) {
+    auto creature = game.newCreature();
+    creature->setPC(false);
+    creature->setMaxHitPoints(25);
+    creature->setCurrentHitPoints(-99975);
+    TestGameModule::addSnapshotObject(*area, creature);
+    auto door = game.newDoor();
+    door->setCurrentHitPoints(-99990);
+    TestGameModule::addSnapshotObject(*area, door);
+
+    auto saved = ModuleSnapshotBuilder(game, "tat_m17ab").build();
+
+    ASSERT_TRUE(saved) << saved.message;
+    auto creatureRecord = recordById(*saved.snapshot->git, "Creature List", creature->id());
+    ASSERT_TRUE(creatureRecord);
+    EXPECT_EQ(-32768, creatureRecord->getInt("CurrentHitPoints"));
+    auto doorRecord = recordById(*saved.snapshot->git, "Door List", door->id());
+    ASSERT_TRUE(doorRecord);
+    EXPECT_EQ(-32768, doorRecord->getInt("CurrentHP"));
+}
+
+TEST_F(SnapshotFixture, linked_doors_keep_their_link_beside_saved_triggers) {
     auto door = game.newDoor();
     door->setTag("linked_door");
     TestGameModule::configureSnapshotLinkedDoor(
         *door, "destination_module", "Destination_Entry");
     TestGameModule::addSnapshotObject(*area, door);
 
-    auto helper = game.newTrigger();
-    TestGameModule::markSnapshotLinkedDoorHelper(*helper);
-    TestGameModule::addSnapshotObject(*area, helper);
-
     auto authored = game.newTrigger();
     authored->setTag("authored_trigger");
     TestGameModule::addSnapshotObject(*area, authored);
-
-    ASSERT_TRUE(helper->isLinkedDoorTransition());
-    ASSERT_FALSE(authored->isLinkedDoorTransition());
-
-    // A stale helper in the root shadow must not resurrect when authoritative
-    // live membership replaces TriggerList.
-    auto staleHelper = Gff::Builder().type(1)
-        .field(Gff::Field::newDword("ObjectId", helper->id()))
-        .field(Gff::Field::newCExoString("Tag", "stale_helper"))
-        .build();
-    auto rootShadow = Gff::Builder().type(0xffffffff)
-        .field(Gff::Field::newList("TriggerList", {staleHelper}))
-        .build();
-    game.captureSaveResourceShadow(
-        {SaveResourceKind::AreaGit, "tat_m17ab"}, *rootShadow);
 
     for (int activation = 0; activation < 3; ++activation) {
         SCOPED_TRACE(activation);
@@ -890,7 +899,6 @@ TEST_F(SnapshotFixture, linked_door_helpers_are_derived_not_saved_git_members) {
         const auto &triggers = saved.snapshot->git->getList("TriggerList");
         ASSERT_EQ(triggers.size(), 1u);
         EXPECT_EQ(triggers.front()->getUint("ObjectId"), authored->id());
-        EXPECT_FALSE(recordById(*saved.snapshot->git, "TriggerList", helper->id()));
 
         auto doorRecord = recordById(
             *saved.snapshot->git, "Door List", door->id());
@@ -1854,14 +1862,9 @@ TEST_F(SnapshotFixture, use_feat_save_is_observational_across_runtime_phases) {
     action->execute(action, *attacker, 0.0f);
     ASSERT_TRUE(action->locked());
     ASSERT_NE(action->result(), AttackResultType::Invalid);
-    expectCanonicalSnapshot(); // rolled, before the impact phase
-
-    action->execute(action, *attacker, 0.0f);
-    expectCanonicalSnapshot(); // waiting for impact
-    action->execute(action, *attacker, 1.0f);
-    expectCanonicalSnapshot(); // buffered impacts are delivered atomically
-    action->execute(action, *attacker, 0.0f);
-    expectCanonicalSnapshot(); // near completion, awaiting the round boundary
+    // The attack is over with its swing; the round lands its hits.
+    ASSERT_TRUE(action->isCompleted());
+    EXPECT_TRUE(attacker->saveActionSnapshot().empty());
 
     const auto sourceResult = action->result();
     const auto sourceHitPoints = target->currentHitPoints();
@@ -1876,7 +1879,7 @@ TEST_F(SnapshotFixture, use_feat_save_is_observational_across_runtime_phases) {
     EXPECT_EQ(attacker->actions(), sourceQueue);
     EXPECT_TRUE(action->locked());
     EXPECT_FALSE(action->isCancelled());
-    EXPECT_FALSE(action->isCompleted());
+    EXPECT_TRUE(action->isCompleted());
 }
 
 TEST_F(SnapshotFixture, physical_feat_talent_dispatcher_exports_its_canonical_action) {
@@ -2261,6 +2264,97 @@ TEST_F(SnapshotFixture, structural_module_references_restore_onto_a_different_ru
     ASSERT_EQ(events.size(), 1u);
     EXPECT_EQ(events.front().object.boundObject(), restoredModule);
     EXPECT_EQ(events.front().caller.boundObject(), restoredModule);
+}
+
+TEST_F(SnapshotFixture, saved_reference_to_a_companion_reaches_whoever_holds_its_roster_slot) {
+    auto companion = game.newCreature();
+    companion->setPC(false);
+    companion->setTag("companion");
+    ASSERT_TRUE(game.party().addAvailableMember(2, companion));
+    ASSERT_TRUE(game.party().addMember(2, companion));
+    TestGameModule::addSnapshotObject(*area, companion);
+    SavedEventRecord event;
+    event.day = 1;
+    event.time = 500;
+    event.object = SavedObjectReference::fromRuntimeId(companion->id());
+    event.caller = SavedObjectReference::fromRuntimeId(companion->id());
+    event.eventId = static_cast<uint32_t>(SavedEventType::DestroyObject);
+    game.module()->enqueueSaveEvent(event);
+
+    auto saved = ModuleSnapshotBuilder(game, "tat_m17ab").build();
+
+    // The companion is no record of the graph, but its identity is listed
+    // beside the roster slot it stands for, and the event names it.
+    ASSERT_TRUE(saved) << saved.message;
+    auto &ifo = *saved.snapshot->ifo;
+    const auto &partyIds = ifo.getList("Mod_PartyObjIds");
+    ASSERT_EQ(1u, partyIds.size());
+    EXPECT_EQ(kSavedPartyIdentityNpc, partyIds.front()->getUint("PartyIdKind"));
+    EXPECT_EQ(2, partyIds.front()->getInt("PartyIdSlot"));
+    const uint32_t savedId = partyIds.front()->getUint("ObjectId");
+    auto serialized = SavedEventQueue::fromGff(ifo, snapshotIdentityContext());
+    ASSERT_EQ(1u, serialized.events.size());
+    EXPECT_EQ(savedId, serialized.events.front().object.id);
+
+    // Loaded by a game whose companion in that slot is another creature, the
+    // event reaches that creature.
+    const auto context = SerializedIdentityContext::moduleGraph("tat_m17ab");
+    Game restored(
+        GameID::KotOR, "", engine.options(), engine.services(), console);
+    restored.prepareSavedRuntimeNamespace(ifo, context);
+    auto restoredModule = restored.newSavedModule();
+    TestGameModule::registerSavedModuleReferenceTarget(
+        restored, restoredModule, context);
+    auto restoredCompanion = restored.newCreature();
+    restoredCompanion->setPC(false);
+    ASSERT_NE(savedId, restoredCompanion->id());
+    ASSERT_TRUE(restored.party().addAvailableMember(2, restoredCompanion));
+    ASSERT_TRUE(restored.party().addMember(2, restoredCompanion));
+    TestGameModule::registerSavedPartyIdentities(restored, ifo, context);
+    restoredModule->deserializeSavedEventQueue(ifo, context);
+    restoredModule->bindSavedEventQueue();
+    const auto &events = restoredModule->savedEventQueue().events;
+    ASSERT_EQ(1u, events.size());
+    EXPECT_EQ(restoredCompanion, events.front().object.boundObject());
+    EXPECT_EQ(restoredCompanion, events.front().caller.boundObject());
+}
+
+TEST_F(SnapshotFixture, door_saved_mid_swing_saves_the_state_the_swing_reaches) {
+    auto addDoor = [&](const std::string &tag) {
+        auto door = game.newDoor();
+        door->setTag(tag);
+        auto source = Gff::Builder().type(8)
+                          .field(Gff::Field::newDword("ObjectId", door->id()))
+                          .field(Gff::Field::newByte("OpenState", 0))
+                          .build();
+        door->captureSaveRecord(
+            *source,
+            SerializedIdentityContext::moduleGraph("tat_m17ab"),
+            {SaveRecordOriginKind::ActiveGitObject, "tat_m17ab"});
+        TestGameModule::addSnapshotObject(*area, door);
+        return door;
+    };
+    // A one-shot playing holds each swing back, so both doors are mid-swing:
+    // one still closed on its way open, one still open on its way shut.
+    auto opening = addDoor("opening");
+    TestGameModule::setSnapshotDoorOneShot(*opening, "shake");
+    opening->open();
+    ASSERT_EQ(DoorState::Closed, opening->state());
+    auto closing = addDoor("closing");
+    TestGameModule::setSnapshotDoorState(*closing, DoorState::Opened1);
+    TestGameModule::setSnapshotDoorOneShot(*closing, "shake");
+    closing->close();
+    ASSERT_EQ(DoorState::Opened1, closing->state());
+
+    auto saved = ModuleSnapshotBuilder(game, "tat_m17ab").build();
+
+    ASSERT_TRUE(saved) << saved.message;
+    auto openingRecord = recordById(*saved.snapshot->git, "Door List", opening->id());
+    auto closingRecord = recordById(*saved.snapshot->git, "Door List", closing->id());
+    ASSERT_TRUE(openingRecord);
+    ASSERT_TRUE(closingRecord);
+    EXPECT_EQ(static_cast<uint32_t>(DoorState::Opened2), openingRecord->getUint("OpenState"));
+    EXPECT_EQ(static_cast<uint32_t>(DoorState::Closed), closingRecord->getUint("OpenState"));
 }
 
 TEST_F(SnapshotFixture, recovered_event_payload_references_renumber_symmetrically) {

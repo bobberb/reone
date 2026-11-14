@@ -17,287 +17,368 @@
 
 #include "reone/game/swooprace.h"
 
+#include "reone/audio/di/services.h"
+#include "reone/audio/mixer.h"
+#include "reone/audio/source.h"
+#include "reone/game/di/services.h"
 #include "reone/game/game.h"
 #include "reone/game/object/camera/firstperson.h"
+#include "reone/game/types.h"
+#include "reone/graphics/animation.h"
+#include "reone/graphics/model.h"
 #include "reone/graphics/types.h"
+#include "reone/resource/di/services.h"
+#include "reone/resource/provider/audioclips.h"
+#include "reone/resource/provider/models.h"
+#include "reone/scene/di/services.h"
+#include "reone/scene/graph.h"
+#include "reone/scene/graphs.h"
 #include "reone/scene/node/camera.h"
 #include "reone/scene/node/model.h"
+#include "reone/scene/node/modelnode.h"
+
+using namespace reone::audio;
+using namespace reone::graphics;
+using namespace reone::scene;
 
 namespace reone {
 
 namespace game {
 
-// Fallback forward speed when metadata movement is unspecified.
-static constexpr float kFallbackMovePerSec = 10.0f;
+namespace {
 
-// The forward target speed is reached in this many seconds, to avoid an
-// instantaneous jump at race start.
-static constexpr float kSpeedRampSeconds = 3.0f;
+constexpr float kDefaultCameraFovDegrees = 75.0f;
 
-// Dev steering tuning. The parsed lateralAccel (e.g. 300) ramps the sideways
-// velocity quickly; the velocity cap keeps it controllable while still snappy
-// relative to the high forward speed. Values are tuned for testing feel, not
-// to match the game.
-static constexpr float kMaxLateralSpeed = 20.0f; // units per second
-static constexpr float kLateralDecay = 40.0f;    // units per second^2 when not steering
+// Chase placement used only when no player model carries a "camerahook".
+constexpr float kFallbackChaseDistance = 6.5f;
+constexpr float kFallbackChaseHeight = 2.8f;
 
-// Lateral travel bounds (world units). The dev proxy moves the bike laterally
-// in world space, so it needs a positional limit. The module tunnel values are
-// angular (deg) lean/rotation limits and do not directly bound lateral
-// position (the track walkmesh does), so the tunnel X magnitude is reused here
-// only as a per-module hint, safety-clamped to this range. A proper positional
-// bound awaits track-rail following.
-static constexpr float kMinLateralBound = 3.0f;
-static constexpr float kMaxLateralBound = 8.0f;
-static constexpr float kFallbackLateralBound = 8.0f;
+} // namespace
 
-// Chase camera placement relative to the bike.
-static constexpr float kChaseDistance = 4.5f; // behind the bike
-static constexpr float kChaseHeight = 2.5f;   // above the bike
-static constexpr float kLookAtHeight = 1.0f;  // look-at point above the bike
+std::shared_ptr<ModelSceneNode> SwoopRace::loadModel(const std::string &resRef) {
+    if (resRef.empty()) {
+        return nullptr;
+    }
+    auto model = _services.resource.models.get(resRef);
+    if (!model) {
+        return nullptr;
+    }
+    auto &sceneGraph = _services.scene.graphs.get(kSceneMain);
+    auto node = sceneGraph.newModel(*model, ModelUsage::Placeable);
+    // Minigame actors are placed by transform far from any room; the culling
+    // that assumes objects stay near their rooms does not apply to them.
+    node->setCullingEnabled(false);
+    node->setDrawDistance(std::numeric_limits<float>::max());
+    return node;
+}
 
-// Maximum cosmetic bank applied while strafing. Purely visual: it does not
-// affect movement, progress, or facing/heading.
-static constexpr float kMaxLeanRadians = 0.20f; // ~11.5 degrees
-
-// Engine default field of view, restored to the reused first-person camera on
-// exit (mirrors Area's default camera FOV).
-static constexpr float kDefaultCameraFovDegrees = 75.0f;
-
-void SwoopRace::start(const MinigameSpec &spec,
-                      FirstPersonCamera *camera,
-                      std::shared_ptr<scene::ModelSceneNode> bikeRoot,
-                      std::vector<std::shared_ptr<scene::ModelSceneNode>> bikeChildNodes,
-                      const glm::vec3 &startPosition,
-                      float startFacing,
-                      float finishProgress) {
-    _type = spec.type;
-    _movePerSec = spec.movementPerSec;
-    _lateralAccel = spec.lateralAccel;
-    _camFov = spec.cameraViewAngle;
-    _trackResRef = spec.player.trackResRef;
-    _modelCount = spec.player.models.size();
-    _finishProgress = finishProgress;
-
-    computeLateralBounds(spec.player);
-
+bool SwoopRace::start(MinigameSession &session,
+                      const MinigameSpec &spec,
+                      const std::vector<glm::vec3> &obstaclePositions,
+                      FirstPersonCamera *camera) {
+    stop();
+    _session = &session;
     _camera = camera;
-    _bikeRoot = std::move(bikeRoot);
-    _bikeChildNodes = std::move(bikeChildNodes);
+    _actors.assign(session.actors().size(), ActorModels());
+    auto &sceneGraph = _services.scene.graphs.get(kSceneMain);
 
-    // Build the track-relative frame once. The bike faces down-course and never
-    // turns from input; engine facing convention is forward = (-sin f, cos f).
-    _trackStart = startPosition;
-    _facing = startFacing;
-    _trackForward = glm::vec3(-glm::sin(_facing), glm::cos(_facing), 0.0f);
-    _trackRight = glm::vec3(glm::cos(_facing), glm::sin(_facing), 0.0f);
+    size_t obstacleIndex = 0;
+    for (size_t i = 0; i < session.actors().size(); ++i) {
+        const auto &actor = session.actors()[i];
+        auto &slot = _actors[i];
+        std::vector<std::string> models;
+        if (actor.kind == MinigameActorKind::Obstacle) {
+            models.push_back(actor.name);
+        } else {
+            for (const auto &model : actor.models) {
+                models.push_back(model.resRef);
+            }
+        }
+        for (const auto &resRef : models) {
+            auto node = loadModel(resRef);
+            if (!node) {
+                continue;
+            }
+            if (slot.nodes.empty()) {
+                sceneGraph.addRoot(node);
+            } else {
+                slot.nodes.front()->addChild(*node);
+            }
+            if (actor.kind == MinigameActorKind::Player && !_cameraHook) {
+                if (auto hook = node->getNodeByName("camerahook")) {
+                    _cameraHook = hook;
+                }
+            }
+            slot.nodes.push_back(std::move(node));
+        }
+        if (actor.kind == MinigameActorKind::Obstacle && !slot.nodes.empty()) {
+            glm::vec3 position = obstacleIndex < obstaclePositions.size() ? obstaclePositions[obstacleIndex] : actor.position;
+            slot.nodes.front()->setLocalTransform(glm::translate(position));
+            slot.nodes.front()->playAnimation("ready", nullptr, AnimationProperties::fromFlags(AnimationFlags::loop));
+        }
+        if (actor.kind == MinigameActorKind::Obstacle) {
+            ++obstacleIndex;
+        }
+    }
 
-    _speed = 0.0f;
-    _progress = 0.0f;
-    _lateralOffset = 0.0f;
-    _lateralVel = 0.0f;
-    _elapsed = 0.0f;
-    _steerDir = 0;
-
+    _steerLeft = _steerRight = _fireKey = _fireButton = _brakeKey = _brakeButton = false;
     _active = true;
+    if (const auto *player = session.player(); player && !player->sounds.engine.empty()) {
+        if (auto clip = _services.resource.audioClips.get(player->sounds.engine)) {
+            _engineSound = _services.audio.mixer.play(std::move(clip), AudioType::Sound, kDefaultSoundGroup, 1.0f, true);
+            _engineSoundResRef = player->sounds.engine;
+        }
+    }
+    float nearClip = spec.nearClip > 0.0f ? spec.nearClip : kDefaultClipPlaneNear;
+    float farClip = spec.farClip > 0.0f ? spec.farClip : kDefaultClipPlaneFar;
+    setCameraProjection(spec.cameraViewAngle > 0.0f ? spec.cameraViewAngle : kDefaultCameraFovDegrees, nearClip, farClip);
+    placeActors();
+    updateCamera();
+    return true;
+}
 
-    setCameraFieldOfView(_camFov > 0.0f ? _camFov : kDefaultCameraFovDegrees);
-    applyBikeTransform();
-    applyChaseCamera();
+void SwoopRace::releaseActor(ActorModels &models) {
+    if (models.removed) {
+        return;
+    }
+    models.removed = true;
+    auto &sceneGraph = _services.scene.graphs.get(kSceneMain);
+    for (auto &node : models.nodes) {
+        _animator.forget(*node);
+    }
+    if (!models.nodes.empty()) {
+        models.nodes.front()->removeAllChildren();
+        sceneGraph.removeRoot(*models.nodes.front());
+    }
+    models.nodes.clear();
 }
 
 void SwoopRace::stop() {
-    // Restore the reused camera's field of view before releasing it.
-    setCameraFieldOfView(kDefaultCameraFovDegrees);
-
-    _active = false;
-    _steerDir = 0;
-    _camera = nullptr;
-    if (_bikeRoot) {
-        _bikeRoot->removeAllChildren();
+    if (_camera) {
+        setCameraProjection(kDefaultCameraFovDegrees, kDefaultClipPlaneNear, kDefaultClipPlaneFar);
     }
-    _bikeChildNodes.clear();
-    _bikeRoot.reset();
+    for (auto &actor : _actors) {
+        releaseActor(actor);
+    }
+    _actors.clear();
+    _animator.clear();
+    if (_engineSound) {
+        _engineSound->stop();
+        _engineSound.reset();
+    }
+    _engineSoundResRef.clear();
+    _cameraHook = nullptr;
+    _camera = nullptr;
+    _session = nullptr;
+    _active = false;
 }
 
-void SwoopRace::computeLateralBounds(const MinigamePlayerSpec &player) {
-    // Lateral axis is X: the steering force acts along the track's X, so
-    // tunnel X is the matching axis. The raw tunnel X values are angular in
-    // the module data; we only use their magnitude as a
-    // per-module hint and safety-clamp it into a controllable positional range.
-    float rawPos = glm::abs(player.tunnelXPos);
-    float rawNeg = glm::abs(player.tunnelXNeg);
-    if (rawPos > 0.0f || rawNeg > 0.0f) {
-        _lateralRightBound = glm::clamp(rawPos > 0.0f ? rawPos : kFallbackLateralBound,
-                                        kMinLateralBound, kMaxLateralBound);
-        _lateralLeftBound = glm::clamp(rawNeg > 0.0f ? rawNeg : kFallbackLateralBound,
-                                       kMinLateralBound, kMaxLateralBound);
-        _lateralBoundSource = "tunnelX";
-    } else {
-        _lateralRightBound = kFallbackLateralBound;
-        _lateralLeftBound = kFallbackLateralBound;
-        _lateralBoundSource = "fallback";
+size_t SwoopRace::modelCount() const {
+    size_t count = 0;
+    for (const auto &actor : _actors) {
+        count += actor.nodes.size();
+    }
+    return count;
+}
+
+void SwoopRace::placeActors() {
+    if (!_session) {
+        return;
+    }
+    const auto &actors = _session->actors();
+    for (size_t i = 0; i < actors.size() && i < _actors.size(); ++i) {
+        const auto &actor = actors[i];
+        auto &slot = _actors[i];
+        if (slot.nodes.empty() || actor.kind == MinigameActorKind::Obstacle) {
+            continue;
+        }
+        glm::mat4 transform = actor.hook;
+        if (actor.kind == MinigameActorKind::Player) {
+            transform *= glm::translate(_session->offset());
+        }
+        slot.nodes.front()->setLocalTransform(transform);
     }
 }
 
 void SwoopRace::update(float dt) {
-    if (!_active || dt <= 0.0f) {
+    if (!_active || !_session) {
         return;
     }
-    _elapsed += dt;
-
-    // Forward speed ramps toward the metadata movement rate.
-    float targetSpeed = _movePerSec > 0.0f ? _movePerSec : kFallbackMovePerSec;
-    if (_speed < targetSpeed) {
-        _speed = glm::min(targetSpeed, _speed + (targetSpeed / kSpeedRampSeconds) * dt);
-    }
-
-    // Lateral strafe: parsed lateral acceleration drives a conservatively
-    // clamped sideways velocity and offset. This is strafe-only - it never
-    // changes the bike's heading.
-    if (_steerDir != 0) {
-        _lateralVel += static_cast<float>(_steerDir) * _lateralAccel * dt;
-        _lateralVel = glm::clamp(_lateralVel, -kMaxLateralSpeed, kMaxLateralSpeed);
-    } else if (_lateralVel != 0.0f) {
-        float decay = kLateralDecay * dt;
-        if (glm::abs(_lateralVel) <= decay) {
-            _lateralVel = 0.0f;
-        } else {
-            _lateralVel -= glm::sign(_lateralVel) * decay;
+    publishInput();
+    for (auto &actor : _actors) {
+        if (actor.removed || actor.removeAfter < 0.0f) {
+            continue;
+        }
+        actor.removeAfter -= dt;
+        if (actor.removeAfter <= 0.0f) {
+            releaseActor(actor);
         }
     }
-    _lateralOffset += _lateralVel * dt;
-    if (_lateralOffset > _lateralRightBound) {
-        _lateralOffset = _lateralRightBound;
-        _lateralVel = 0.0f;
-    } else if (_lateralOffset < -_lateralLeftBound) {
-        _lateralOffset = -_lateralLeftBound;
-        _lateralVel = 0.0f;
+    _animator.update(dt);
+    placeActors();
+    updateCamera();
+    if (_engineSound) {
+        // Idle to full throttle: a low hum rising with the bike's speed, at the volume the
+        // scripts set for the engine (SWMG_SetSoundVolume, sound 1).
+        const auto *player = _session->player();
+        // Before the scripts set a top speed, the K1 top gear's 420.
+        float top = _session->maxSpeed() > 0.0f ? _session->maxSpeed() : 420.0f;
+        float ratio = glm::clamp(_session->playerSpeed() / top, 0.0f, 1.0f);
+        _engineSound->setPitch(0.7f + 0.8f * ratio);
+        _engineSound->setGain(player ? glm::clamp(player->soundVolume[1] / 127.0f, 0.0f, 1.0f) : 1.0f);
     }
-
-    // Advance forward progress down the fixed track frame.
-    _progress += _speed * dt;
-
-    applyBikeTransform();
-    applyChaseCamera();
 }
 
-glm::vec3 SwoopRace::bikePosition() const {
-    glm::vec3 centerline = _trackStart + _trackForward * _progress;
-    return centerline + _trackRight * _lateralOffset;
-}
-
-void SwoopRace::applyBikeTransform() {
-    if (!_bikeRoot) {
+void SwoopRace::updateCamera() {
+    if (!_camera || !_session || _actors.empty() || _actors.front().nodes.empty()) {
         return;
     }
-    glm::vec3 bikePos = bikePosition();
-
-    // Down-course yaw (fixed), plus a small cosmetic bank into the strafe. The
-    // lean is visual only: it does not affect heading, progress, or strafe.
-    float lean = 0.0f;
-    if (kMaxLateralSpeed > 0.0f) {
-        lean = glm::clamp(_lateralVel / kMaxLateralSpeed, -1.0f, 1.0f) * kMaxLeanRadians;
+    glm::mat4 eye;
+    if (_cameraHook) {
+        eye = _cameraHook->absoluteTransform();
+    } else {
+        // Behind and above the bike, looking down the course.
+        const auto &root = _actors.front().nodes.front()->absoluteTransform();
+        glm::vec3 bike(root[3]);
+        glm::vec3 forward(glm::normalize(glm::vec3(root[1])));
+        glm::vec3 position = bike - forward * kFallbackChaseDistance + glm::vec3(0.0f, 0.0f, kFallbackChaseHeight);
+        glm::quat orientation(glm::quatLookAt(glm::normalize(bike + forward * 10.0f - position), glm::vec3(0.0f, 0.0f, 1.0f)));
+        eye = glm::translate(position) * glm::mat4_cast(orientation);
     }
-
-    glm::mat4 transform(1.0f);
-    transform *= glm::translate(bikePos);
-    transform *= glm::mat4_cast(glm::quat(glm::vec3(0.0f, 0.0f, _facing)));
-    transform *= glm::mat4_cast(glm::quat(glm::vec3(0.0f, lean, 0.0f)));
-
-    _bikeRoot->setLocalTransform(transform);
+    _camera->cameraSceneNode()->setLocalTransform(eye);
 }
 
-void SwoopRace::applyChaseCamera() {
+void SwoopRace::setCameraProjection(float fovDegrees, float nearClip, float farClip) {
     if (!_camera) {
         return;
     }
-    static const glm::vec3 up(0.0f, 0.0f, 1.0f);
-
-    glm::vec3 bikePos = bikePosition();
-
-    glm::vec3 cameraPos = bikePos - _trackForward * kChaseDistance;
-    cameraPos.z += kChaseHeight;
-
-    glm::vec3 target = bikePos;
-    target.z += kLookAtHeight;
-
-    glm::quat orientation(glm::quatLookAt(glm::normalize(target - cameraPos), up));
-
-    glm::mat4 transform(1.0f);
-    transform *= glm::translate(cameraPos);
-    transform *= glm::mat4_cast(orientation);
-    _camera->cameraSceneNode()->setLocalTransform(transform);
-}
-
-void SwoopRace::setCameraFieldOfView(float fovDegrees) {
-    if (!_camera) {
-        return;
-    }
-    _camera->cameraSceneNode()->setPerspectiveProjection(
-        glm::radians(fovDegrees),
-        cameraAspect(),
-        graphics::kDefaultClipPlaneNear,
-        graphics::kDefaultClipPlaneFar);
-}
-
-float SwoopRace::cameraAspect() const {
     const auto &graphicsOpts = _game.options().graphics;
-    if (graphicsOpts.height <= 0) {
-        return 1.0f;
+    float aspect = graphicsOpts.height > 0 ? graphicsOpts.width / static_cast<float>(graphicsOpts.height) : 1.0f;
+    _camera->cameraSceneNode()->setPerspectiveProjection(glm::radians(fovDegrees), aspect, nearClip, farClip);
+}
+
+void SwoopRace::playMinigameAnimation(const MinigameActor &actor,
+                                      const std::string &name,
+                                      bool looping,
+                                      bool queue,
+                                      bool overlay) {
+    if (!_session) {
+        return;
     }
-    return graphicsOpts.width / static_cast<float>(graphicsOpts.height);
+    size_t index = static_cast<size_t>(&actor - _session->actors().data());
+    if (index >= _actors.size()) {
+        return;
+    }
+    for (auto &node : _actors[index].nodes) {
+        _animator.play(*node, name, looping, queue, overlay);
+    }
+}
+
+void SwoopRace::removeMinigameAnimation(const MinigameActor &actor, const std::string &name) {
+    if (!_session) {
+        return;
+    }
+    size_t index = static_cast<size_t>(&actor - _session->actors().data());
+    if (index >= _actors.size()) {
+        return;
+    }
+    for (auto &node : _actors[index].nodes) {
+        _animator.remove(*node, name);
+    }
+}
+
+void SwoopRace::playMinigameSound(const std::string &resRef, const glm::vec3 &position) {
+    auto clip = _services.resource.audioClips.get(resRef);
+    if (!clip) {
+        return;
+    }
+    _services.audio.mixer.play(std::move(clip), AudioType::Sound, kDefaultSoundGroup);
+}
+
+void SwoopRace::onMinigameActorDied(const MinigameActor &actor) {
+    if (!_session || actor.kind == MinigameActorKind::Player) {
+        return;
+    }
+    size_t index = static_cast<size_t>(&actor - _session->actors().data());
+    if (index >= _actors.size()) {
+        return;
+    }
+    auto &slot = _actors[index];
+    // Each model plays its "die" and leaves when it ends; one without leaves now.
+    float longest = 0.0f;
+    for (auto &node : slot.nodes) {
+        if (auto die = node->model().getAnimation("die")) {
+            _animator.play(*node, "die", false, false, false);
+            longest = glm::max(longest, die->length());
+        }
+    }
+    slot.removeAfter = longest;
+    if (longest <= 0.0f) {
+        releaseActor(slot);
+    }
+}
+
+void SwoopRace::publishInput() {
+    auto &input = _game.minigameInput();
+    // Steering keys held over the update keep steering.
+    if (_steerLeft || _steerRight) {
+        input.steer = (_steerRight ? 1.0f : 0.0f) - (_steerLeft ? 1.0f : 0.0f);
+    }
 }
 
 bool SwoopRace::handle(const input::Event &event) {
+    auto &in = _game.minigameInput();
     switch (event.type) {
     case input::EventType::KeyDown:
-        return handleKeyDown(event.key);
-    case input::EventType::KeyUp:
-        return handleKeyUp(event.key);
-    default:
-        return false;
+    case input::EventType::KeyUp: {
+        bool down = event.type == input::EventType::KeyDown;
+        switch (event.key.code) {
+        case input::KeyCode::Left:
+        case input::KeyCode::A:
+            _steerLeft = down;
+            break;
+        case input::KeyCode::Right:
+        case input::KeyCode::D:
+            _steerRight = down;
+            break;
+        case input::KeyCode::Space:
+        case input::KeyCode::Up:
+        case input::KeyCode::W:
+            // The shift key: fire on KotOR, accelerate on TSL.
+            _fireKey = down;
+            setMinigameShiftKey(in, _fireKey || _fireButton, _game.isTSL());
+            return true;
+        case input::KeyCode::Down:
+        case input::KeyCode::S:
+            // Brake: the jump of the TSL swoop races.
+            _brakeKey = down;
+            in.brake = _brakeKey || _brakeButton;
+            return true;
+        case input::KeyCode::Escape:
+        case input::KeyCode::Pause:
+            // Escape pauses the race; it does not leave it.
+            if (down && !event.key.repeat) {
+                _game.pressPauseKey();
+            }
+            return true;
+        default:
+            return false;
+        }
+        in.steer = (_steerRight ? 1.0f : 0.0f) - (_steerLeft ? 1.0f : 0.0f);
+        return true;
     }
-}
-
-bool SwoopRace::handleKeyDown(const input::KeyEvent &event) {
-    switch (event.code) {
-    case input::KeyCode::Left:
-    case input::KeyCode::A:
-        _steerDir = -1;
-        return true;
-    case input::KeyCode::Right:
-    case input::KeyCode::D:
-        _steerDir = 1;
-        return true;
-    case input::KeyCode::Space:
-        // Jump is stubbed for the skeleton: accepted but has no gameplay effect.
-        return true;
-    case input::KeyCode::Escape:
-    case input::KeyCode::Pause:
-        // Escape pauses the race; it does not leave it.
-        if (!event.repeat) {
-            _game.pressPauseKey();
+    case input::EventType::MouseButtonDown:
+    case input::EventType::MouseButtonUp:
+        if (event.button.button == input::MouseButton::Right) {
+            _brakeButton = event.button.pressed;
+            in.brake = _brakeKey || _brakeButton;
+            return true;
         }
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool SwoopRace::handleKeyUp(const input::KeyEvent &event) {
-    switch (event.code) {
-    case input::KeyCode::Left:
-    case input::KeyCode::A:
-        if (_steerDir == -1) {
-            _steerDir = 0;
+        if (event.button.button != input::MouseButton::Left) {
+            return false;
         }
-        return true;
-    case input::KeyCode::Right:
-    case input::KeyCode::D:
-        if (_steerDir == 1) {
-            _steerDir = 0;
-        }
+        _fireButton = event.button.pressed;
+        setMinigameShiftKey(in, _fireKey || _fireButton, _game.isTSL());
         return true;
     default:
         return false;

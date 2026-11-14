@@ -18,6 +18,7 @@
 #include "reone/game/gui/actionslot.h"
 
 #include <algorithm>
+#include <tuple>
 
 #include "reone/audio/mixer.h"
 #include "reone/game/contextaction.h"
@@ -84,18 +85,15 @@ void ActionMenuFeedback::reject(PowerUnavailableReason reason, ServicesView &ser
     if (reason != PowerUnavailableReason::None) {
         _remaining = kRejectionDuration;
     }
-    auto clip = services.game.guiSounds.getActionUnavailable();
-    _sound = services.audio.mixer.play(std::move(clip), audio::AudioType::Sound);
+    _sound = services.game.guiSounds.play(services.game.guiSounds.getActionUnavailable());
 }
 
 void ActionMenuFeedback::accept(ServicesView &services) {
-    auto clip = services.game.guiSounds.getActionAccepted();
-    _sound = services.audio.mixer.play(std::move(clip), audio::AudioType::Sound);
+    _sound = services.game.guiSounds.play(services.game.guiSounds.getActionAccepted());
 }
 
 void ActionMenuFeedback::scroll(ServicesView &services) {
-    auto clip = services.game.guiSounds.getActionMenuScroll();
-    _sound = services.audio.mixer.play(std::move(clip), audio::AudioType::Sound);
+    _sound = services.game.guiSounds.play(services.game.guiSounds.getActionMenuScroll());
 }
 
 void ActionMenuFeedback::announce(std::optional<uint32_t> message) {
@@ -123,6 +121,35 @@ std::string ActionMenuFeedback::announcementText(const Game &game) const {
 float ActionMenuFeedback::descriptionOpacity() const {
     // The line holds for the first half of the rejection, then fades.
     return active() ? std::min(1.0f, 2.0f * _remaining / kRejectionDuration) : 1.0f;
+}
+
+EntryIdentity::EntryIdentity(const ContextAction &entry) :
+    type(entry.type),
+    feat(entry.feat),
+    skill(entry.skill),
+    subSkill(entry.subSkill),
+    form(entry.form) {
+    if (entry.spell) {
+        spell = entry.spell->type;
+    }
+    if (entry.item) {
+        item = entry.item->id();
+    }
+    if (entry.implant) {
+        implantMode = entry.implant->mode;
+    }
+    if (entry.behavior) {
+        behavior = entry.behavior->style;
+    }
+}
+
+bool EntryIdentity::operator==(const EntryIdentity &other) const {
+    return std::tie(type, feat, skill, subSkill, spell, item, form, implantMode, behavior) ==
+           std::tie(other.type, other.feat, other.skill, other.subSkill, other.spell, other.item, other.form, other.implantMode, other.behavior);
+}
+
+bool isSameEntry(const ContextAction &left, const ContextAction &right) {
+    return EntryIdentity(left) == EntryIdentity(right);
 }
 
 void renderContextActionIcon(const ContextAction &action, glm::mat4 transform, bool enabled, ServicesView &services) {

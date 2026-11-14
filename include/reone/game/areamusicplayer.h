@@ -57,13 +57,15 @@ public:
         _services(services) {
     }
 
-    /**
-     * Reads the music, ambient sound and priority group tables once, at start-up.
-     *
-     * @param tsl whether the title is TSL, which reads the PC volumes of the
-     *            priority groups and plays the music group louder
-     */
+    /** Reads the music and ambient sound tables once, at start-up. */
     void init(bool tsl);
+
+    /**
+     * Night falls (dusk and night) or day breaks (dawn and day). Music and an
+     * ambient loop playing for the other part of the day start again with
+     * this part's track; the ambient loop takes this part's volume.
+     */
+    void setNight(bool night);
 
     /**
      * What hands over the playing load-screen music when the background
@@ -79,7 +81,13 @@ public:
      * start; whether each is on starts from what the area asks for.
      */
     void load(std::shared_ptr<const Area> area);
-    /** Begin playing what the loaded area asks for. */
+    /**
+     * Begin playing, or play again, what the player last had on: the battle
+     * music, else the background music, and the ambient loop; what is off
+     * fades out. Music and an ambient loop that a stop turned off stay off.
+     * In TSL background music that has to start the loading screen's track
+     * carries that music on.
+     */
     void start();
     /** Fade out the music, end the ambient loop and forget the pending restart and battle state. */
     void stopSounds();
@@ -91,8 +99,15 @@ public:
     void stopSoundsForMovie();
     /** Stop for the area being left; nothing plays until the next area is loaded and started. */
     void unload();
-    /** Advance the fades, repeat ended tracks and restart an ended ambient loop. */
-    void update();
+    /**
+     * Advance the fades, repeat ended tracks and restart an ended ambient loop.
+     *
+     * @param dt the frame's time in seconds, which runs through pauses and
+     *        menus but not through loads or a window without focus
+     * @param clockRuns whether the gap before a track repeats counts down; it
+     *        does not while every sound waits
+     */
+    void update(float dt, bool clockRuns = true);
 
     /** The area turned its background music on or off. */
     void playMusic(const Area &area, bool play);
@@ -121,7 +136,10 @@ public:
         return _musicPlaysThroughMovies ? _music : nullptr;
     }
     /** Advance the music's fade, as it goes on while a movie plays. */
-    void updateMusicFade() { isMusicPlaying(); }
+    void updateMusicFade() {
+        isMusicPlaying();
+        isDialogAmbientPlaying();
+    }
     /** The area set its battle track; previousTrack is the row it replaced. */
     void battleMusicTrackChanged(const Area &area, int previousTrack);
 
@@ -129,15 +147,33 @@ public:
     void playAmbientSound(const Area &area, bool play);
     /** The area set its ambient day track: the loop fades out and the new one follows. */
     void ambientDayTrackChanged(const Area &area);
-    /** The area set its ambient night track. There is no night; the ambient loop is turned on again. */
+    /** The area set its ambient night track: at night the loop fades out and the new one follows. */
     void ambientNightTrackChanged(const Area &area);
     /** The area set its ambient day volume. */
     void ambientDayVolumeChanged(const Area &area);
+    /** The area set its ambient night volume. */
+    void ambientNightVolumeChanged(const Area &area);
+    /**
+     * The end credits roll: the music fades out and the ambient loop fades
+     * out over its usual fade, then nothing restarts.
+     */
+    void fadeOutSounds();
+    /**
+     * TSL: lightning strikes, and while the ambient loop plays its thunder is
+     * heard everywhere, close or distant.
+     */
+    void thunder(bool close);
 
-    /** The gain of streamed music, menu music included: its priority group's volume as a share of the loudest. */
-    float musicGroupGain() const { return _musicGroupGain; }
-    /** The gain of the area-wide ambient priority group, which the credits music plays in too. */
-    float ambientGroupGain() const { return _ambientGroupGain; }
+    /**
+     * A conversation shows its first entry: the track a conversation started
+     * before stops at once, and the conversation's own plays through once, on
+     * after it ends.
+     *
+     * @param resRef the conversation's track; empty for none
+     */
+    void playDialogAmbientTrack(const std::string &resRef);
+    /** The conversation's track fades out. */
+    void fadeDialogAmbientTrack();
 
 private:
     /** An ambientmusic.2da row: the track and the stingers that may end it. */
@@ -149,6 +185,9 @@ private:
     };
 
     ServicesView &_services;
+    bool _tsl {false};
+    /** Dusk or night: the night tracks and the night ambient volume are in use. */
+    bool _night {false};
     std::function<std::shared_ptr<audio::AudioSource>(const std::string &)> _loadMusicHandover;
 
     // Tables
@@ -157,17 +196,15 @@ private:
     std::vector<Track> _tracks;
     /** The ambientsound.2da sounds, by row; empty for none. */
     std::vector<std::string> _ambientTracks;
-    /** The volume of the streamed music priority group, as a share of the loudest. */
-    float _musicGroupGain {0.0f};
-    /** The volume of the stinger priority group, as a share of the loudest. */
-    float _stingerGroupGain {0.0f};
-    /** The volume of the area-wide ambient priority group, as a share of the loudest. */
-    float _ambientGroupGain {0.0f};
 
     // END Tables
 
     /** The area being played, from its load until it is unloaded. */
     std::shared_ptr<const Area> _area;
+    /** The track the last conversation started, which outlives it. */
+    std::shared_ptr<audio::AudioSource> _dialogAmbient;
+    /** When the conversation's fading track ends. */
+    std::optional<uint32_t> _dialogAmbientFadeEnd;
     /** The area has been arrived in, and its music and ambient loop play. */
     bool _started {false};
     /** The background music plays on through a movie that lets music play; set by the last track change. */
@@ -190,9 +227,9 @@ private:
      */
     uint32_t _musicDelay {0};
     /** Milliseconds until the music track is repeated, retried or handed over. */
-    uint32_t _countdown {0};
-    /** The clock time of the last update, in milliseconds. */
-    uint32_t _lastUpdateTime {0};
+    float _countdown {0.0f};
+    /** The stinger playing, if any; a new one cuts it. */
+    std::shared_ptr<audio::AudioSource> _stinger;
     /** The music track playing or fading, if any. */
     std::shared_ptr<audio::AudioSource> _music;
     /** The sound of the music track last started. */
@@ -213,13 +250,21 @@ private:
     const Track &battleTrack() const;
     /** The sound of the ambientsound.2da row \p row; empty for a row outside the table. */
     const std::string &ambientTrack(int row) const;
-    /** The area's ambient volume as a share of the loudest. */
+    /** The area's ambient volume for the part of the day, as a share of the loudest. */
     float ambientVolumeScale() const;
+    /** The background music's row for the part of the day. */
+    int musicTrackRow() const;
+    /** The ambient loop's row for the part of the day. */
+    int ambientTrackRow() const;
+    /** The background music's sound for the part of the day; empty for none. */
+    std::string backgroundTrack() const;
 
     /** Whether music sounds, a fading track until its fade ends. */
     bool isMusicPlaying();
     /** Whether the ambient loop sounds, a fading loop until its fade ends. */
     bool isAmbientPlaying();
+    /** Whether the conversation's track sounds, a fading one until its fade ends. */
+    bool isDialogAmbientPlaying();
     /**
      * Plays the music track \p resRef; false when it does not play.
      * @param takeLoadMusic whether the playing load-screen music of the same

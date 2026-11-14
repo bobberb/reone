@@ -20,12 +20,16 @@
 #include "reone/game/gui/chargen/iconselection.h"
 
 #include "reone/game/d20/classes.h"
+#include "reone/game/d20/recommended.h"
 #include "reone/game/game.h"
 #include "reone/game/gui/chargen.h"
+#include "reone/game/object/creature.h"
+#include "reone/game/party.h"
 #include "reone/gui/control/button.h"
 #include "reone/gui/control/iconchain.h"
 #include "reone/gui/control/listbox.h"
 #include "reone/resource/provider/textures.h"
+#include "reone/resource/strings.h"
 
 #include <algorithm>
 #include <cmath>
@@ -37,6 +41,10 @@ using namespace reone::resource;
 namespace reone {
 
 namespace game {
+
+// The message for accepting while powers can still be chosen.
+static constexpr int kK1PowersLeftStrRef = 48210;
+static constexpr int kTSLPowersLeftStrRef = 125861;
 
 static IconChain::State getPowerIconState(SpellAvailability availability) {
     switch (availability) {
@@ -51,44 +59,6 @@ static IconChain::State getPowerIconState(SpellAvailability availability) {
         return IconChain::State::Locked;
     }
     return IconChain::State::Locked;
-}
-
-static std::map<SpellType, glm::ivec2> getPowerIconPositions(
-    const std::vector<SpellDisplayEntry> &entries) {
-
-    std::map<SpellType, int> nextIndexByRoot;
-    std::vector<SpellType> chainRoots;
-    std::map<SpellType, glm::ivec2> result;
-    for (const auto &entry : entries) {
-        if (!entry.visible) {
-            continue;
-        }
-
-        SpellType root = entry.chainRoot != SpellType::All ? entry.chainRoot : entry.type;
-        auto maybeIndex = nextIndexByRoot.insert({root, 0});
-        if (maybeIndex.second) {
-            chainRoots.push_back(root);
-        }
-        int index = maybeIndex.first->second++;
-        result.emplace(entry.type, glm::ivec2(index % kIconSelectionColumnCount, index / kIconSelectionColumnCount));
-    }
-
-    std::map<SpellType, int> rowBases;
-    int nextRow = 0;
-    for (auto root : chainRoots) {
-        int count = nextIndexByRoot.at(root);
-        rowBases.emplace(root, nextRow);
-        nextRow += (count + kIconSelectionColumnCount - 1) / kIconSelectionColumnCount;
-    }
-
-    for (const auto &entry : entries) {
-        if (!entry.visible) {
-            continue;
-        }
-        SpellType root = entry.chainRoot != SpellType::All ? entry.chainRoot : entry.type;
-        result.at(entry.type).y += rowBases.at(root);
-    }
-    return result;
 }
 
 /** The controls the panel shows in both titles. */
@@ -132,15 +102,11 @@ void CharGenPowers::onGUILoaded() {
         activateFocusedPower();
     });
     _controls.SELECT_BTN->setVisible(true);
-    _controls.RECOMMENDED_BTN->setDisabled(true);
-    _controls.RECOMMENDED_BTN->setVisible(false);
+    _controls.RECOMMENDED_BTN->setOnClick([this]() {
+        recommend();
+    });
     _controls.ACCEPT_BTN->setOnClick([this]() {
-        if (_selectedPowers.size() != static_cast<size_t>(_powerGain)) {
-            return;
-        }
-        updateCharacter();
-        _charGen.goToNextStep();
-        _charGen.openSteps();
+        accept();
     });
     _controls.BACK_BTN->setOnClick([this]() {
         _charGen.openSteps();
@@ -179,7 +145,42 @@ void CharGenPowers::refreshControls() {
 void CharGenPowers::refreshSelectionControls() {
     int remaining = _powerGain - static_cast<int>(_selectedPowers.size());
     _controls.REMAINING_SELECTIONS_LBL->setTextMessage(std::to_string(remaining));
-    _controls.ACCEPT_BTN->setDisabled(remaining != 0);
+}
+
+void CharGenPowers::recommend(bool fillWithUnranked) {
+    _selectedPowers.clear();
+    const CreatureAttributes &attributes = _charGen.character().attributes;
+    std::shared_ptr<CreatureClass> clazz(_services.game.classes.get(attributes.getEffectiveClass()));
+    if (clazz) {
+        // A new character starts balanced.
+        const Alignment alignment = _charGen.isLevelUp() ? _game.party().getLeader()->alignment() : Alignment::Neutral;
+        for (auto power : recommendPowers(_services.game.spells, attributes, *clazz, _powerGain, alignment, fillWithUnranked)) {
+            _selectedPowers.insert(power);
+        }
+    }
+    loadDisplayEntries();
+    refreshSelectionControls();
+    refreshIconChainSelection();
+}
+
+// Accepting is refused with a message only while powers remain to be chosen
+// and one can still be chosen; otherwise the chosen powers are learned.
+int CharGenPowers::remainingPicks() const {
+    return _powerGain - static_cast<int>(_selectedPowers.size());
+}
+
+void CharGenPowers::accept() {
+    const bool powersLeft = _selectedPowers.size() < static_cast<size_t>(_powerGain);
+    const bool choosable = std::any_of(_displayEntries.begin(), _displayEntries.end(), [](const SpellDisplayEntry &entry) {
+        return entry.selectable;
+    });
+    if (powersLeft && choosable) {
+        _game.showMessagePopup(_services.resource.strings.getText(_game.isTSL() ? kTSLPowersLeftStrRef : kK1PowersLeftStrRef));
+        return;
+    }
+    updateCharacter();
+    _charGen.goToNextStep();
+    _charGen.openSteps();
 }
 
 void CharGenPowers::refreshIconChain() {

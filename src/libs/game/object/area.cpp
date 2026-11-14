@@ -21,12 +21,18 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 
+#include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+
 #include "reone/audio/di/services.h"
 #include "reone/audio/mixer.h"
+#include "reone/audio/source.h"
 #include "reone/game/action/appear.h"
+#include "reone/game/animations.h"
 #include "reone/game/camerastyles.h"
 #include "reone/game/combattables.h"
 #include "reone/game/d20/class.h"
@@ -58,6 +64,7 @@
 #include "reone/resource/di/services.h"
 #include "reone/resource/exception/notfound.h"
 #include "reone/resource/provider/2das.h"
+#include "reone/resource/provider/audioclips.h"
 #include "reone/resource/provider/gffs.h"
 #include "reone/resource/provider/layouts.h"
 #include "reone/resource/provider/models.h"
@@ -67,6 +74,7 @@
 #include "reone/resource/provider/walkmeshes.h"
 #include "reone/resource/resources.h"
 #include "reone/resource/strings.h"
+#include "reone/scene/animeventlistener.h"
 #include "reone/scene/collision.h"
 #include "reone/scene/di/services.h"
 #include "reone/scene/graphs.h"
@@ -97,13 +105,13 @@ static constexpr float kDefaultFieldOfView = 75.0f;
 // second, other creatures every four seconds.
 static constexpr float kLeaderPerceptionPass = 0.2f;
 static constexpr float kPerceptionPass = 4.0f;
-static constexpr float kPerceptionEyeHeight = 1.5f;
-// Squared thickness of a door or other object both sounds run into.
+// Squared thickness of a door or other object both sounds run into, or of
+// anything only one of them runs into.
 static constexpr float kSharedObstacleThickness2 = 0.16f;
-// Listen penalties: for a way around the walls, and for each whole metre of wall.
+// Listen penalties: for any obstacle where the area routes sound around obstacles,
+// and for each whole metre of obstacle elsewhere.
 static constexpr int kSoundDetourPenalty = 2;
 static constexpr int kSoundWallPenaltyPerMetre = 5;
-static constexpr float kLineOfSightHeight = 1.7f;        // TODO: make it appearance-based
 // Every surface material, for lines that any face stops.
 static const std::set<uint32_t> kEverySurface = [] {
     std::set<uint32_t> materials;
@@ -250,20 +258,33 @@ void Area::load(
 
     _unescapable = areParsed.Unescapable != 0;
     _transitDisabled = areParsed.DisableTransit != 0;
-    _playerRestrictMode = are.getBool("RestrictMode");
+    // The area file's restrict mode goes through the setter, so a change ends
+    // the party's stealth.
+    setPlayerRestrictMode(are.getUint("RestrictMode"));
     _transitionPending = are.getBool("TransPending");
     _transitionPendingNextId = are.getUint("TransPendNextID");
     _transitionPendingCurrentId = are.getUint("TransPendCurrID");
+    // An area file gives the stealth experience pool; one that leaves its
+    // current amount out starts it full.
+    std::optional<uint32_t> currentStealthXP;
+    if (are.has("StealthXPCurrent")) {
+        currentStealthXP = are.getUint("StealthXPCurrent");
+    }
+    loadStealthXP(areParsed.StealthXPMax, currentStealthXP, areParsed.StealthXPLoss, areParsed.StealthXPEnabled);
     loadARE(areParsed);
+    loadMap(are);
+    loadPartSounds(are);
     loadLYT();
+    attachPartSounds();
     loadGIT(git, identityContext);
     loadVIS();
 }
 
 void Area::activate() {
-    // Map is presentation state owned by Game, while loaded areas are cached.
-    // Restore this area's map whenever a cached module becomes active again.
-    _game.map().load(_name, _map);
+    // The map screen draws whichever area is active, while loaded areas are
+    // cached. Point it back at this area whenever a cached module becomes
+    // active again; the exploration it shows stays with the area.
+    _game.map().load(_name);
     applySceneProperties();
 
     for (auto &pair : _rooms) {
@@ -283,12 +304,14 @@ void Area::loadARE(const resource::generated::ARE &are) {
     loadCameraStyle(are);
     loadAmbientColor(are);
     loadScripts(are);
-    loadMap(are);
-    loadStealthXP(are);
     loadHearing(are);
     loadGrass(are);
     loadFog(are);
     loadMiniGame(are);
+    _roomEnvAudio.clear();
+    for (const auto &room : are.Rooms) {
+        _roomEnvAudio.emplace(boost::to_lower_copy(room.RoomName), room.EnvAudio);
+    }
     _roomForceRatings.clear();
     if (_game.isTSL()) {
         for (const auto &room : are.Rooms) {
@@ -330,16 +353,81 @@ void Area::loadScripts(const resource::generated::ARE &are) {
     _onUserDefined = are.OnUserDefined;
 }
 
-void Area::loadMap(const resource::generated::ARE &are) {
-    _map = are.Map;
-    _game.map().load(_name, _map);
+void Area::loadMap(const resource::Gff &are) {
+    // An area carries a map only when its map image exists. Without one its
+    // map settings go unread.
+    const std::string image(AreaMapState::imageResRef(_name));
+    if (_services.resource.textures.get(image, TextureUsage::AreaMap)) {
+        _mapState.load(_game.gameId(), _name, are);
+    } else if (auto map = are.findStruct("Map"); map && map->getInt("MapResX") != 0) {
+        warn(str(boost::format("Area %s carries no map: its map image %s is missing") % _name % image));
+    }
+    _game.map().load(_name);
 }
 
-void Area::setPlayerRestrictMode(bool value) {
-    if (value && !_playerRestrictMode) {
-        _game.party().endStealth();
+void Area::updateMapData() {
+    // The whole party reveals the map it walks through, not just its leader.
+    auto &party = _game.party();
+    for (int index = 0; index < party.getSize(); ++index) {
+        _mapState.setExplored(
+            glm::vec2(party.getMember(index)->position()), AreaMapState::kPartyRevealRadius);
+    }
+}
+
+void Area::setPlayerRestrictMode(int value) {
+    if (value != 0 && value != _playerRestrictMode) {
+        _game.party().endStealth(true);
     }
     _playerRestrictMode = value;
+}
+
+void Area::setTransitionPending(bool pending, int id) {
+    _transitionPending = pending;
+    _transitionPendingCurrentId = static_cast<uint8_t>(id);
+    if (pending) {
+        _game.stopMovement();
+    }
+    _game.setPlayerInputBlocked(pending);
+}
+
+// A transition waits this long for its second signal, while the screen fades
+// out over this many seconds.
+static constexpr uint32_t kTransitionDelayMilliseconds = 500;
+static constexpr float kTransitionFadeLength = 0.5f;
+
+void Area::passTransition(const std::shared_ptr<Object> &traveller, std::optional<int> transition,
+                          const std::string &module, const std::string &waypoint,
+                          const std::function<void(const Creature &traveller, int transition, uint32_t delayMilliseconds)> &sendAgain) {
+    auto creature = traveller ? dyn_cast<Creature>(traveller) : nullptr;
+    if (!creature || _game.isDialogUnderWay()) {
+        setTransitionPending(false, 0);
+        return;
+    }
+    if (module.empty()) {
+        return;
+    }
+    if (_transitionPending) {
+        if (transition != transitionPendingId()) {
+            return;
+        }
+        if (creature->isDead() || creature->isTemporarilyDead()) {
+            _game.globalFade().stop();
+        } else {
+            _game.scheduleModuleTransition(module, waypoint);
+        }
+        setTransitionPending(false, 0);
+        return;
+    }
+    Party &party = _game.party();
+    if (!party.movesBetweenModules(*creature) || !party.admitTraveller(*creature)) {
+        return;
+    }
+    const int id = nextTransitionPendingId();
+    sendAgain(*creature, id, kTransitionDelayMilliseconds);
+    _game.globalFade().request(GlobalFade::Direction::Out, 0.0f, kTransitionFadeLength);
+    setTransitionPending(true, id);
+    // The transition unpauses play at once.
+    _game.setPausedNow(false);
 }
 
 void Area::loadHearing(const resource::generated::ARE &are) {
@@ -348,10 +436,14 @@ void Area::loadHearing(const resource::generated::ARE &are) {
     _modListenCheck = are.ModListenCheck;
 }
 
-void Area::loadStealthXP(const resource::generated::ARE &are) {
-    _stealthXPEnabled = are.StealthXPEnabled;
-    _stealthXPDecrement = are.StealthXPLoss; // TODO: loss = decrement?
-    _maxStealthXP = are.StealthXPMax;
+void Area::loadStealthXP(std::optional<uint32_t> max, std::optional<uint32_t> current,
+                         std::optional<uint32_t> decrement, std::optional<uint32_t> enabled) {
+    setMaxStealthXP(max.value_or(_maxStealthXP));
+    setCurrentStealthXP(current.value_or(_maxStealthXP));
+    _stealthXPDecrement = decrement.value_or(_stealthXPDecrement);
+    if (enabled) {
+        _stealthXPEnabled = static_cast<int>(*enabled);
+    }
 }
 
 void Area::loadGrass(const resource::generated::ARE &are) {
@@ -394,11 +486,26 @@ void Area::applySceneProperties() {
     sceneGraph.setFog(fogProperties);
 }
 
+void Area::setFogColor(const glm::vec3 &color) {
+    const auto channel = [](float value) {
+        return static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int>(value * 255.0f)));
+    };
+    _sunFogColor = channel(color.r) | channel(color.g) << 8 | channel(color.b) << 16;
+    auto fogProperties = FogProperties();
+    fogProperties.enabled = _fogEnabled;
+    fogProperties.nearPlane = _fogNear;
+    fogProperties.farPlane = _fogFar;
+    fogProperties.color = color;
+    _services.scene.graphs.get(_sceneName).setFog(fogProperties);
+}
+
 void Area::loadGIT(
     const resource::Gff &gff,
     const SerializedIdentityContext &identityContext) {
     _game.reserveSavedObjectIds(gff, identityContext, SerializedGraphRoot::AreaGit);
     loadProperties(gff);
+    // The area file sized the exploration grid; put back what was explored.
+    _mapState.loadFromGit(gff);
     loadCreatures(gff, identityContext);
     loadDoors(gff, identityContext);
     loadPlaceables(gff, identityContext);
@@ -419,6 +526,13 @@ void Area::loadProperties(const resource::Gff &git) {
     if (!properties) {
         return;
     }
+    auto field = [&properties](const std::string &name) -> std::optional<uint32_t> {
+        if (!properties->has(name)) {
+            return std::nullopt;
+        }
+        return properties->getUint(name);
+    };
+    loadStealthXP(field("StealthXPMax"), field("StealthXPCurrent"), field("StealthXPLoss"), field("StealthXPEnabled"));
     properties->readBool(_unescapable, "Unescapable");
     properties->readBool(_transitionPending, "TransPending");
     properties->readByte(_transitionPendingNextId, "TransPendNextID");
@@ -457,8 +571,23 @@ void Area::loadCreatures(const resource::Gff &gff, const SerializedIdentityConte
     }
 }
 
+// An entry of a module's area places its template: one that names no
+// template, or whose template is missing, places nothing. A saved entry
+// places its own record.
+static bool placesObject(IGffs &gffs, const Gff &entry, const SerializedIdentityContext &identityContext,
+                         const std::string &templateField, ResType templateType) {
+    if (identityContext.isSerializedState()) {
+        return true;
+    }
+    std::string templateResRef;
+    return entry.readResRef(templateResRef, templateField) && gffs.get(templateResRef, templateType);
+}
+
 void Area::loadDoors(const resource::Gff &gff, const SerializedIdentityContext &identityContext) {
     for (auto &doorGff : gff.getList("Door List")) {
+        if (!placesObject(_services.resource.gffs, *doorGff, identityContext, "TemplateResRef", ResType::Utd)) {
+            continue;
+        }
         auto door = _game.newDoor(*doorGff, identityContext, _sceneName);
         if (identityContext.isSerializedState()) {
             door->captureSaveRecord(*doorGff, identityContext, {SaveRecordOriginKind::ActiveGitObject, _name});
@@ -469,6 +598,9 @@ void Area::loadDoors(const resource::Gff &gff, const SerializedIdentityContext &
 
 void Area::loadPlaceables(const resource::Gff &gff, const SerializedIdentityContext &identityContext) {
     for (auto &placeableGff : gff.getList("Placeable List")) {
+        if (!placesObject(_services.resource.gffs, *placeableGff, identityContext, "TemplateResRef", ResType::Utp)) {
+            continue;
+        }
         auto placeable = _game.newPlaceable(*placeableGff, identityContext, _sceneName);
         if (identityContext.isSerializedState()) {
             placeable->captureSaveRecord(*placeableGff, identityContext, {SaveRecordOriginKind::ActiveGitObject, _name});
@@ -491,6 +623,9 @@ void Area::loadWaypoints(const resource::Gff &gff, const SerializedIdentityConte
 
 void Area::loadTriggers(const resource::Gff &gff, const SerializedIdentityContext &identityContext) {
     for (auto &triggerGff : gff.getList("TriggerList")) {
+        if (!placesObject(_services.resource.gffs, *triggerGff, identityContext, "TemplateResRef", ResType::Utt)) {
+            continue;
+        }
         auto trigger = _game.newTrigger(*triggerGff, identityContext, _sceneName);
         if (identityContext.isSerializedState()) {
             trigger->captureSaveRecord(*triggerGff, identityContext, {SaveRecordOriginKind::ActiveGitObject, _name});
@@ -501,6 +636,9 @@ void Area::loadTriggers(const resource::Gff &gff, const SerializedIdentityContex
 
 void Area::loadSounds(const resource::Gff &gff, const SerializedIdentityContext &identityContext) {
     for (auto &soundGff : gff.getList("SoundList")) {
+        if (!placesObject(_services.resource.gffs, *soundGff, identityContext, "TemplateResRef", ResType::Uts)) {
+            continue;
+        }
         auto sound = _game.newSound(*soundGff, identityContext, _sceneName);
         if (identityContext.isSerializedState()) {
             sound->captureSaveRecord(*soundGff, identityContext, {SaveRecordOriginKind::ActiveGitObject, _name});
@@ -527,8 +665,18 @@ void Area::loadCameras(const resource::Gff &gff, const SerializedIdentityContext
     }
 }
 
+// Whether a record lists geometry without points.
+static bool hasEmptyGeometryList(const Gff &record) {
+    return record.has("Geometry") && record.getList("Geometry").empty();
+}
+
+// An encounter whose entry has a geometry list without points is not placed.
 void Area::loadEncounters(const resource::Gff &gff, const SerializedIdentityContext &identityContext) {
     for (auto &encounterGff : gff.getList("Encounter List")) {
+        if (!placesObject(_services.resource.gffs, *encounterGff, identityContext, "TemplateResRef", ResType::Ute) ||
+            hasEmptyGeometryList(*encounterGff)) {
+            continue;
+        }
         auto encounter = _game.newEncounter(*encounterGff, identityContext, _sceneName);
         if (identityContext.isSerializedState()) {
             encounter->captureSaveRecord(*encounterGff, identityContext, {SaveRecordOriginKind::ActiveGitObject, _name});
@@ -539,6 +687,9 @@ void Area::loadEncounters(const resource::Gff &gff, const SerializedIdentityCont
 
 void Area::loadStores(const resource::Gff &gff, const SerializedIdentityContext &identityContext) {
     for (auto &storeGff : gff.getList("StoreList")) {
+        if (!placesObject(_services.resource.gffs, *storeGff, identityContext, "ResRef", ResType::Utm)) {
+            continue;
+        }
         auto store = _game.newStore(*storeGff, identityContext, _sceneName);
         if (identityContext.isSerializedState()) {
             store->captureSaveRecord(*storeGff, identityContext, {SaveRecordOriginKind::ActiveGitObject, _name});
@@ -588,6 +739,138 @@ void Area::loadAreaEffects(const resource::Gff &gff, const SerializedIdentityCon
     }
 }
 
+namespace {
+
+/** A room model's omen events start its part sounds. */
+class PartSoundEventListener : public scene::IAnimationEventListener {
+public:
+    PartSoundEventListener(std::function<void(const std::string &)> play) :
+        _play(std::move(play)) {
+    }
+
+    void onEventSignalled(const std::string &name) override { _play(name); }
+
+private:
+    std::function<void(const std::string &)> _play;
+};
+
+} // namespace
+
+void Area::loadPartSounds(const resource::Gff &are) {
+    _partSounds.clear();
+    // An interior has no weather.
+    static constexpr uint32_t kInteriorAreaFlag = 1;
+    if ((are.getUint("Flags") & kInteriorAreaFlag) == 0) {
+        _chanceRain = are.getInt("ChanceRain");
+        _chanceSnow = are.getInt("ChanceSnow");
+        _chanceLightning = are.getInt("ChanceLightning");
+    }
+    for (auto &room : are.getList("Rooms")) {
+        const std::string roomName = boost::to_lower_copy(room->getString("RoomName"));
+        if (room->getInt("DisableWeather") != 0) {
+            _weatherlessRooms.insert(roomName);
+        }
+        for (auto &part : room->getList("PartSounds")) {
+            PartSound partSound;
+            partSound.roomName = roomName;
+            partSound.part = boost::to_lower_copy(part->getString("ModelPart"));
+            partSound.omenEvent = part->getString("OmenEvent");
+            partSound.resRef = boost::to_lower_copy(part->getString("Sound"));
+            _partSounds.push_back(std::move(partSound));
+        }
+    }
+}
+
+// A part sound of a room the layout has, on a part its model has, plays in
+// the room sounds' group, at full volume within 20 m and heard out to 150 m.
+// One without an omen event starts at once; the others wait for theirs.
+void Area::attachPartSounds() {
+    std::map<const scene::ModelSceneNode *, bool> listened;
+    for (auto &partSound : _partSounds) {
+        auto room = _rooms.find(partSound.roomName);
+        if (room == _rooms.end() || !room->second->model()) {
+            continue;
+        }
+        partSound.partNode = room->second->model()->getNodeByName(partSound.part);
+        if (!partSound.partNode) {
+            continue;
+        }
+        partSound.roomModel = room->second->model();
+        if (!partSound.omenEvent.empty() && !listened[partSound.roomModel.get()]) {
+            listened[partSound.roomModel.get()] = true;
+            const auto *roomModel = partSound.roomModel.get();
+            auto listener = std::make_unique<PartSoundEventListener>([this, roomModel](const std::string &event) {
+                playPartSounds(*roomModel, event);
+            });
+            partSound.roomModel->setAnimationEventListener(*listener);
+            _partSoundListeners.push_back(std::move(listener));
+        }
+    }
+    for (auto &partSound : _partSounds) {
+        if (partSound.roomModel && partSound.omenEvent.empty()) {
+            playPartSounds(*partSound.roomModel, "");
+        }
+    }
+}
+
+void Area::playPartSounds(const scene::ModelSceneNode &roomModel, const std::string &event) {
+    static constexpr float kPartSoundFullVolumeDistance = 20.0f;
+    static constexpr float kPartSoundCutoffDistance = 150.0f;
+    for (auto &partSound : _partSounds) {
+        if (partSound.roomModel.get() != &roomModel || !boost::iequals(partSound.omenEvent, event) ||
+            (partSound.source && partSound.source->isPlaying())) {
+            continue;
+        }
+        partSound.source = _services.audio.mixer.play(
+            _services.resource.audioClips.get(partSound.resRef), audio::AudioType::Sound, kRoomSoundGroup, 1.0f, true,
+            partSound.partNode->origin(), audio::SoundDistances {kPartSoundFullVolumeDistance, kPartSoundCutoffDistance});
+    }
+}
+
+void Area::updatePartSounds() {
+    for (auto &partSound : _partSounds) {
+        if (partSound.source) {
+            partSound.source->setPosition(partSound.partNode->origin());
+        }
+    }
+}
+
+// The weather follows the first chance the area has of rain, then snow, then
+// lightning, which brings rain. Its timers count seconds of play, whatever the
+// frame rate: the time left over when one runs out counts toward the next.
+void Area::updateWeather(float dt) {
+    static constexpr float kWeatherRollSeconds = 300.0f;
+    if (!_game.isTSL()) {
+        return;
+    }
+    _weatherTimer -= dt;
+    if (_weatherTimer <= 0.0f) {
+        const int roll = randomInt(0, 99);
+        const int chance = _chanceRain != 0 ? _chanceRain : (_chanceSnow != 0 ? _chanceSnow : _chanceLightning);
+        if (chance != 0) {
+            _weatherOn = roll < chance;
+        }
+        // A stall longer than a whole period rolls once, not once for each.
+        _weatherTimer = _weatherTimer + kWeatherRollSeconds > 0.0f ? _weatherTimer + kWeatherRollSeconds : kWeatherRollSeconds;
+    }
+    if (!_weatherOn || _chanceLightning == 0) {
+        return;
+    }
+    auto leader = _game.party().getLeader();
+    if (leader && leader->room() && _weatherlessRooms.count(leader->room()->name()) != 0) {
+        return;
+    }
+    _lightningDelay -= dt;
+    if (_lightningDelay > 0.0f) {
+        return;
+    }
+    const float nextDelay = randomInt(0, 4999) / 1000.0f + 5.0f;
+    _lightningDelay = _lightningDelay + nextDelay > 0.0f ? _lightningDelay + nextDelay : nextDelay;
+    if (randomInt(0, 99) < _chanceLightning) {
+        _game.areaMusic().thunder(randomInt(0, 1) == 0);
+    }
+}
+
 void Area::loadLYT() {
     auto layout = _services.resource.layouts.get(_name);
     if (!layout) {
@@ -597,42 +880,10 @@ void Area::loadLYT() {
     auto walkableSurfaces = _services.game.surfaces.getWalkableSurfaces();
     for (auto &lytRoom : layout->rooms) {
         _layoutWalkmeshes.emplace_back();
-        auto model = _services.resource.models.get(lytRoom.name);
-        if (!model) {
-            continue;
-        }
-
-        // Model
         glm::vec3 position(lytRoom.position.x, lytRoom.position.y, lytRoom.position.z);
-        std::shared_ptr<ModelSceneNode> modelSceneNode(sceneGraph.newModel(*model, ModelUsage::Room));
-        modelSceneNode->setLocalTransform(glm::translate(glm::mat4(1.0f), position));
-
-        // Mark room objects as static when not below "{modelName}a" model node
-        std::stack<std::reference_wrapper<ModelNode>> modelNodes;
-        modelNodes.push(*model->rootNode());
-        while (!modelNodes.empty()) {
-            auto &modelNode = modelNodes.top().get();
-            modelNodes.pop();
-            if (modelNode.name() == model->name() + "a") {
-                continue;
-            }
-            auto sceneNode = modelSceneNode->getNodeByName(modelNode.name());
-            if (sceneNode) {
-                sceneNode->setStatic(true);
-            }
-            for (auto &child : modelNode.children()) {
-                modelNodes.push(*child);
-            }
-        }
-
-        for (auto &anim : model->getAnimationNames()) {
-            if (boost::starts_with(anim, "animloop")) {
-                modelSceneNode->playAnimation(anim, nullptr, AnimationProperties::fromFlags(AnimationFlags::loopOverlay));
-            }
-        }
-        sceneGraph.addRoot(modelSceneNode);
-
-        // Walkmesh
+        // A room is walked on by its walkmesh, whether or not its model is
+        // there to be drawn.
+        auto model = _services.resource.models.get(lytRoom.name);
         std::shared_ptr<WalkmeshSceneNode> walkmeshSceneNode;
         auto walkmesh = _services.resource.walkmeshes.get(lytRoom.name, ResType::Wok);
         if (walkmesh) {
@@ -641,22 +892,43 @@ void Area::loadLYT() {
             uniwalkLoadRoom(_pathfinder.uni, *walkmesh, walkableSurfaces);
         }
 
-        // Grass
-        std::shared_ptr<GrassSceneNode> grassSceneNode;
-        auto aabbNode = modelSceneNode->model().getAABBNode();
-        if (_grass.texture && aabbNode && _game.options().graphics.grass) {
-            auto grassProperties = GrassProperties();
-            grassProperties.density = _grass.density;
-            grassProperties.quadSize = _grass.quadSize;
-            grassProperties.probabilities = _grass.probabilities;
-            grassProperties.materials = _services.game.surfaces.getGrassSurfaces();
-            grassProperties.texture = _grass.texture.get();
-            grassSceneNode = sceneGraph.newGrass(grassProperties, *aabbNode);
-            grassSceneNode->setLocalTransform(glm::translate(position) * aabbNode->absoluteTransform());
-            sceneGraph.addRoot(grassSceneNode);
+        if (!model && !walkmeshSceneNode) {
+            continue;
         }
 
-        auto room = std::make_unique<Room>(lytRoom.name, position, std::move(modelSceneNode), walkmeshSceneNode, std::move(grassSceneNode));
+        // Model
+        std::shared_ptr<ModelSceneNode> modelSceneNode;
+        if (model) {
+            modelSceneNode = sceneGraph.newModel(*model, ModelUsage::Room);
+            modelSceneNode->setLocalTransform(glm::translate(glm::mat4(1.0f), position));
+
+            // Mark room objects as static when not below "{modelName}a" model node
+            std::stack<std::reference_wrapper<ModelNode>> modelNodes;
+            modelNodes.push(*model->rootNode());
+            while (!modelNodes.empty()) {
+                auto &modelNode = modelNodes.top().get();
+                modelNodes.pop();
+                if (modelNode.name() == model->name() + "a") {
+                    continue;
+                }
+                auto sceneNode = modelSceneNode->getNodeByName(modelNode.name());
+                if (sceneNode) {
+                    sceneNode->setStatic(true);
+                }
+                for (auto &child : modelNode.children()) {
+                    modelNodes.push(*child);
+                }
+            }
+
+            for (auto &anim : model->getAnimationNames()) {
+                if (boost::starts_with(anim, "animloop")) {
+                    modelSceneNode->playAnimation(anim, nullptr, AnimationProperties::fromFlags(AnimationFlags::loopOverlay));
+                }
+            }
+            sceneGraph.addRoot(modelSceneNode);
+        }
+
+        auto room = std::make_unique<Room>(lytRoom.name, position, std::move(modelSceneNode), walkmeshSceneNode);
         if (walkmeshSceneNode) {
             walkmeshSceneNode->setUser(*room);
         }
@@ -674,6 +946,33 @@ void Area::loadLYT() {
     // lasts.
     sceneGraph.setRoomWalkmeshes(_layoutWalkmeshes);
     sceneGraph.setRoomTest(_roomTest);
+    if (_game.options().graphics.grass) {
+        buildGrass();
+    }
+}
+
+void Area::buildGrass() {
+    _grassBuilt = true;
+    if (!_grass.texture) {
+        return;
+    }
+    GrassProperties properties;
+    properties.density = _grass.density;
+    properties.quadSize = _grass.quadSize;
+    properties.probabilities = _grass.probabilities;
+    properties.materials = _services.game.surfaces.getGrassSurfaces();
+    properties.texture = _grass.texture.get();
+    auto &sceneGraph = _services.scene.graphs.get(_sceneName);
+    for (auto *room : _roomOrder) {
+        auto aabbNode = room->model() ? room->model()->model().getAABBNode() : nullptr;
+        if (!aabbNode) {
+            continue;
+        }
+        auto grass = sceneGraph.newGrass(properties, *aabbNode);
+        grass->setLocalTransform(glm::translate(room->position()) * aabbNode->absoluteTransform());
+        sceneGraph.addRoot(grass);
+        room->setGrass(std::move(grass));
+    }
 }
 
 void Area::loadVIS() {
@@ -726,6 +1025,14 @@ void Area::initCameras(const glm::vec3 &entryPosition, float entryFacing) {
 }
 
 Area::~Area() {
+    for (auto &partSound : _partSounds) {
+        if (partSound.source) {
+            partSound.source->stop();
+        }
+        if (partSound.roomModel) {
+            partSound.roomModel->clearAnimationEventListener();
+        }
+    }
     for (Object *object : _objectsByX) {
         if (object->_spatialArea == this) {
             object->_spatialArea = nullptr;
@@ -733,9 +1040,12 @@ Area::~Area() {
     }
     // Corpses, fading bodies and released effect models go with the area.
     if (_fadingBodies.empty() && _corpses.empty() && _corpseBagBodies.empty() && _releasedEffectModels.empty() &&
-        _presentedVisuals.empty() && _hitSparks.empty())
+        _presentedVisuals.empty() && _hitSparks.empty() && _removedMines.empty())
         return;
     auto &sceneGraph = _services.scene.graphs.get(_sceneName);
+    for (auto &mine : _removedMines) {
+        sceneGraph.removeRoot(*mine.model);
+    }
     for (auto &body : _fadingBodies) {
         sceneGraph.removeRoot(*body.model);
     }
@@ -943,31 +1253,6 @@ void Area::add(const std::shared_ptr<Object> &object) {
         determineObjectRoom(*object);
         attachObjectToSceneGraph(object);
         updateBreathVisual(_game, object);
-
-        if (auto door = dyn_cast<Door>(object)) {
-            if ((door->linkedToFlags() == 1 || door->linkedToFlags() == 2) &&
-                !door->linkedToModule().empty() &&
-                !door->linkedTo().empty() &&
-                !door->linkedTransitionGeometry().empty()) {
-                std::vector<std::shared_ptr<Object>> noObsolete;
-                std::shared_ptr<Trigger> trigger;
-                _game.replaceRuntimeObjectGraph(
-                    noObsolete,
-                    [&]() {
-                        trigger = _game.newTrigger(_sceneName);
-                        trigger->configureLinkedDoorTransition(door);
-                    },
-                    []() noexcept {});
-                try {
-                    add(trigger);
-                } catch (...) {
-                    if (trigger->isRuntimeLive()) {
-                        _game.destroyRuntimeObjectGraph(trigger);
-                    }
-                    throw;
-                }
-            }
-        }
     } catch (...) {
         auto owned = std::find_if(
             _objects.begin(), _objects.end(),
@@ -1216,6 +1501,27 @@ int Area::getRoomForceRating(const glm::vec3 &position) const {
     return found != _roomForceRatings.end() ? found->second : 0;
 }
 
+void Area::playRoomAnimation(const std::string &roomName, int animation) {
+    auto room = _rooms.find(boost::to_lower_copy(roomName));
+    if (room == _rooms.end()) {
+        return;
+    }
+    // Loops are numbered from 00; a number reads as unsigned and 16 bits wide.
+    auto name = str(boost::format("scriptloop%02u") % static_cast<uint16_t>(animation));
+    int flags = _game.isTSL() ? AnimationFlags::loop : AnimationFlags::loopOverlay;
+    room->second->model()->playAnimation(name, nullptr, AnimationProperties::fromFlags(flags));
+}
+
+const Room *Area::roomUnder(const glm::vec3 &position) const {
+    auto walkmesh = _services.scene.graphs.get(_sceneName).findRoomWalkmesh(position);
+    return walkmesh ? dynamic_cast<const Room *>(walkmesh->user()) : nullptr;
+}
+
+int Area::roomEnvAudio(const Room &room) const {
+    auto found = _roomEnvAudio.find(boost::to_lower_copy(room.name()));
+    return found != _roomEnvAudio.end() ? found->second : 0;
+}
+
 int Area::getSurfaceMaterial(const glm::vec3 &position) const {
     auto &sceneGraph = _services.scene.graphs.get(_sceneName);
     auto room = sceneGraph.findRoomWalkmesh(position);
@@ -1250,6 +1556,9 @@ void Area::detachObjectRuntime(const std::shared_ptr<Object> &object) {
     }
     for (auto &areaEffectObject : _objectsByType[ObjectType::AreaOfEffect]) {
         static_cast<AreaOfEffect &>(*areaEffectObject).forgetOccupant(object->id());
+    }
+    for (auto &doorObject : _objectsByType[ObjectType::Door]) {
+        static_cast<Door &>(*doorObject).forgetOutlineOccupant(object->id());
     }
     _persistentQueryIndex.erase(object->id());
 
@@ -1367,29 +1676,25 @@ void Area::doDestroyObject(uint32_t objectId, bool destroyRuntimeObject) {
         return;
     }
 
-    if (auto door = dyn_cast<Door>(object)) {
-        std::vector<uint32_t> linkedTriggerIds;
-        for (auto &triggerObject : _objectsByType[ObjectType::Trigger]) {
-            auto trigger = std::static_pointer_cast<Trigger>(triggerObject);
-            if (trigger->detachLinkedDoorTransition(*door)) {
-                linkedTriggerIds.push_back(trigger->id());
-            }
-        }
-        for (auto triggerId : linkedTriggerIds) {
-            doDestroyObject(triggerId);
-        }
-    }
-
     // A destroyed encounter creature no longer counts against its wave.
     if (auto creature = dyn_cast<Creature>(object); creature && creature->isEncounterCreature() && !creature->hasLeftEncounter()) {
         creature->leaveEncounter();
     }
-    // An area of effect that goes runs OnExit at once for those still inside.
+    // An area of effect that goes runs OnExit at once for those still inside,
+    // and ends its sounds.
     if (auto areaOfEffect = dyn_cast<AreaOfEffect>(object)) {
         areaOfEffect->releaseOccupants();
+        areaOfEffect->stopSounds();
+    }
+    if (auto creature = dyn_cast<Creature>(object)) {
+        creature->stopRollingFootstep();
+        creature->stopLoopingSounds();
     }
     // Only a body standing in the area stays behind it.
     const bool resident = isObjectResident(*object);
+    if (auto trigger = dyn_cast<Trigger>(object); trigger && destroyRuntimeObject && trigger->isTrap()) {
+        presentMineRemoval(*trigger);
+    }
     detachObjectRuntime(object);
     if (destroyRuntimeObject) {
         // A live creature destroyed where it stood leaves the area.
@@ -1490,6 +1795,8 @@ void Area::releaseEffectModel(std::shared_ptr<ModelSceneNode> model) {
     }
 }
 
+// The visual's model plays its impact at the point and its impact sound
+// above it.
 void Area::presentVisualAt(int visualEffectId, const glm::vec3 &position) {
     const auto found = _services.game.visualEffects.get(visualEffectId);
     if (!found) {
@@ -1505,7 +1812,8 @@ void Area::presentVisualAt(int visualEffectId, const glm::vec3 &position) {
         _presentedVisuals.push_back(std::move(model));
     }
     if (desc.soundImpact) {
-        _services.audio.mixer.play(desc.soundImpact, audio::AudioType::Sound, 1.0f, false, position);
+        const glm::vec3 soundPosition {position + glm::vec3 {0.0f, 0.0f, kEffectSoundHeight}};
+        _services.audio.mixer.play(desc.soundImpact, audio::AudioType::Sound, kSpellEffectSoundGroup, 1.0f, false, soundPosition);
     }
 }
 
@@ -1559,9 +1867,44 @@ void Area::presentHitSpark(const Creature &target, int visualEffectId, const glm
     _hitSparks.push_back(std::move(spark));
 }
 
+// The clips a mine's model plays as it goes with its explosion or disarmed.
+static constexpr int kMineActivateAnimation = 348;
+static constexpr int kMineDeactivateAnimation = 349;
+// A removed mine's model stays this long after its clip.
+static constexpr float kRemovedMineHold = 0.5f;
+
+void Area::presentMineRemoval(Trigger &mine) {
+    const MineRemoval removal = mine.mineRemoval();
+    if (removal == MineRemoval::Plain) {
+        return;
+    }
+    // Only a mine whose model is present, one within the player's view, is
+    // shown going.
+    if (!mine.trapModel()) {
+        return;
+    }
+    const bool explosion = removal == MineRemoval::Explosion;
+    // A trap type with a blank explosion sound goes off silently.
+    if (explosion && !mine.trapExplosionSound().empty()) {
+        _services.audio.mixer.play(_services.resource.audioClips.get(mine.trapExplosionSound()),
+                                   audio::AudioType::Sound, kSingleShotPositionalSoundGroup, 1.0f, false, mine.trapModelPosition());
+    }
+    auto model = mine.releaseTrapModel();
+    model->setPickable(false);
+    const std::string name =
+        _services.game.animations.getNameById(explosion ? kMineActivateAnimation : kMineDeactivateAnimation);
+    // A model without the clip holds still for the time it stays.
+    float clipLength = 0.0f;
+    if (auto animation = model->model().getAnimation(name)) {
+        model->playAnimation(name);
+        clipLength = animation->length();
+    }
+    _removedMines.push_back({std::move(model), clipLength + kRemovedMineHold});
+}
+
 void Area::updateReleasedPresentation(float dt) {
     if (_fadingBodies.empty() && _corpses.empty() && _corpseBagBodies.empty() && _releasedEffectModels.empty() &&
-        _presentedVisuals.empty() && _hitSparks.empty())
+        _presentedVisuals.empty() && _hitSparks.empty() && _removedMines.empty())
         return;
     auto &sceneGraph = _services.scene.graphs.get(_sceneName);
     for (auto it = _fadingBodies.begin(); it != _fadingBodies.end();) {
@@ -1585,6 +1928,15 @@ void Area::updateReleasedPresentation(float dt) {
         } else {
             sceneGraph.removeRoot(**it);
             it = _releasedEffectModels.erase(it);
+        }
+    }
+    for (auto it = _removedMines.begin(); it != _removedMines.end();) {
+        it->remaining -= dt;
+        if (it->remaining <= 0.0f) {
+            sceneGraph.removeRoot(*it->model);
+            it = _removedMines.erase(it);
+        } else {
+            ++it;
         }
     }
     for (auto it = _presentedVisuals.begin(); it != _presentedVisuals.end();) {
@@ -1626,7 +1978,7 @@ std::shared_ptr<Creature> Area::getNextFactionMember(Faction faction, int pc) {
     return findFactionMember(faction, pc, cursor != _factionMemberCursors.end() ? cursor->second : 0);
 }
 
-std::shared_ptr<Creature> Area::findFactionMember(Faction faction, int pc, size_t from) {
+std::vector<std::shared_ptr<Creature>> Area::getFactionMembers(Faction faction) {
     std::vector<std::shared_ptr<Creature>> members;
     for (const auto &object : getObjectsByType(ObjectType::Creature)) {
         auto creature = std::static_pointer_cast<Creature>(object);
@@ -1637,6 +1989,11 @@ std::shared_ptr<Creature> Area::findFactionMember(Faction faction, int pc, size_
     std::stable_sort(members.begin(), members.end(), [](const auto &left, const auto &right) {
         return left->factionJoinOrder() < right->factionJoinOrder();
     });
+    return members;
+}
+
+std::shared_ptr<Creature> Area::findFactionMember(Faction faction, int pc, size_t from) {
+    const auto members = getFactionMembers(faction);
     for (size_t index = from; index < members.size(); ++index) {
         if (members[index]->isPCValue() != pc) {
             continue;
@@ -1655,34 +2012,7 @@ std::shared_ptr<Object> Area::getObjectByTag(const std::string &tag, int nth) co
     if (nth >= objects->second.size())
         return nullptr;
 
-    // GetObjectByTag routine requires the array to be partitioned by isDead:
-    // all alive objects should be at the front, and all dead objects should be
-    // at the back of the array.
-    //
-    // We do not actually sort the array, but traverse it in two passes with an
-    // inverted condition.
-
-    // Search "not dead" objects first.
-    size_t i = 0;
-    for (const std::shared_ptr<Object> &object : objects->second) {
-        if (!object->isDead()) {
-            if ((i++) == nth) {
-                return object;
-            }
-        }
-    }
-
-    // Search across dead objects.
-    for (const std::shared_ptr<Object> &object : objects->second) {
-        if (object->isDead()) {
-            if ((i++) == nth) {
-                return object;
-            }
-        }
-    }
-
-    assert(0 && "inconsistent getObjectByTag");
-    return nullptr;
+    return objects->second[nth];
 }
 
 void Area::landObject(Object &object) {
@@ -1695,9 +2025,27 @@ void Area::groundCreature(Creature &creature) {
     const glm::vec3 position {creature.position()};
     std::shared_ptr<scene::WalkmeshSceneNode> walkmesh;
     const int hint = creature.groundRoomHint();
+    // In TSL the room the creature was last found in is kept while the
+    // vertical through the creature meets it; where floors lie over others,
+    // not while the creature stands at the level of another room's floor and
+    // not of that room's.
+    const auto atLevel = [&](const scene::WalkmeshSceneNode &room) {
+        const auto face = sceneGraph.findRoomFace(room, position, scene::RoomFaceProbe::Locating);
+        return face && std::abs(face->height - position.z) <= graphics::Walkmesh::kFloorHeadroom;
+    };
+    std::shared_ptr<scene::WalkmeshSceneNode> hinted;
     if (_game.isTSL() && hint >= 0 && hint < static_cast<int>(_layoutWalkmeshes.size()) && _layoutWalkmeshes[hint] &&
         sceneGraph.findRoomFace(*_layoutWalkmeshes[hint], position, scene::RoomFaceProbe::Locating)) {
-        walkmesh = _layoutWalkmeshes[hint];
+        hinted = _layoutWalkmeshes[hint];
+    }
+    if (hinted && sceneGraph.hasStackedFloors() && !atLevel(*hinted)) {
+        const auto found = sceneGraph.findRoomWalkmesh(position);
+        if (found && found != hinted && atLevel(*found)) {
+            hinted = nullptr;
+        }
+    }
+    if (hinted) {
+        walkmesh = hinted;
     } else {
         walkmesh = sceneGraph.findRoomWalkmesh(position);
         const auto found = std::find(_layoutWalkmeshes.begin(), _layoutWalkmeshes.end(), walkmesh);
@@ -1781,6 +2129,55 @@ bool Area::hasRoomAt(const glm::vec3 &position) const {
     return _services.scene.graphs.get(_sceneName).findRoomWalkmesh(position) != nullptr;
 }
 
+bool Area::hasStackedFloors() const {
+    return _services.scene.graphs.get(_sceneName).hasStackedFloors();
+}
+
+bool Area::isAtLevelOf(const glm::vec3 &point, float height) const {
+    auto &sceneGraph = _services.scene.graphs.get(_sceneName);
+    if (!sceneGraph.hasStackedFloors()) {
+        return true;
+    }
+    const glm::vec3 probe {point.x, point.y, height};
+    float floor = height;
+    if (const auto room = sceneGraph.findRoomWalkmesh(probe)) {
+        const auto face = sceneGraph.findRoomFace(*room, probe, scene::RoomFaceProbe::Locating);
+        if (!face) {
+            return false;
+        }
+        floor = face->height;
+    }
+    return std::abs(floor - point.z) <= graphics::Walkmesh::kFloorHeadroom;
+}
+
+float Area::roomLookupHeight(float height) const {
+    return hasStackedFloors() ? height : 0.0f;
+}
+
+graphics::Walkmesh::HeightBand Area::staticWallBand(const Creature &walker, float low, float high) const {
+    static constexpr float kStaticWallReach = 1000.0f;
+    static constexpr float kOverhead = 0.1f;
+    if (!hasStackedFloors()) {
+        return {low - kStaticWallReach, high + kStaticWallReach};
+    }
+    return {low - graphics::Walkmesh::kFloorHeadroom, high + walker.collisionHeight() + kOverhead};
+}
+
+// How far up from its feet a creature stands in the way of others where
+// floors lie over others: its collision height, but no less than a floor's
+// headroom, so that one of no height still meets those beside it.
+static float standingHeight(const Creature &creature) {
+    return std::max(creature.collisionHeight(), graphics::Walkmesh::kFloorHeadroom);
+}
+
+// Whether a creature, from its feet up through its standing height, keeps
+// clear of the heights from low to high: where floors lie over others, it
+// stands on another floor.
+static bool clearsHeights(const Creature &creature, float low, float high) {
+    const float feet = creature.position().z;
+    return feet > high || feet + standingHeight(creature) < low;
+}
+
 // Blocking faces are the non-walkable ones that walking is checked against,
 // in the rooms and in doors and placeables alike.
 static std::set<uint32_t> blockingSurfaces(const ISurfaces &surfaces) {
@@ -1807,6 +2204,24 @@ static bool hasBlockingFaceWithin(const std::shared_ptr<scene::WalkmeshSceneNode
     return node->walkmesh().hasFaceWithin(blocking, localFrom, localTo, radius, minZ + shift, maxZ + shift);
 }
 
+// Where a walker of the given radius, swept along the level segment between
+// two points, first meets a blocking face of an enabled walkmesh between two
+// heights; the contact's normal in world coordinates.
+static std::optional<graphics::Walkmesh::Contact> sweepWalkmesh(const std::shared_ptr<scene::WalkmeshSceneNode> &node, const std::set<uint32_t> &blocking,
+                                                                const glm::vec3 &from, const glm::vec3 &to, float radius, float minZ, float maxZ) {
+    if (!node || !node->isEnabled()) {
+        return std::nullopt;
+    }
+    const glm::vec3 localFrom {node->absoluteTransformInverse() * glm::vec4(from, 1.0f)};
+    const glm::vec3 localTo {node->absoluteTransformInverse() * glm::vec4(to, 1.0f)};
+    const float shift = localFrom.z - from.z;
+    auto contact = node->walkmesh().sweep(blocking, localFrom, localTo, radius, minZ + shift, maxZ + shift);
+    if (contact) {
+        contact->normal = glm::vec3(node->absoluteTransform() * glm::vec4(contact->normal, 0.0f));
+    }
+    return contact;
+}
+
 // Whether a wall of a door as it stands lies within radius of the level
 // segment between two points, between two heights.
 static bool hasDoorWallWithin(const Door &door, const std::set<uint32_t> &blocking,
@@ -1830,21 +2245,44 @@ bool Area::hasDoorWallAlong(const glm::vec3 &from, const glm::vec3 &to, const Cr
     return false;
 }
 
-std::optional<std::reference_wrapper<const Object>> Area::findStaticWallNear(
-    const glm::vec3 &point, const Creature &creature, float minZ, float maxZ) const {
+std::optional<std::reference_wrapper<const Object>> Area::findStaticWallAlong(
+    const glm::vec3 &from, const glm::vec3 &to, const Creature &creature, float minZ, float maxZ) const {
     const auto blocking = blockingSurfaces(_services.game.surfaces);
     const float radius = creature.personalSpace();
     for (const auto &object : _objectsByType.at(ObjectType::Door)) {
-        if (hasDoorWallWithin(static_cast<const Door &>(*object), blocking, point, point, radius, minZ, maxZ)) {
+        if (hasDoorWallWithin(static_cast<const Door &>(*object), blocking, from, to, radius, minZ, maxZ)) {
             return std::cref(*object);
         }
     }
     for (const auto &object : _objectsByType.at(ObjectType::Placeable)) {
-        if (hasBlockingFaceWithin(static_cast<const Placeable &>(*object).walkmesh(), blocking, point, point, radius, minZ, maxZ)) {
+        if (hasBlockingFaceWithin(static_cast<const Placeable &>(*object).walkmesh(), blocking, from, to, radius, minZ, maxZ)) {
             return std::cref(*object);
         }
     }
     return std::nullopt;
+}
+
+std::optional<Area::StaticWallContact> Area::findStaticWallContact(
+    const glm::vec3 &from, const glm::vec3 &to, const Creature &creature, float minZ, float maxZ) const {
+    const auto blocking = blockingSurfaces(_services.game.surfaces);
+    const float radius = creature.personalSpace();
+    std::optional<StaticWallContact> nearest;
+    const auto consider = [&](const Object &object, const std::shared_ptr<scene::WalkmeshSceneNode> &node) {
+        auto contact = sweepWalkmesh(node, blocking, from, to, radius, minZ, maxZ);
+        if (contact && (!nearest || contact->distance < nearest->contact.distance)) {
+            nearest = StaticWallContact {std::cref(object), *contact};
+        }
+    };
+    for (const auto &object : _objectsByType.at(ObjectType::Door)) {
+        const auto &door = static_cast<const Door &>(*object);
+        for (const auto &node : {door.walkmeshOpen1(), door.walkmeshOpen2(), door.walkmeshClosed()}) {
+            consider(door, node);
+        }
+    }
+    for (const auto &object : _objectsByType.at(ObjectType::Placeable)) {
+        consider(*object, static_cast<const Placeable &>(*object).walkmesh());
+    }
+    return nearest;
 }
 
 bool Area::isSafeLocationPoint(const glm::vec3 &point, const Creature &creature) const {
@@ -1877,9 +2315,11 @@ bool Area::isSafeLocationPoint(const glm::vec3 &point, const Creature &creature)
     }
 
     const float ownRadius = creature.creaturePersonalSpace() + kCreatureCollisionEpsilon;
+    const bool stacked = hasStackedFloors();
     for (const auto &object : _objectsByType.at(ObjectType::Creature)) {
         const auto &other = static_cast<const Creature &>(*object);
-        if (&other == &creature || other.isDead() || other.isTemporarilyDead()) {
+        if (&other == &creature || other.isDead() || other.isTemporarilyDead() ||
+            (stacked && clearsHeights(other, point.z, point.z + standingHeight(creature)))) {
             continue;
         }
         const float reach = ownRadius + other.creaturePersonalSpace();
@@ -1932,10 +2372,7 @@ std::optional<glm::vec3> Area::computeSafeLocation(
     if (isSafeLocationPoint(grounded, creature)) {
         return grounded;
     }
-    // Reachability only counts from a position on walkable ground, clear of
-    // the walls of any door.
-    const glm::vec3 probe {kSafeLocationDoorProbe, kSafeLocationDoorProbe, 0.0f};
-    if (!isPositionWalkable(grounded) || hasDoorWallAlong(grounded - probe, grounded + probe, creature, grounded.z, grounded.z + creature.collisionHeight())) {
+    if (!testsWaysFrom(grounded, creature)) {
         clearLine = false;
     }
 
@@ -1972,10 +2409,14 @@ std::optional<glm::vec3> Area::computeSafeLocation(
             return spot; });
 }
 
+bool Area::testsWaysFrom(const glm::vec3 &spot, const Creature &creature) const {
+    const glm::vec3 probe {kSafeLocationDoorProbe, kSafeLocationDoorProbe, 0.0f};
+    return isPositionWalkable(spot) && !hasDoorWallAlong(spot - probe, spot + probe, creature, spot.z, spot.z + creature.collisionHeight());
+}
+
 std::optional<glm::vec3> Area::computeSafeLocationInDirection(
     const glm::vec3 &base, const glm::vec3 &direction, float radius, const Creature &creature, bool clearLine) const {
-    static constexpr float kProbe = 0.01f;
-    static constexpr float kRowRounding = 0.01f;
+    static constexpr double kRowRounding = 0.01;
     // Spots stand at the top ground height, their rooms looked for around the
     // height of the first spot for it, and around base's height for the rows.
     const auto spotAt = [this](const glm::vec3 &point) {
@@ -1985,8 +2426,7 @@ std::optional<glm::vec3> Area::computeSafeLocationInDirection(
     if (isSafeLocationPoint(first, creature)) {
         return first;
     }
-    const glm::vec3 probe {kProbe, kProbe, 0.0f};
-    if (!isPositionWalkable(first) || testDirectLine(creature, first - probe, first + probe).result == DirectLine::Blocked) {
+    if (!testsWaysFrom(first, creature)) {
         clearLine = false;
     }
 
@@ -1994,13 +2434,14 @@ std::optional<glm::vec3> Area::computeSafeLocationInDirection(
     const glm::vec2 along {glm::normalize(glm::vec2(direction))};
     const glm::vec2 across {along.y, -along.x};
     for (float width = step; radius > width; width += step) {
-        const int row = static_cast<int>((width + kRowRounding) / step);
+        const int row = static_cast<int>((static_cast<double>(width) + kRowRounding) / static_cast<double>(step));
         for (int i = -row; i <= row; ++i) {
             const glm::vec3 spot {spotAt(glm::vec3(glm::vec2(base) + static_cast<float>(row) * along + static_cast<float>(i) * across, base.z))};
             if (!isSafeLocationPoint(spot, creature)) {
                 continue;
             }
-            if (clearLine && testDirectLine(creature, base, spot).result == DirectLine::Blocked) {
+            const float low = std::min(spot.z, base.z);
+            if (clearLine && hasDoorWallAlong(base, spot, creature, low - kSafeLocationDoorBand, low + creature.collisionHeight())) {
                 continue;
             }
             return spot;
@@ -2070,12 +2511,15 @@ void Area::budgeCreatures(const glm::vec3 &center, const graphics::AABB &bounds,
     }
 }
 
-void Area::updateSubAreaOccupancy(const std::shared_ptr<Creature> &creature, bool announce) {
+void Area::updateSubAreaOccupancy(const std::shared_ptr<Creature> &creature, bool announce, std::optional<glm::vec3> from) {
     for (const auto &object : _objectsByType[ObjectType::Encounter]) {
-        static_cast<Encounter &>(*object).updateOccupancy(creature, announce);
+        static_cast<Encounter &>(*object).updateOccupancy(creature, announce, from);
     }
     for (const auto &object : _objectsByType[ObjectType::AreaOfEffect]) {
-        static_cast<AreaOfEffect &>(*object).updateOccupancy(creature, announce);
+        static_cast<AreaOfEffect &>(*object).updateOccupancy(creature, announce, from);
+    }
+    for (const auto &object : _objectsByType[ObjectType::Door]) {
+        static_cast<Door &>(*object).updateOutlineOccupancy(*creature, announce);
     }
 }
 
@@ -2094,16 +2538,13 @@ std::optional<std::reference_wrapper<const Creature>> Area::findBlockingCreature
     return collision.creature;
 }
 
-Area::DirectLineTest Area::testDirectLine(
+Area::DirectLineTest Area::testWalkStep(
     const Creature &mover,
     const glm::vec3 &from,
     const glm::vec3 &to,
     std::optional<std::reference_wrapper<const Creature>> ignored) const {
     // In TSL a walk is followed through no more than this many rooms.
     static constexpr int kMaxRoomsOnWalk = 100;
-    // Door and placeable walls are looked for this far below and above the
-    // heights the walk spans in the room it leaves the rooms from.
-    static constexpr float kExitWallReach = 1000.0f;
     auto &sceneGraph = _services.scene.graphs.get(_sceneName);
     DirectLineTest test;
     std::vector<float> crossings;
@@ -2165,12 +2606,12 @@ Area::DirectLineTest Area::testDirectLine(
     }
     if (leavesRooms) {
         // Where the walk runs out of the rooms, a door or placeable wall
-        // there stops it first.
+        // there stops it first, across the heights the walk spans in the
+        // room it leaves the rooms from (see staticWallBand).
         const float exit = fractionOf(reach);
         const glm::vec3 entry {from + line * roomStart(exit)};
-        const float minZ = std::min(entry.z, reach.z) - kExitWallReach;
-        const float maxZ = std::max(entry.z, reach.z) + kExitWallReach;
-        if (auto object = findStaticWallNear(reach, mover, minZ, maxZ)) {
+        const auto wallBand = staticWallBand(mover, std::min(entry.z, reach.z), std::max(entry.z, reach.z));
+        if (auto object = findStaticWallAlong(reach, reach, mover, wallBand.low, wallBand.high)) {
             if (creatureInEarlierRoom(exit)) {
                 return test;
             }
@@ -2190,6 +2631,108 @@ Area::DirectLineTest Area::testDirectLine(
         test.result = DirectLine::LeavesRooms;
         test.stopPoint = reach;
         test.normal = roomExit.normal;
+    }
+    return test;
+}
+
+Area::DirectLineTest Area::testDirectLine(
+    const Creature &mover,
+    const glm::vec3 &from,
+    const glm::vec3 &to,
+    std::optional<std::reference_wrapper<const Creature>> ignored) const {
+    // In TSL a walk is followed through no more than this many rooms.
+    static constexpr int kMaxRoomsOnWalk = 100;
+    // Room walls are looked for this far below the heights the walk spans in
+    // a room, and this far above those plus the walker's height; door and
+    // placeable walls across the band staticWallBand gives.
+    static constexpr float kRoomWallMargin = 0.1f;
+
+    auto &sceneGraph = _services.scene.graphs.get(_sceneName);
+    DirectLineTest test;
+    std::vector<scene::RoomStretch> stretches;
+    Collision roomEnd;
+    const scene::RoomWalkEnd walkEnd = sceneGraph.walkRooms(from, to, _game.isTSL() ? std::make_optional(kMaxRoomsOnWalk) : std::nullopt,
+                                                            /*withBands=*/true, stretches, roomEnd);
+    if (walkEnd == scene::RoomWalkEnd::OffRooms) {
+        test.result = DirectLine::LeavesRooms;
+        test.stopPoint = from;
+        test.normal = roomEnd.normal;
+        return test;
+    }
+    const glm::vec3 line {to - from};
+    const glm::vec2 level {line};
+    const float length2 = glm::dot(level, level);
+    const glm::vec3 back {length2 > 0.0f ? glm::vec3(-level / std::sqrt(length2), 0.0f) : glm::vec3(0.0f)};
+    // Where the walk runs out of the rooms, as a fraction of it.
+    const float last = walkEnd == scene::RoomWalkEnd::Dest || length2 == 0.0f
+                           ? 1.0f
+                           : glm::dot(glm::vec2(roomEnd.intersection - from), level) / length2;
+    // A scene graph that records no stretch, as a test's may, has the walk
+    // settled as one stretch with no room walls.
+    if (stretches.empty()) {
+        stretches.push_back(scene::RoomStretch {});
+    }
+    const auto blocking = blockingSurfaces(_services.game.surfaces);
+    const float radius = mover.personalSpace();
+    for (size_t i = 0; i < stretches.size(); ++i) {
+        const scene::RoomStretch &stretch = stretches[i];
+        const glm::vec3 start {from + line * stretch.from};
+        const glm::vec3 end {from + line * (i + 1 < stretches.size() ? stretches[i + 1].from : last)};
+        const float span = glm::length(glm::vec2(end - start));
+        const auto pointAt = [&](float distance) {
+            return span > 0.0f ? start + (end - start) * (distance / span) : start;
+        };
+        float low = std::min(start.z, end.z);
+        float high = std::max(start.z, end.z);
+        std::optional<graphics::Walkmesh::Contact> roomContact;
+        if (stretch.room) {
+            if (!stretch.band) {
+                test.result = DirectLine::Blocked;
+                test.stopPoint = start;
+                test.normal = back;
+                return test;
+            }
+            low = stretch.band->low;
+            high = stretch.band->high;
+            const float minZ = low - kRoomWallMargin;
+            const float maxZ = high + mover.collisionHeight() + kRoomWallMargin;
+            roomContact = sweepWalkmesh(stretch.room, blocking, start, end, radius, minZ, maxZ);
+        }
+        // The nearer of the room's wall and a door's or placeable's stops the
+        // walk; on a tie the door or placeable does, so that a door in the
+        // way is known.
+        const auto wallBand = staticWallBand(mover, low, high);
+        const auto wall = findStaticWallContact(start, end, mover, wallBand.low, wallBand.high);
+        if (wall && (!roomContact || wall->contact.distance <= roomContact->distance)) {
+            test.result = DirectLine::Blocked;
+            test.stopPoint = pointAt(wall->contact.distance);
+            if (wall->object.get().type() == ObjectType::Door) {
+                test.door = static_cast<const Door &>(wall->object.get());
+            }
+            test.normal = wall->contact.normal;
+            test.contact = wall->contact.kind;
+            return test;
+        }
+        if (roomContact) {
+            test.result = DirectLine::Blocked;
+            test.stopPoint = pointAt(roomContact->distance);
+            test.normal = roomContact->normal;
+            test.contact = roomContact->kind;
+            return test;
+        }
+        CreatureCollision creatureCollision;
+        if (findCreatureCollision(mover, start, end, creatureCollision, ignored)) {
+            test.result = DirectLine::CreatureBlocked;
+            test.blocker = creatureCollision.creature;
+            test.stopPoint = start + (end - start) * creatureCollision.time;
+            test.normal = glm::vec3 {creatureCollision.normal, 0.0f};
+            return test;
+        }
+    }
+    if (walkEnd != scene::RoomWalkEnd::Dest) {
+        test.result = DirectLine::LeavesRooms;
+        test.stopPoint = roomEnd.intersection;
+        test.normal = roomEnd.normal;
     }
     return test;
 }
@@ -2221,7 +2764,7 @@ glm::vec3 Area::randomDestination(const Creature &mover, int range) const {
     const int span = 2 * range;
     const int dx = randomInt(0, kRandMax) % span - range;
     const int dy = randomInt(0, kRandMax) % span - range;
-    glm::vec3 target {origin.x + static_cast<float>(dx), origin.y + static_cast<float>(dy), 0.0f};
+    glm::vec3 target {origin.x + static_cast<float>(dx), origin.y + static_cast<float>(dy), roomLookupHeight(origin.z)};
     target.z = groundHeight(target, GroundFace::Locating);
 
     glm::vec3 direction {target - origin};
@@ -2271,7 +2814,7 @@ std::optional<glm::vec3> Area::randomWalkPoint(const Creature &walker, const glm
 
     const int dx = randomInt(0, kRandMax) % kSpan - kReach;
     const int dy = randomInt(0, kRandMax) % kSpan - kReach;
-    glm::vec3 target {home.x + static_cast<float>(dx), home.y + static_cast<float>(dy), 0.0f};
+    glm::vec3 target {home.x + static_cast<float>(dx), home.y + static_cast<float>(dy), roomLookupHeight(home.z)};
     target.z = groundHeight(target, GroundFace::Locating);
 
     const glm::vec3 &origin = walker.position();
@@ -2413,6 +2956,21 @@ void Area::retirePartyMemberAreaRuntime(const std::shared_ptr<Creature> &member)
     }
 }
 
+void Area::wearBackupHeadsApartFrom(const Creature &leader) {
+    auto appearances = _services.resource.twoDas.get("appearance");
+    if (!appearances) {
+        return;
+    }
+    const int head = appearances->getInt(leader.appearance(), "normalhead", 0);
+    const Party &party = _game.party();
+    for (const auto &object : getObjectsByType(ObjectType::Creature)) {
+        auto &creature = static_cast<Creature &>(*object);
+        if (!party.isMember(creature) && appearances->getInt(creature.appearance(), "normalhead", 0) == head) {
+            creature.wearBackupHead();
+        }
+    }
+}
+
 void Area::loadParty(const glm::vec3 &position, float facing, bool preserveSavedPlacement) {
     Party &party = _game.party();
     auto leader = party.getLeader();
@@ -2449,9 +3007,19 @@ void Area::loadParty(const glm::vec3 &position, float facing, bool preserveSaved
         leader->setFacing(facing);
     }
     loadPartyMember(leader, 0, preserveSavedPlacement);
-    // The player arrives in the encounter areas and areas of effect it stands
-    // in; a restored game records them without signalling.
+    // The player arrives in the encounter areas, areas of effect and door
+    // outlines it stands in; a restored game records them without signalling.
     updateSubAreaOccupancy(leader, !preserveSavedPlacement);
+    // A restored game also counts the leader inside the area transitions it
+    // stands in, so it has to step out and in again to set one off.
+    if (preserveSavedPlacement) {
+        for (const auto &object : _objectsByType[ObjectType::Trigger]) {
+            auto &trigger = static_cast<Trigger &>(*object);
+            if (trigger.isAreaTransition() && trigger.isIn(leader->position())) {
+                trigger.recordTenant(leader);
+            }
+        }
+    }
     // Entering the area starts the trail over at the leader.
     party.resetFollowPath(*this, leader->position(), leader->getFacing(), false);
 
@@ -2581,7 +3149,12 @@ bool Area::handleKeyDown(const input::KeyEvent &event) {
 }
 
 void Area::update(float dt) {
+    // Grass turned on for the first time in the area grows from here on.
+    if (!_grassBuilt && _game.options().graphics.grass) {
+        buildGrass();
+    }
     doDestroyObjects();
+    updatePartSounds();
     updateReleasedPresentation(dt);
     updateObjectSelection();
 
@@ -2595,6 +3168,7 @@ void Area::update(float dt) {
     if (held()) {
         return;
     }
+    updateWeather(dt);
 
     // A creature placed since the last update runs its creation script first,
     // even when a time stop holds it.
@@ -2630,6 +3204,12 @@ void Area::runObjectActions() {
         return;
     }
     runSpawnScripts();
+    if (held()) {
+        return;
+    }
+    // Perception goes on under a pause: creatures outside the party
+    // still check the party, and new ones see what is around them.
+    updatePerception(0.0f);
     // Actions can create new objects, so iterate with indices. Objects held
     // by a time stop stand still.
     for (size_t i = 0; i < _objects.size() && !held(); ++i) {
@@ -2744,8 +3324,8 @@ bool Area::stepCreatureTo(const std::shared_ptr<Creature> &creature, const glm::
         onPartyLeaderMoved(userRoom != prevRoom);
     }
 
-    checkTriggersIntersection(creature);
-    updateSubAreaOccupancy(creature);
+    checkTriggersIntersection(creature, true, origin);
+    updateSubAreaOccupancy(creature, true, origin);
 
     return true;
 }
@@ -2758,10 +3338,16 @@ bool Area::findCreatureCollision(
     std::optional<std::reference_wrapper<const Creature>> ignoredCreature) const {
     bool found = false;
     outCollision.time = 1.0f;
+    // Where floors lie over others, a creature counts only across the heights
+    // the mover spans along the step.
+    const bool stacked = hasStackedFloors();
+    const float low = std::min(origin.z, destination.z);
+    const float high = std::max(origin.z, destination.z) + standingHeight(creature);
 
     for (const auto &object : _objectsByType.at(ObjectType::Creature)) {
         const auto &other = static_cast<const Creature &>(*object);
-        if (&other == &creature || (ignoredCreature && &other == &ignoredCreature->get()) || other.isDead() || other.isTemporarilyDead()) {
+        if (&other == &creature || (ignoredCreature && &other == &ignoredCreature->get()) || other.isDead() || other.isTemporarilyDead() ||
+            (stacked && clearsHeights(other, low, high))) {
             continue;
         }
 
@@ -2780,24 +3366,21 @@ bool Area::findCreatureCollision(
     return found;
 }
 
-// The line of sight runs between the two at eye height. The walls and floors
-// of every room stop it, whatever their material, and so does every closed
-// door but the one looked at, however far away. Open doors, placeables and
-// creatures do not.
+// The line of sight runs from the subject's eye to the height the object is
+// looked at. The walls and floors of every room stop it, whatever their
+// material, and so does the posed model of every closed door but the one
+// looked at. Open doors, placeables and creatures do not.
 bool Area::isObjectSeen(const Creature &subject, const Object &object) const {
-    if (!object.visible()) {
-        return false;
-    }
     const auto *creature = dyn_cast<Creature>(&object);
     if (creature && creature->isInvisibleTo(subject)) {
         return false;
     }
 
     glm::vec3 origin(subject.position());
-    origin.z += kLineOfSightHeight;
+    origin.z += Object::kEyeHeight;
 
     glm::vec3 dest(object.position());
-    dest.z += kLineOfSightHeight;
+    dest.z += object.canSeeHeight();
 
     const float length = glm::distance(origin, dest);
     const glm::vec3 dir {(dest - origin) / length};
@@ -2809,13 +3392,12 @@ bool Area::isObjectSeen(const Creature &subject, const Object &object) const {
         }
     }
     for (const auto &candidate : _objectsByType.at(ObjectType::Door)) {
-        const auto &walkmesh = static_cast<const Door &>(*candidate).walkmeshClosed();
-        if (candidate.get() == &object || !walkmesh || !walkmesh->isEnabled()) {
+        const auto &door = static_cast<const Door &>(*candidate);
+        auto model = std::dynamic_pointer_cast<ModelSceneNode>(door.sceneNode());
+        if (candidate.get() == &object || door.state() != DoorState::Closed || !model) {
             continue;
         }
-        const glm::vec3 originLocal {walkmesh->absoluteTransformInverse() * glm::vec4(origin, 1.0f)};
-        const glm::vec3 dirLocal {walkmesh->absoluteTransformInverse() * glm::vec4(dir, 0.0f)};
-        if (!walkmesh->walkmesh().raycast(kEverySurface, originLocal, dirLocal, length, /*ignoreBackface=*/false).fail) {
+        if (model->intersectSegment(origin, dest)) {
             return false;
         }
     }
@@ -2964,18 +3546,29 @@ std::optional<glm::vec3> Area::roomViewPosition() const {
 }
 
 bool Area::isModelInShownRoom(const ModelSceneNode &model) const {
-    // A model whose subclassification has this flag is in every room.
-    static constexpr int kInEveryRoom = 1;
-    if (!_cullingRooms || (model.model().subclassification() & kInEveryRoom) != 0) {
+    if (!_cullingRooms || (model.model().subclassification() & MdlSubclassification::inEveryRoom) != 0) {
+        return true;
+    }
+    // A model placed at the world origin for a clip authored there is drawn
+    // whatever the room.
+    if (auto object = dynamic_cast<const Object *>(model.user()); object && object->isStuntMode()) {
         return true;
     }
     const glm::mat4 &transform = model.absoluteTransform();
+    const auto &box = model.model().meshBox();
     const glm::vec3 centre {(model.model().classification() & MdlClassification::character) != 0
                                 ? glm::vec3(transform[3])
-                                : glm::vec3(transform * glm::vec4(0.5f * (model.model().aabb().min() + model.model().aabb().max()), 1.0f))};
+                                : glm::vec3(transform * glm::vec4(0.5f * (box.min() + box.max()), 1.0f))};
+    return isPointInShownRoom(centre);
+}
+
+bool Area::isPointInShownRoom(const glm::vec3 &point) const {
+    if (!_cullingRooms) {
+        return true;
+    }
     bool held = false;
     for (const auto &room : _rooms) {
-        if (!room.second->boxHolds(glm::vec2(centre))) {
+        if (!room.second->boxHolds(glm::vec2(point))) {
             continue;
         }
         if (room.second->isVisible()) {
@@ -3012,42 +3605,53 @@ void Area::update3rdPersonCameraTarget() {
     }
 }
 
-void Area::checkTriggersIntersection(const std::shared_ptr<Object> &triggerrer, bool fireTransitions) {
+void Area::checkTriggersIntersection(const std::shared_ptr<Object> &triggerrer, bool fireTransitions, std::optional<glm::vec3> from) {
+    // An area transition is entered only by a creature moving into it. Every
+    // creature that does is announced to it; only one that moves the party
+    // between modules sets it off.
+    const auto enter = [&](Trigger &trigger) {
+        const bool transition = trigger.isAreaTransition();
+        if (transition && !fireTransitions) {
+            // Leave module-transition triggers to movement-based firing so a
+            // creature placed inside one is not immediately warped out.
+            return false;
+        }
+        debug(str(boost::format("trigger: onenter tag=%s script=%s entering=%s") %
+                  trigger.tag() %
+                  (trigger.getOnEnter().empty() ? std::string("<none>") : trigger.getOnEnter()) %
+                  triggerrer->tag()));
+        trigger.addTenant(triggerrer);
+        trigger.markDebugEntered();
+        if (transition) {
+            trigger.receiveEntered(triggerrer);
+        }
+        return true;
+    };
     // Entering scripts may add triggers (a spawned mine), which are left out;
     // triggers are destroyed only between updates.
     const ObjectList &triggers = _objectsByType[ObjectType::Trigger];
     const size_t count = triggers.size();
     for (size_t i = 0; i < count; ++i) {
         auto trigger = std::static_pointer_cast<Trigger>(triggers[i]);
-        if (!trigger->isActive()) {
-            trigger->removeTenant(triggerrer.get());
-            continue;
-        }
-        bool inside = trigger->isIn(triggerrer->position());
+        const bool inside = trigger->isIn(triggerrer->position());
         trigger->markDebugTested(inside);
-        if (trigger->isTenant(triggerrer) || !inside) {
+        const bool tenant = trigger->isTenant(triggerrer);
+        if (inside && !tenant) {
+            enter(*trigger);
             continue;
         }
-        bool transition = !trigger->linkedToModule().empty();
-        if (transition && !fireTransitions) {
-            // Leave module-transition triggers to movement-based firing so a
-            // creature placed inside one is not immediately warped out.
+        // A tenant that has stepped out leaves as the trigger updates. A step
+        // that crosses the edge and ends on the side it began on passes
+        // through: one inside leaves and enters again, one outside enters and
+        // leaves.
+        if (inside != tenant || !from || !trigger->crosses(*from, triggerrer->position())) {
             continue;
         }
-        debug(str(boost::format("trigger: onenter tag=%s script=%s entering=%s") %
-                  trigger->tag() %
-                  (trigger->getOnEnter().empty() ? std::string("<none>") : trigger->getOnEnter()) %
-                  triggerrer->tag()));
-
-        if (transition && !trigger->acceptsTransitionActivator(triggerrer)) {
-            continue;
-        }
-        trigger->addTenant(triggerrer);
-        trigger->markDebugEntered();
-
-        if (transition) {
-            _game.scheduleModuleTransition(trigger->linkedToModule(), trigger->linkedTo());
-            return;
+        if (inside) {
+            trigger->removeTenant(triggerrer.get(), true);
+            enter(*trigger);
+        } else if (enter(*trigger)) {
+            trigger->removeTenant(triggerrer.get(), true);
         }
     }
 }
@@ -3099,20 +3703,36 @@ void Area::setThirdPersonCombat(bool combat) {
     update3rdPersonCameraTarget();
 }
 
-void Area::setStealthXPEnabled(bool value) {
+void Area::setStealthXPEnabled(int value) {
     _stealthXPEnabled = value;
 }
 
-void Area::setMaxStealthXP(int value) {
+void Area::setMaxStealthXP(uint32_t value) {
+    _currentStealthXP = std::min(_currentStealthXP, value);
     _maxStealthXP = value;
 }
 
-void Area::setCurrentStealthXP(int value) {
-    _currentStealthXP = value;
+void Area::setCurrentStealthXP(uint32_t value) {
+    _currentStealthXP = std::min(value, _maxStealthXP);
 }
 
-void Area::setStealthXPDecrement(int value) {
+void Area::setStealthXPDecrement(uint32_t value) {
     _stealthXPDecrement = value;
+}
+
+void Area::loseStealthXP() {
+    setCurrentStealthXP(_currentStealthXP < _stealthXPDecrement ? 0 : _currentStealthXP - _stealthXPDecrement);
+}
+
+void Area::awardStealthXP() {
+    if (!isStealthXPEnabled() || _currentStealthXP == 0) {
+        return;
+    }
+    const auto pool = static_cast<int>(_currentStealthXP);
+    _game.party().awardXP(pool, XPSource::Stealth);
+    _game.submitStatusSummary(StatusSummaryCategory::StealthXP, pool);
+    setCurrentStealthXP(0);
+    setStealthXPEnabled(0);
 }
 
 void Area::setUnescapable(bool value) {
@@ -3210,6 +3830,7 @@ void Area::setAmbientSoundNightVolume(int volume) {
         return;
     }
     _ambientAudio.ambientSoundNightVolume = volume;
+    _game.areaMusic().ambientNightVolumeChanged(*this);
 }
 
 std::shared_ptr<Object> Area::createObject(ObjectType type, const std::string &blueprintResRef, const std::shared_ptr<Location> &location, bool appear) {
@@ -3334,10 +3955,7 @@ std::optional<std::reference_wrapper<const Object>> Area::findNearestObject(cons
             return;
         }
         const Object &object = *_objectsByX[index];
-        // A linked door's transition trigger stands in for the door and is
-        // never a result.
-        const auto *trigger = dyn_cast<Trigger>(&object);
-        if ((trigger && trigger->isLinkedDoorTransition()) || !matches(object)) {
+        if (!matches(object)) {
             return;
         }
         candidates.emplace_back(object, object.getSquareDistanceTo(origin));
@@ -3543,7 +4161,8 @@ void Area::updatePerception(float dt) {
 
 // Each creature perceives on its own schedule. A creature outside the party
 // checks the party every update; the controlled creature looks around every
-// 0.2 s and everyone else every 4 s. A creature's first update does both.
+// 0.2 s and everyone else every 4 s. A creature's first update does both,
+// unless the creature waits a full interval for its first look around.
 //
 // No script runs during a pass, as notices wait for its end, and creatures are
 // destroyed only between updates, so the creature list holds still.
@@ -3568,7 +4187,7 @@ void Area::updatePerceptionPasses(float dt, bool all) {
         const bool started = observer->perceptionStarted();
         observer->setPerceptionPassTime(observer->perceptionPassTime() + dt);
         const float interval = controlled ? kLeaderPerceptionPass : kPerceptionPass;
-        bool fullPass = all || !started || observer->perceptionPassTime() >= interval;
+        bool fullPass = all || (!started && !observer->firstLookWaits()) || observer->perceptionPassTime() >= interval;
         // A priority-0 creature waits out its throttle before a timed pass.
         if (fullPass && started && !all && observer->throttlesPerceptionPass()) {
             fullPass = false;
@@ -3581,7 +4200,7 @@ void Area::updatePerceptionPasses(float dt, bool all) {
     }
     _perceptionPassActive = false;
     dispatchPerceptionNotices();
-    updateClientPresence();
+    updatePresence();
 }
 
 void Area::updatePerceptionPass(const std::shared_ptr<Creature> &observer, bool partyTargets, bool fullPass) {
@@ -3589,9 +4208,17 @@ void Area::updatePerceptionPass(const std::shared_ptr<Creature> &observer, bool 
     observer->resolvePerceptionRanges();
     const bool inParty = party.isMember(*observer);
     const float range = std::max(observer->spotRange(), observer->listenRange());
-    auto inRange = [&](const Creature &target) {
+    // In TSL a creature that is always updated counts as in range: anywhere
+    // for the party check, and within the range across for the full pass.
+    auto inRange = [&](const Creature &target, bool anywhere) {
         const glm::vec3 offset {target.position() - observer->position()};
-        return glm::dot(offset, offset) <= range * range || (_game.isTSL() && target.forceAlwaysUpdate());
+        if (glm::dot(offset, offset) <= range * range) {
+            return true;
+        }
+        if (!_game.isTSL() || !target.forceAlwaysUpdate()) {
+            return false;
+        }
+        return anywhere || std::abs(offset.x) <= range;
     };
     if (partyTargets) {
         for (const auto &member : party.members()) {
@@ -3599,7 +4226,7 @@ void Area::updatePerceptionPass(const std::shared_ptr<Creature> &observer, bool 
             if (!target || target == observer) {
                 continue;
             }
-            if (observer->perception().has(target->id()) || inRange(*target)) {
+            if (observer->perception().has(target->id()) || inRange(*target, true)) {
                 updatePerceptionPair(observer, target);
             }
         }
@@ -3608,19 +4235,12 @@ void Area::updatePerceptionPass(const std::shared_ptr<Creature> &observer, bool 
         return;
     }
 
-    // Those already perceived, then any others in range. Outside the party,
-    // party members are left to the party check.
-    // Those already perceived are taken by descending ID.
-    const auto &perception = observer->perception();
+    // Those already perceived, the most recently perceived first, then any
+    // others in range, in X order. Outside the party, party members are left
+    // to the party check.
+    const auto &order = observer->perception().order;
     std::vector<uint32_t> known = std::move(_perceivedIds);
-    known.clear();
-    for (const auto *entries : {&perception.seen, &perception.heard, &perception.invisible}) {
-        for (const auto &entry : *entries) {
-            known.push_back(entry.first);
-        }
-    }
-    std::sort(known.begin(), known.end(), std::greater<uint32_t>());
-    known.erase(std::unique(known.begin(), known.end()), known.end());
+    known.assign(order.rbegin(), order.rend());
     for (uint32_t id : known) {
         auto target = _game.getObjectById<Creature>(id);
         if (!target || !target->isRuntimeLive()) {
@@ -3633,19 +4253,19 @@ void Area::updatePerceptionPass(const std::shared_ptr<Creature> &observer, bool 
         updatePerceptionPair(observer, target);
     }
     _perceivedIds = std::move(known);
-    const ObjectList &candidates = getObjectsByType(ObjectType::Creature);
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        auto target = std::static_pointer_cast<Creature>(candidates[i]);
-        if (target == observer || observer->perception().has(target->id())) {
-            continue;
+    const float x = observer->position().x;
+    forEachObjectInXRange(x - range, x + range, [&](const Object &object) {
+        if (object.type() != ObjectType::Creature || &object == observer.get() || observer->perception().has(object.id())) {
+            return;
         }
+        auto target = _game.getObjectById<Creature>(object.id());
         if (!inParty && party.isMember(*target)) {
-            continue;
+            return;
         }
-        if (inRange(*target)) {
+        if (inRange(*target, false)) {
             updatePerceptionPair(observer, target);
         }
-    }
+    });
 }
 
 // The notices wait for the next perception update.
@@ -3657,7 +4277,7 @@ void Area::perceiveNow(const std::shared_ptr<Creature> &observer) {
     _perceptionPassActive = true;
     updatePerceptionPass(observer, false, true);
     _perceptionPassActive = active;
-    updateClientPresence();
+    updatePresence();
 }
 
 void Area::refreshPerceptionFor(Creature &changed) {
@@ -3690,7 +4310,7 @@ void Area::refreshPerceptionFor(Creature &changed) {
     if (!active) {
         dispatchPerceptionNotices();
     }
-    updateClientPresence();
+    updatePresence();
 }
 
 bool Area::isEyeLineClear(const glm::vec3 &from, const glm::vec3 &to,
@@ -3732,12 +4352,13 @@ bool Area::isEyeLineClear(const glm::vec3 &from, const glm::vec3 &to,
 }
 
 // Sound is cast both ways between the eyes. A door or other object hit both
-// ways is thin; otherwise the gap between the two hits is the thickness of
-// what lies between. Where the area routes sound around walls, a way around
-// costs 2 and no way around blocks the sound; elsewhere each whole metre of
-// wall costs 5.
-std::optional<int> Area::soundOcclusion(const Creature &listener, const Creature &source,
-                                        const glm::vec3 &listenerEye, const glm::vec3 &sourceEye) const {
+// ways is thin, and so is anything met only one way. Otherwise the thickness
+// of what lies between runs between where the two ways met something: the
+// object's position when a way met an object, else the point it met. Where
+// the area routes sound around obstacles, any obstacle costs 2; elsewhere
+// each whole metre costs 5.
+int Area::soundOcclusion(const Creature &listener, const Creature &source, const glm::vec3 &listenerEye,
+                         const glm::vec3 &sourceEye) const {
     auto &sceneGraph = _services.scene.graphs.get(_sceneName);
     Collision forward, backward;
     const bool forwardHit = sceneGraph.testLineOfSight(listenerEye, sourceEye, forward);
@@ -3749,27 +4370,20 @@ std::optional<int> Area::soundOcclusion(const Creature &listener, const Creature
     const Object *forwardObject = forwardHit ? hitObject(forward) : nullptr;
     const Object *backwardObject = backwardHit ? hitObject(backward) : nullptr;
     float thickness2 = 0.0f;
-    if (forwardObject && forwardObject == backwardObject) {
-        thickness2 = kSharedObstacleThickness2;
-    } else if (forwardHit || backwardHit) {
-        const glm::vec3 forwardPoint = forwardObject ? forwardObject->position()
-                                       : forwardHit  ? forward.intersection
-                                                     : sourceEye;
-        const glm::vec3 backwardPoint = backwardObject ? backwardObject->position()
-                                        : backwardHit  ? backward.intersection
-                                                       : listenerEye;
+    if (forwardHit && backwardHit && !(forwardObject && forwardObject == backwardObject)) {
+        const glm::vec3 forwardPoint = forwardObject ? forwardObject->position() : forward.intersection;
+        const glm::vec3 backwardPoint = backwardObject ? backwardObject->position() : backward.intersection;
         thickness2 = glm::distance2(forwardPoint, backwardPoint);
+    } else if (forwardHit || backwardHit) {
+        thickness2 = kSharedObstacleThickness2;
     }
     if (thickness2 <= 0.0f) {
         return 0;
     }
     if (_interior || _underground) {
-        if (!pathExists(_pathfinder, listener.position(), source.position())) {
-            return std::nullopt;
-        }
         return -kSoundDetourPenalty;
     }
-    return -kSoundWallPenaltyPerMetre * static_cast<int>(std::sqrt(thickness2));
+    return -kSoundWallPenaltyPerMetre * static_cast<int>(std::sqrt(static_cast<double>(thickness2)));
 }
 
 void Area::notifyPerception(const std::shared_ptr<Creature> &observer, const std::shared_ptr<Object> &target,
@@ -3793,8 +4407,16 @@ void Area::dispatchPerceptionNotices() {
 }
 
 // Other creatures exist for the player only while the controlled creature
-// sees or hears them.
-void Area::updateClientPresence() {
+// sees or hears them, or, in TSL, while they are always updated. A door, a
+// placeable that is not static, an item, an area of effect or a trigger exists
+// for the player only while it lies within the farther of the controlled
+// creature's sight and hearing ranges across the ground, or, in TSL, while it
+// is always updated. Within that range a generic trigger never exists for the
+// player (a trigger's cursor, which would show one, is not read), and a trap
+// only once the controlled creature has found it or it is flagged, or while it
+// is no enemy of the controlled creature. A static placeable always exists for
+// the player, and any other object never needs to.
+void Area::updatePresence() {
     auto leader = _game.party().getLeader();
     if (!leader || !isObjectResident(*leader)) {
         return;
@@ -3803,8 +4425,27 @@ void Area::updateClientPresence() {
     for (const auto &object : getObjectsByType(ObjectType::Creature)) {
         const bool present = object == leader || _game.party().isMember(*object) ||
                              perception.sees(object->id()) || perception.hears(object->id()) ||
-                             object->forceAlwaysUpdate();
-        object->setClientPresent(present);
+                             (_game.isTSL() && object->forceAlwaysUpdate());
+        object->setPresent(present);
+    }
+    const float range = std::max(leader->spotRange(), leader->listenRange());
+    const glm::vec2 viewer {leader->position()};
+    for (ObjectType type : {ObjectType::Door, ObjectType::Placeable, ObjectType::Item, ObjectType::AreaOfEffect, ObjectType::Trigger}) {
+        for (const auto &object : getObjectsByType(type)) {
+            if (type == ObjectType::Placeable && static_cast<const Placeable &>(*object).isStatic()) {
+                continue;
+            }
+            const glm::vec2 offset {glm::vec2(object->position()) - viewer};
+            bool present = glm::dot(offset, offset) <= range * range;
+            if (present && type == ObjectType::Trigger) {
+                const auto &trigger = static_cast<const Trigger &>(*object);
+                present = trigger.isTrap()
+                              ? trigger.trapDetection().flagged || trigger.trapDetection().isDetectedBy(leader->id()) ||
+                                    !trigger.isTrapHostileTo(*leader)
+                              : !trigger.isGeneric();
+            }
+            object->setPresent(present || (_game.isTSL() && object->forceAlwaysUpdate()));
+        }
     }
 }
 
@@ -3837,7 +4478,7 @@ void Area::updatePerceptionPair(
         if (controlled) {
             sight = true;
         } else {
-            const glm::vec3 lift {0.0f, 0.0f, kPerceptionEyeHeight};
+            const glm::vec3 lift {0.0f, 0.0f, Object::kEyeHeight};
             const glm::vec3 eye {observer->position() + lift};
             const glm::vec3 targetEye {target->position() + lift};
             const float range = std::max(observer->spotRange(), observer->listenRange());
@@ -3883,6 +4524,11 @@ void Area::updatePerceptionPair(
                 seen = false;
                 lost = true;
             }
+            // A silenced creature is heard no longer.
+            if (wasHeard && target->isSilenced()) {
+                heard = false;
+                lost = true;
+            }
             if (invisible && (wasSeen || wasHeard)) {
                 lost = true;
             }
@@ -3896,7 +4542,8 @@ void Area::updatePerceptionPair(
         newly = seen || heard;
     }
 
-    if (_game.party().isMember(*observer) && _game.party().isMember(*target)) {
+    const bool partyPair = _game.party().isMember(*observer) && _game.party().isMember(*target);
+    if (partyPair) {
         seen = true;
         heard = true;
         invisible = false;
@@ -3921,10 +4568,13 @@ void Area::updatePerceptionPair(
     if (!newly) {
         return;
     }
+    // A new sighting starts the observer's stealth experience timer, a party
+    // member's too.
     if (present) {
         if (seen && !observer->perception().sees(id)) {
             observer->setObjectSeen(target, true);
             notifyPerception(observer, target, PerceptionEvent::Seen);
+            observer->startStealthXPTimer(*target);
         }
         if (heard && !observer->perception().hears(id)) {
             observer->setObjectHeard(target, true);
@@ -3939,12 +4589,13 @@ void Area::updatePerceptionPair(
         }
         if (seen) {
             notifyPerception(observer, target, PerceptionEvent::Seen);
+            observer->startStealthXPTimer(*target);
         }
     }
 }
 
-// How far each talk volume carries. Talk and silent shout carry the farthest.
-static constexpr float kTalkRange = 1000.0f;
+// How far each other talk volume carries. Talk and silent shout carry
+// kTalkRange, the farthest.
 static constexpr float kWhisperRange = 3.0f;
 static constexpr float kShoutRange = 250.0f;
 static constexpr float kSilentTalkRange = 35.0f;
@@ -4025,6 +4676,10 @@ std::optional<std::reference_wrapper<Object>> Area::getObjectAt(int x, int y) co
     auto &scene = _services.scene.graphs.get(kSceneMain);
     auto model = scene.pickModelAt(x, y, partyLeader.get());
     if (!model) {
+        // A pointer on no object's model picks the object it is nearest.
+        if (auto nearest = _game.nearestObjectToPointer(*partyLeader, x, y)) {
+            return std::ref(*nearest);
+        }
         return std::nullopt;
     }
     // A kept corpse is picked as its body bag.
@@ -4046,27 +4701,34 @@ std::optional<std::reference_wrapper<Object>> Area::getObjectAt(int x, int y) co
 
 std::vector<TransitionPortal> Area::transitionPresentationPortals() const {
     std::vector<TransitionPortal> portals;
-    auto maybeTriggers = _objectsByType.find(ObjectType::Trigger);
-    if (maybeTriggers == _objectsByType.end()) {
-        return portals;
-    }
-    for (auto &object : maybeTriggers->second) {
-        auto trigger = std::static_pointer_cast<Trigger>(object);
-        if (trigger->linkedToModule().empty() || !trigger->isActive()) {
-            continue;
-        }
-        const auto &geometry = trigger->geometry();
-        if (geometry.size() < 3) {
-            continue;
+    auto addPortal = [&portals](const Object &object, const std::string &destination, const std::vector<glm::vec3> &outline) {
+        if (outline.size() < 3) {
+            return;
         }
         TransitionPortal portal;
-        portal.objectId = trigger->id();
-        portal.destination = trigger->transitionDestin();
-        portal.points.reserve(geometry.size());
-        for (const auto &vertex : geometry) {
-            portal.points.push_back(glm::vec3(trigger->transform() * glm::vec4(vertex, 1.0f)));
+        portal.objectId = object.id();
+        portal.destination = destination;
+        portal.points.reserve(outline.size());
+        for (const auto &vertex : outline) {
+            portal.points.push_back(glm::vec3(object.transform() * glm::vec4(vertex, 1.0f)));
         }
         portals.push_back(std::move(portal));
+    };
+    // A transition trigger, and a linked door leading to another module while
+    // it is open, by its outline.
+    if (auto triggers = _objectsByType.find(ObjectType::Trigger); triggers != _objectsByType.end()) {
+        for (auto &object : triggers->second) {
+            const auto &trigger = static_cast<const Trigger &>(*object);
+            if (!trigger.linkedToModule().empty()) {
+                addPortal(trigger, trigger.transitionDestin(), trigger.geometry());
+            }
+        }
+    }
+    for (auto &object : _objectsByType.at(ObjectType::Door)) {
+        const auto &door = static_cast<const Door &>(*object);
+        if (door.isLinked() && !door.linkedToModule().empty() && door.isOpen()) {
+            addPortal(door, door.transitionDestin(), door.outline());
+        }
     }
     return portals;
 }

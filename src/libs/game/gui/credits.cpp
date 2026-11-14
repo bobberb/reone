@@ -72,6 +72,7 @@ CreditsGUI::~CreditsGUI() {
     if (_music) {
         _music->stop();
     }
+    _game.areaMusic().fadeDialogAmbientTrack();
 }
 
 void CreditsGUI::onGUILoaded() {
@@ -85,8 +86,7 @@ void CreditsGUI::onGUILoaded() {
     // The music plays as a sound effect, at the area-wide ambient priority
     // group's volume.
     if (!_musicResRef.empty()) {
-        _music = _services.audio.mixer.play(_services.resource.audioClips.get(_musicResRef), audio::AudioType::Sound,
-                                            _game.areaMusic().ambientGroupGain());
+        _music = _services.audio.mixer.play(_services.resource.audioClips.get(_musicResRef), audio::AudioType::Sound, kAreaWideAmbientSoundGroup);
     }
     showNextText();
 }

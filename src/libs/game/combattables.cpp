@@ -211,6 +211,7 @@ void CombatTables::init(ITwoDAs &twoDas, GameID gameId) {
             }
         }
         _weaponSounds.push_back(std::move(sounds));
+        _weaponSoundPitchOffsets.push_back(weaponSounds->getFloat(row, "pitchoffset", 0.0f));
     }
 
     auto bodyBags = getRequiredTwoDA(twoDas, "bodybag");
@@ -365,6 +366,10 @@ const std::string &CombatTables::weaponSound(int row, const std::string &column)
     return sound != _weaponSounds[row].end() ? sound->second : kNoSound;
 }
 
+float CombatTables::weaponSoundPitchOffset(int row) const {
+    return row >= 0 && row < static_cast<int>(_weaponSoundPitchOffsets.size()) ? _weaponSoundPitchOffsets[row] : 0.0f;
+}
+
 BodyBagRow CombatTables::bodyBag(int row) const {
     return rowOrBlank(_bodyBags, row);
 }
@@ -376,6 +381,10 @@ float CombatTables::fractionalChallengeMinimum(int row) const {
 
 std::optional<int> CombatTables::encounterDifficulty(int row) const {
     return rowOrBlank(_encounterDifficulties, row);
+}
+
+int CombatTables::encounterDifficultyCount() const {
+    return static_cast<int>(_encounterDifficulties.size());
 }
 
 const RegenerationRates &CombatTables::regeneration() const {

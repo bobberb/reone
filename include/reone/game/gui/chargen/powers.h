@@ -50,6 +50,24 @@ public:
 
     void reset();
 
+    /**
+     * Chooses the powers recommended for the character's side, taking back
+     * those chosen on the screen.
+     *
+     * @param fillWithUnranked true to fill the picks no recommended power can
+     *        take with the other candidates, lowest row first
+     */
+    void recommend(bool fillWithUnranked = false);
+
+    /** @return the powers still to choose */
+    int remainingPicks() const;
+
+    /**
+     * Learns the chosen powers and goes on to the next step, unless powers
+     * are still to choose and one can be chosen.
+     */
+    void accept();
+
     /** Selects the first selectable grid entry, for scripted captures. */
     void selectFirstEntryForCapture();
 

@@ -32,10 +32,14 @@
 #include "reone/game/action/attackobject.h"
 #include "reone/game/action/castspellatlocation.h"
 #include "reone/game/action/castspellatobject.h"
+#include "reone/game/action/changefacing.h"
+#include "reone/game/action/drive.h"
 #include "reone/game/action/movetoobject.h"
 #include "reone/game/action/movetopoint.h"
 #include "reone/game/action/switchweapons.h"
+#include "reone/game/action/unlockobject.h"
 #include "reone/game/action/usefeat.h"
+#include "reone/game/action/useskill.h"
 #include "reone/game/animations.h"
 #include "reone/game/animationutil.h"
 #include "reone/game/attack.h"
@@ -53,6 +57,7 @@
 #include "reone/game/d20/spells.h"
 #include "reone/game/debug.h"
 #include "reone/game/di/services.h"
+#include "reone/game/difficultyoptions.h"
 #include "reone/game/effect/abilitydecrease.h"
 #include "reone/game/effect/abilityincrease.h"
 #include "reone/game/effect/acdecrease.h"
@@ -63,6 +68,7 @@
 #include "reone/game/effect/blasterdeflectionincrease.h"
 #include "reone/game/effect/bonusfeat.h"
 #include "reone/game/effect/creaturestate.h"
+#include "reone/game/effect/knockdown.h"
 #include "reone/game/effect/damage.h"
 #include "reone/game/effect/damagedecrease.h"
 #include "reone/game/effect/damageimmunitydecrease.h"
@@ -167,20 +173,6 @@ constexpr int getResurrectionHitPoints(bool tsl, int current, int maximum, int p
 // A death cast by a spell checks death immunity when it is magical.
 constexpr bool shouldCheckDeathImmunity(uint32_t spellId, EffectCategory category) {
     return spellId != UINT32_MAX && category == EffectCategory::Magical;
-}
-
-// The visual effects that are beams, which a death leaves in place, in both
-// games and in TSL alone.
-constexpr std::array<int, 16> kBeamVisualEffects {
-    2026, 2027, 2028, 2029, 2037, 2038, 2049, 2050,
-    2051, 2052, 2053, 2061, 2065, 2066, 4037, 6000};
-constexpr std::array<int, 2> kTSLBeamVisualEffects {2068, 2069};
-
-bool isBeamVisual(bool tsl, int visualId) {
-    const auto contains = [visualId](const auto &visuals) {
-        return std::find(visuals.begin(), visuals.end(), visualId) != visuals.end();
-    };
-    return contains(kBeamVisualEffects) || (tsl && contains(kTSLBeamVisualEffects));
 }
 
 inline bool isEffectPreservedOnDeath(const EffectInstance &record,
@@ -392,6 +384,12 @@ int rollDamageShieldDice(const DamageCost &cost, Roll roll) {
     }
     return result;
 }
+// The loop a footstep type plays in place of steps; empty for a type that steps.
+static std::string rollingFootstepSound(const FootstepTypeSounds &sounds) {
+    auto rolling = sounds.cells.find("rolling");
+    return rolling != sounds.cells.end() ? rolling->second : std::string();
+}
+
 // The sound set entry a creature falling onto a surface material sounds
 // from; none for a surface with no fall sound.
 inline std::string Creature::AppearanceSoundSet::*fallSound(int material) {
@@ -444,15 +442,24 @@ static constexpr float kObjectUseSpacing = 0.75f;
 static constexpr float kPreciseUseRange = 0.1f;
 static constexpr float kDoorSaberUseRange = 1.0f;
 static constexpr float kCorpseUseSpacing = 5.0f;
-// A use range is met a tenth of a metre beyond it, along a line this far
-// above the ground.
+// A use range is met a tenth of a metre beyond it, along a line at eye height.
 static constexpr float kUseRangeAllowance = 0.1f;
-static constexpr float kUseLineHeight = 1.5f;
+// A walk that ends in a clear line also needs no wall of a door or placeable
+// within the walker's personal space of that line, this far either side of
+// the walker's eye height.
+static constexpr float kClearLineWallBand = 0.01f;
 // The height above the ground at which a walk tests its line to where it goes.
 static constexpr float kGroundLineHeight = 0.1f;
 // A walk to a use point keeps its point while the current one lies within a
 // millimetre of it.
 static constexpr float kUsePointTolerance = 0.001f;
+// The ground beside a placeable's use point that no path reaches is looked for
+// within two metres of it, in rings a quarter of a metre apart, sixteen
+// directions each, and walked to within a quarter of a metre.
+static constexpr float kUseBesideRadius = 2.0f;
+static constexpr float kUseBesideStep = 0.25f;
+static constexpr int kUseBesideDirections = 16;
+static constexpr float kUseBesideArrival = 0.25f;
 // Walking into other creatures: five blocked steps are planned round, the
 // sixth ends the walk.
 static constexpr int kMaxPathBumps = 5;
@@ -462,6 +469,7 @@ static constexpr char kPathFailScript[] = "k_def_pathfail01";
 static constexpr float kPushAsideSpace = 0.1f;      // kept beyond both personal spaces by a creature pushed aside
 static constexpr float kPushAsideSpotRadius = 5.0f; // how far round its spot a pushed creature's place is looked for
 static constexpr float kPushBehindRadius = 4.0f;    // how far behind the pusher a creature that cannot step aside goes
+static constexpr float kPushAsideDoorBand = 0.1f;   // how far under its floor a pushed creature's way is kept clear of door walls
 // Below this run distance an appearance cannot move.
 static constexpr float kImmobileRunSpeed = 0.0001f;
 // The slowest run, as a share of the distance one loop of the run clip covers
@@ -478,9 +486,17 @@ static constexpr float kWalkPaceGain = 1.0f;
 static constexpr float kClipPaceGain = 2.0f;
 static constexpr float kRunClipMinimumWalkPace = 0.5f;
 // A walk given no more range than this goes onto its point: it ends on the
-// step that reaches the end of its path, and one that sets out within a tenth
-// of a metre of the point steps onto it at once.
+// step that reaches the end of its path.
 static constexpr float kNoMoveRange = 0.001f;
+// How long a path walk is watched before judging whether it is getting
+// anywhere. Arbitrary, but it must span several frames at the highest frame
+// rate played and stay short enough for a blocked creature to react quickly.
+static constexpr float kProgressCheckInterval = 0.1f;
+// A path walk slower than this, in metres a second, is getting nowhere. One
+// centimetre per frame at 60 frames a second.
+static constexpr float kMinimumProgressSpeed = 0.6f;
+// A walk that sets out within a tenth of a metre of its point steps onto it at
+// once, whatever its range.
 static constexpr float kArrivalSnapDistance2 = 0.01f;
 static constexpr int kMaximumDamageEffectModifier = 36;
 static constexpr int kMaximumElementalDamageBonus = 108;
@@ -493,7 +509,6 @@ static constexpr int kWillSavingThrow = 3;
 static constexpr int kAttackRoundAction = 1;
 static constexpr int kCastRoundAction = 9;
 static constexpr int kItemCastRoundAction = 10;
-static constexpr int kTotalDefenseRoundAction = 13;
 // A Force push carries a creature at 25 metres a second; a leap covers its
 // ground distance in 0.33 seconds, however far it goes.
 static constexpr float kForcePushSpeed = 25.0f;
@@ -502,6 +517,8 @@ static constexpr float kLeapDuration = 0.33f;
 // Animation IDs of the poses, fidgets and turns a creature shows.
 static constexpr int kPauseAnimationId = 10000;
 static constexpr int kReadyAnimationId = 10001;
+// The second ready, which shows the ready as the first does.
+static constexpr int kSecondReadyAnimationId = 10148;
 // The one animation ID that names no clip shows nothing rather than the pause.
 static constexpr int kNoPauseFallbackAnimationId = 10098;
 static constexpr int kWalkAnimationId = 10002;
@@ -509,6 +526,21 @@ static constexpr int kRunAnimationId = 10004;
 static constexpr int kStealthWalkAnimationId = 10133;
 static constexpr int kInjuredWalkAnimationId = 10093;
 static constexpr int kInjuredRunAnimationId = 10094;
+static constexpr int kWalkBackAnimationId = 10003;
+// Steps on wood may creak; footstep types with wings never do.
+static constexpr int kWoodSurfaceMaterial = 5;
+static constexpr int kWingsFootstepType = 6;
+static constexpr int kHugeWingsFootstepType = 7;
+static constexpr int kFloorCreakPercent = 5;
+static const std::string kFloorCreakResRef {"as_cv_florcreak"};
+// Clips of a creature the player steers that turns as it goes: in place,
+// walking or running, to the left or to the right.
+static constexpr int kTurnInPlaceLeftAnimationId = 10078;
+static constexpr int kTurnInPlaceRightAnimationId = 10079;
+static constexpr int kWalkTurnLeftAnimationId = 10084;
+static constexpr int kWalkTurnRightAnimationId = 10085;
+static constexpr int kRunTurnLeftAnimationId = 10086;
+static constexpr int kRunTurnRightAnimationId = 10087;
 static constexpr int kDeadAnimationId = 10006;
 static constexpr int kDead1AnimationId = 10008;
 static constexpr int kDead3AnimationId = 10156;
@@ -556,23 +588,13 @@ static int getHighestOwnedFeatRank(
     return 0;
 }
 
-static int getHighestTotalDefenseClassLevel(
-    const CreatureAttributes &attributes) {
-
-    return std::max({
-        attributes.getClassLevel(ClassType::Scoundrel),
-        attributes.getClassLevel(ClassType::JediSentinel),
-        attributes.getClassLevel(ClassType::JediWatchman),
-        attributes.getClassLevel(ClassType::SithAssassin),
-    });
-}
-
 // Stealth
 static constexpr FeatType kStealthFeat = FeatType::PersonalCloakingShield;
 
 static constexpr int kStealthInCombatStrRef = 1452;
 static constexpr int kSkillUnusableStrRef = 1435;
-static constexpr int kStealthFieldVisual = 8002;
+/** The message for a hostile skill refused against a friendly target: string 0 of the talk table. */
+static constexpr int kHostileSkillRefusedStrRef = 0;
 static constexpr int kCloakRemovalVisual = 8001;
 static constexpr char kStealthCue[] = "sdr_invisible";
 
@@ -604,11 +626,15 @@ static constexpr char kReductionCostTable[] = "iprp_soakcost";
 static constexpr char kVulnerabilityCostTable[] = "iprp_damvulcost";
 static constexpr char kDamageTypeTable[] = "iprp_damagetype";
 static constexpr char kProtectionTable[] = "iprp_protection";
+/** A creature record's skill list holds the ranks of the eight skills. */
+static constexpr int kSkillListSize = 8;
 static constexpr int kImprovedForceResistanceCostTable = 11;
 /** The iprp_costtable row of the Decreased Ability Score amounts (iprp_neg10cost). */
 static constexpr int kDecreasedAbilityCostTable = 21;
 /** The iprp_costtable row of the Improved Saving Throw amounts (iprp_bonuscost). */
 static constexpr int kImprovedSavingThrowCostTable = 1;
+/** The iprp_costtable row a decreased-skill property takes its amount from. */
+static constexpr int kDecreasedSkillCostTable = 21;
 static constexpr int kItemLightVisualEffect = 5000;
 
 /** The ability an ability property's subtype names; a subtype past Charisma names Strength. */
@@ -618,7 +644,7 @@ static Ability getPropertyAbility(uint16_t subtype) {
 
 static std::string g_talkDummyNode("talkdummy");
 
-static const std::string g_headHookNode("headhook");
+static const std::string g_headHookNode(Creature::kHeadHookNode);
 // The talking head plays once as a layer over the body's pose, on the head too.
 static constexpr int kHeadTalkFlags = AnimationFlags::layer | AnimationFlags::propagate;
 static const std::string g_maskHookNode("gogglehook");
@@ -1024,7 +1050,7 @@ static MergedDamageModifiers mergeDamageModifiers(
     const std::vector<DamageModifierEntry> &entries,
     const std::function<bool(const DamageModifierEntry &)> &counts) {
 
-    const size_t slots = tsl ? 108 : 36;
+    const int slots = getEffectSourceCapacity(tsl);
     const auto &tables = services.game.combatTables;
     MergedDamageModifiers result;
     int rank = 0;
@@ -1057,7 +1083,7 @@ static MergedDamageModifiers mergeDamageModifiers(
                     continue;
                 }
             }
-            if (list.size() < slots) {
+            if (static_cast<int>(list.size()) < slots) {
                 list.push_back(entry);
             }
         }
@@ -1161,9 +1187,7 @@ static std::vector<DamageModifierEntry> collectDamageModifiers(
         if (!item || !equippedItemPropertiesAreActive(slot)) {
             continue;
         }
-        // An unarmed attack types the gloves' modifiers as bludgeoning.
-        const int itemFlags = slot == InventorySlots::hands ? static_cast<int>(DamageType::Bludgeoning) : item->damageFlags();
-        appendItemDamageModifiers(creature.services(), *item, itemFlags, target,
+        appendItemDamageModifiers(creature.services(), *item, item->damageFlags(), target,
                                   itemDamageAppliesToHand(slot, *item, attackHand),
                                   isHandSpecificAttackModifierSlot(slot), entries);
     }
@@ -1249,9 +1273,9 @@ Creature::Creature(
     ServicesView &services) :
     Object(id, ObjectType::Creature, std::move(sceneName), game, services) {
 
-    // Initialize unsaved perception ranges from PercepRngDefault in ranges.2da.
-    _perception.sightRange = 20.0f;
-    _perception.hearingRange = 20.0f;
+    // Perception ranges come only from data.
+    _perception.sightRange = 0.0f;
+    _perception.hearingRange = 0.0f;
     startUnsavedCounters();
     // A creature's destroyed body waits 8 s before it fades.
     _fadeOutTime = 8000;
@@ -1298,6 +1322,7 @@ void Creature::retireAreaRuntime(
     }
     _pathVelocity = glm::vec3(0.0f);
     _previousPosition = _position;
+    _progressTime = 0.0f;
     _stuckTimer.reset(0.0f);
     _stuckForce = glm::vec3(0.0f);
     setMovementType(MovementType::None);
@@ -1306,14 +1331,12 @@ void Creature::retireAreaRuntime(
     setCombatState(false);
     // What the creature's record does not keep starts over, as it does for a
     // creature built from its record: the excitement, the item-use timer, the
-    // stance and its Total Defense start, the kind of the round's last
-    // action, the end-of-round decision timer, the orientation lock, the spot
-    // it could not see its attack target from, the last projectile time and
-    // the fractions of regeneration.
+    // stance, the kind of the round's last action, the end-of-round decision
+    // timer, the orientation lock, the spot it could not see its attack target
+    // from, the last projectile time and the fractions of regeneration.
     _excitedMilliseconds = 0;
     _itemUseCooldown = 0.0f;
     _combatStance = CombatStance::None;
-    clearTotalDefenseStart();
     _roundActionKind = 0;
     _combatState.decisionScriptTime = 3.0f;
     _orientationLock = script::kObjectInvalid;
@@ -1333,6 +1356,7 @@ void Creature::retireAreaRuntime(
     _oneShot.reset();
     _animFireForget = false;
     _storedLoop.reset();
+    _overlayLoop.reset();
     _swingAttack.reset();
     _weaponDrawPending = false;
     _injuredIdle = false;
@@ -1359,16 +1383,26 @@ void Creature::retireAreaRuntime(
     _attackerList.clear();
     _receivedAttack = {};
     _lastWeaponUsed = script::kObjectInvalid;
-    _clientCombatMode = false;
+    _partyCombatMode = false;
 
-    _perception.clear();
+    // What it perceived starts over too, but for its view of the player
+    // character: a party member keeps its id into the next module, yet
+    // forgets the other members all the same. Its stealth experience timer
+    // starts over.
+    const auto player = _game.party().player();
+    const uint32_t playerId = player ? player->id() : script::kObjectInvalid;
+    for (auto *entries : {&_perception.seen, &_perception.heard, &_perception.invisible}) {
+        for (auto it = entries->begin(); it != entries->end();) {
+            it = it->first == playerId ? std::next(it) : entries->erase(it);
+        }
+    }
+    auto &order = _perception.order;
+    order.erase(std::remove_if(order.begin(), order.end(), [playerId](uint32_t id) { return id != playerId; }), order.end());
     _perceptionStarted = false;
+    _stealthXPTimer.reset();
     stopTalking();
     stopStuntMode();
-    if (_audioSourceVoice) _audioSourceVoice->stop();
-    if (_audioSourceFootstep) _audioSourceFootstep->stop();
-    _audioSourceVoice.reset();
-    _audioSourceFootstep.reset();
+    stopVoiceAndFootsteps();
 }
 
 std::optional<std::reference_wrapper<const Creature>> Creature::asCreature(const Object &object) {
@@ -1409,17 +1443,31 @@ bool Creature::loadFromBlueprint(const std::string &blueprintResRef) {
     // deserialize the same data twice, doubling accumulated class levels.
     deserializeAll(*utc, SerializedIdentityContext::templateResource(resRef));
     restoreSerializedVitality();
+    deserializeHeldCounts(*utc);
     deserializeOwnedItemsAndEquipment(*utc, SerializedIdentityContext::templateResource(resRef), false);
-    countLoadedItems();
+    countLoadedItems(false);
     updateTransform();
     loadAppearance();
+    // A creature that comes into the world in stealth shows it arriving.
+    if (_stealthMode) {
+        presentStealthChange(true, false);
+    }
     return true;
 }
 
-// The sneaking pace and the top driving speed of an appearance whose cell is
-// blank or zero.
+// The sneaking pace, the top driving speed and the driving acceleration of an
+// appearance whose cell is blank or zero.
 static constexpr float kDefaultStealthWalkSpeed = 2.0f;
 static constexpr float kDefaultDriveMaxSpeed = 6.0f;
+static constexpr float kDefaultDriveAcceleration = 25.0f;
+static constexpr float kDefaultDriveRunClipSpeed = 4.0f;
+
+// The appearance.2da columns of the body's evil textures: the unarmoured
+// body's, then those of armour of body variation B, I, L and N.
+static constexpr std::array<const char *, 5> kEvilBodyTextureColumns {"texaevil", "texbevil", "texievil", "texlevil", "texnevil"};
+// The heads.2da columns of the head's textures for good/evil of 10, 20, 30
+// and 40 and below, then of 70 and 90 and above.
+static constexpr std::array<const char *, 6> kHeadAlignmentTextureColumns {"headtexvvve", "headtexvve", "headtexve", "headtexe", "headtexg", "headtexvg"};
 
 void Creature::loadAppearanceProperties() {
     auto appearances = getRequiredTwoDA(_services.resource.twoDas, "appearance");
@@ -1437,9 +1485,17 @@ void Creature::loadAppearanceProperties() {
     if (_stealthWalkSpeed == 0.0f) {
         _stealthWalkSpeed = kDefaultStealthWalkSpeed;
     }
+    _driveRunClipSpeed = appearances->getFloat(_appearance, _game.isTSL() ? "driveanimrun_pc" : "driveanimrun", 0.0f);
+    if (_driveRunClipSpeed == 0.0f) {
+        _driveRunClipSpeed = kDefaultDriveRunClipSpeed;
+    }
     _driveMaxSpeed = appearances->getFloat(_appearance, "drivemaxspeed", 0.0f);
     if (_driveMaxSpeed == 0.0f) {
         _driveMaxSpeed = kDefaultDriveMaxSpeed;
+    }
+    _driveAcceleration = appearances->getFloat(_appearance, "driveaccl", 0.0f);
+    if (_driveAcceleration == 0.0f) {
+        _driveAcceleration = kDefaultDriveAcceleration;
     }
     _personalSpace = appearances->getFloat(_appearance, "perspace", 0.6f);
     // A blank space kept from other creatures is no space at all.
@@ -1485,12 +1541,36 @@ void Creature::loadAppearanceProperties() {
         _armourAppearances[variation] = !model.empty() && model.front() == '&' ? std::stoi(model.substr(1)) : 0;
     }
     _appearancePerceptionRange = appearances->getInt(_appearance, "perceptiondist");
-
-    if (_portraitId > 0) {
-        _portrait = _services.game.portraits.getTextureByIndex(_portraitId);
-    } else {
-        _portrait = _services.game.portraits.getTextureByAppearance(_appearance);
+    // The body's evil textures, by column, the head's model and its good/evil
+    // textures, from the most evil band up.
+    _evilBodyTextures.clear();
+    for (const char *column : kEvilBodyTextureColumns) {
+        _evilBodyTextures[column] = boost::to_lower_copy(appearances->getString(_appearance, column));
     }
+    loadHeadProperties(*appearances);
+
+    const Portrait *portraitRow = findPortrait(_services.game.portraits.portraits(), _portraitId, _appearance);
+    _portraitRow = portraitRow ? std::optional<Portrait>(*portraitRow) : std::nullopt;
+    refreshPortrait();
+}
+
+void Creature::loadHeadProperties(const TwoDA &appearances) {
+    const int head = headRow(appearances);
+    // Without heads.2da a head row names no head.
+    auto heads = head == -1 ? nullptr : _services.resource.twoDas.get("heads");
+    _headModelName = heads ? boost::to_lower_copy(heads->getString(head, "head")) : std::string();
+    for (size_t band = 0; band < kHeadAlignmentTextureColumns.size(); ++band) {
+        _headAlignmentTextures[band] = heads ? boost::to_lower_copy(heads->getString(head, kHeadAlignmentTextureColumns[band])) : std::string();
+    }
+}
+
+std::string Creature::portraitResRef() const {
+    return _portraitRow ? _portraitRow->resRefForGoodEvil(_goodEvil) : std::string();
+}
+
+void Creature::refreshPortrait() {
+    const auto resRef = portraitResRef();
+    _portrait = resRef.empty() ? nullptr : _services.resource.textures.get(resRef, TextureUsage::GUI);
 }
 
 void Creature::loadAppearanceMoveRate(const TwoDA &appearances) {
@@ -1505,6 +1585,15 @@ void Creature::loadAppearanceSoundSet(int row) {
     _appearanceSoundSet.fallHard = boost::to_lower_copy(soundSets->getString(row, "fallhard"));
     _appearanceSoundSet.fallMetal = boost::to_lower_copy(soundSets->getString(row, "fallmetal"));
     _appearanceSoundSet.fallWater = boost::to_lower_copy(soundSets->getString(row, "fallwater"));
+    // A new appearance drops the old appearance's loop.
+    _appearanceSoundSet.looping = boost::to_lower_copy(soundSets->getString(row, "looping"));
+    if (_loopingSoundResRef != _appearanceSoundSet.looping) {
+        if (_loopingSound) {
+            _loopingSound->stop();
+            _loopingSound.reset();
+        }
+        _loopingSoundResRef.clear();
+    }
 }
 
 void Creature::loadAppearance() {
@@ -1516,7 +1605,7 @@ void Creature::loadAppearance() {
         _sceneNode = std::move(modelSceneNode);
         _sceneNode->setUser(*this);
         _sceneNode->setLocalTransform(_transform);
-        _sceneNode->setEnabled(_visible && _clientPresent);
+        updateSceneNodeEnabled();
         _stealthShell.reset();
         // A rebuilt model keeps the stealth field.
         if (_stealthMode) {
@@ -1555,6 +1644,10 @@ void Creature::updateModel() {
     if (!replacement) {
         return;
     }
+    // A loop a script has the creature hold carries over to the new model, at
+    // the speed it was playing.
+    const auto heldLoop = heldScriptLoop();
+    const float heldSpeed = _animationSource.speed;
     auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
     // Visual effects and special-attack weapon visuals carry over to the new
     // model without starting over, and the latest shell covers its new head
@@ -1578,6 +1671,9 @@ void Creature::updateModel() {
     VisualEffect::showLatestShell(*this);
     _oneShot.reset();
     _animDirty = true;
+    if (heldLoop) {
+        playScriptAnimation(getScriptAnimation(*heldLoop), heldSpeed);
+    }
 }
 
 void Creature::loadTransformFromGIT(const resource::generated::GIT_Creature_List &git) {
@@ -1760,23 +1856,44 @@ void Creature::playSwingSound(const std::string &name, int variants) {
     playWeaponSound(row, name + std::to_string(randomInt(0, variants - 1)));
 }
 
-// A weapon sound plays once, 1.5 m above the creature's feet; a weapon with
-// no sound in the column plays nothing.
+// A weapon sound plays once, 1.5 m above the creature's feet, among the
+// combat sounds, straying in pitch by the weapon's offset, or by the group's
+// variance when it has none; a weapon with no sound in the column, or a
+// creature the player does not perceive, plays nothing.
 void Creature::playWeaponSound(int weaponSoundRow, const std::string &column) {
+    if (!isPresent()) {
+        return;
+    }
     const auto &resRef = _services.game.combatTables.weaponSound(weaponSoundRow, column);
     if (resRef.empty()) {
         return;
     }
     if (auto clip = _services.resource.audioClips.get(resRef)) {
-        _services.audio.mixer.play(std::move(clip), AudioType::Sound, 1.0f, false, _position + glm::vec3(0.0f, 0.0f, 1.5f));
+        std::optional<float> pitchVariance;
+        if (const float offset = _services.game.combatTables.weaponSoundPitchOffset(weaponSoundRow); offset != 0.0f) {
+            pitchVariance = offset;
+        }
+        _services.audio.mixer.play(std::move(clip),
+                                   AudioType::Sound,
+                                   kCombatSoundGroup,
+                                   1.0f,
+                                   false,
+                                   _position + glm::vec3(0.0f, 0.0f, 1.5f),
+                                   std::nullopt,
+                                   pitchVariance);
     }
 }
 
 // A creature hitting the ground plays its sound set's fall sound for the
-// surface under its feet once, at its feet; another surface, or a sound set
-// with no sound for the surface, plays nothing.
+// surface under its feet once, at its feet, unmasked by other sounds; another
+// surface, or a sound set with no sound for the surface, plays nothing.
 void Creature::playFallSound() {
-    const auto sound = fallSound(_game.module()->area()->getSurfaceMaterial(_position));
+    // A creature outside an area falls without a sound, as it steps without one.
+    const auto area = spatialArea();
+    if (!area) {
+        return;
+    }
+    const auto sound = fallSound(area->get().getSurfaceMaterial(_position));
     if (!sound) {
         return;
     }
@@ -1785,7 +1902,7 @@ void Creature::playFallSound() {
         return;
     }
     if (auto clip = _services.resource.audioClips.get(resRef)) {
-        _services.audio.mixer.play(std::move(clip), AudioType::Sound, 1.0f, false, _position);
+        _services.audio.mixer.play(std::move(clip), AudioType::Sound, kUnmaskableSoundGroup, 1.0f, false, _position);
     }
 }
 
@@ -1957,10 +2074,66 @@ void Creature::clearHostileActionsAgainst(const Object &object) {
             return false; }, [this](const OrdinaryActionQueue::Node &node) { discardGroupNode(node); });
 }
 
+bool Creature::keepsItemsInOrder() const {
+    return _game.party().actualPlayer().get() == this;
+}
+
 // A Force push holds only the creature's moves, through its AI state.
+// So does every other state: a creature acts while it is neither dead nor
+// down, and what a state keeps it from doing, its AI state keeps it from. A
+// stun, paralysis or sleep also holds the body, and what the creature does
+// with it waits (waitsForBody).
 bool Creature::canExecuteActions() const {
-    return !_dead && !isTemporarilyDead() && !hasEffect(EffectType::Stunned) &&
-           !isImmobilizingState(static_cast<CreatureState>(_effectState));
+    return !_dead && !isTemporarilyDead();
+}
+
+bool Creature::isBodyHeld() const {
+    return hasEffect(EffectType::Stunned) || isImmobilizingState(static_cast<CreatureState>(_effectState));
+}
+
+bool Creature::waitsForBody(const Action &action) const {
+    if (!isBodyHeld()) {
+        return false;
+    }
+    switch (action.combatAction().type()) {
+    case ActionType::PickUpItem:
+    case ActionType::DropItem:
+    case ActionType::PutDownItem:
+    case ActionType::AttackObject:
+    case ActionType::CastSpell:
+    case ActionType::CastSpellAtObject:
+    case ActionType::CastSpellAtLocation:
+    case ActionType::ItemCastSpell:
+    case ActionType::CounterSpell:
+    case ActionType::OpenDoor:
+    case ActionType::CloseDoor:
+    case ActionType::DoorSaber:
+    case ActionType::DisableTrap:
+    case ActionType::RecoverTrap:
+    case ActionType::FlagTrap:
+    case ActionType::ExamineTrap:
+    case ActionType::SetTrap:
+    case ActionType::OpenLock:
+    case ActionType::Lock:
+    case ActionType::UseObject:
+    case ActionType::OpenContainer:
+    case ActionType::AnimalEmpathy:
+    case ActionType::Taunt:
+    case ActionType::Heal:
+    case ActionType::PickPocket:
+    case ActionType::EquipItem:
+    case ActionType::UnequipItem:
+    case ActionType::SwitchWeapons:
+    case ActionType::GiveItem:
+    case ActionType::TakeItem:
+    case ActionType::UseFeat:
+    case ActionType::UseSkill:
+    case ActionType::UseTalentOnObject:
+    case ActionType::UseTalentAtLocation:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // The commands a party member at zero vitality still carries out; it fails
@@ -1968,6 +2141,7 @@ bool Creature::canExecuteActions() const {
 static bool runsWhileDown(SavedActionType type) {
     switch (type) {
     case SavedActionType::SpeakString:
+    case SavedActionType::OrientCamera:
     case SavedActionType::StartConversation:
     case SavedActionType::DisarmMine:
     case SavedActionType::RecoverMine:
@@ -1999,19 +2173,36 @@ bool Creature::permitsAction(const Action &action) const {
     if (isTemporarilyDead()) {
         return runsWhileDown(static_cast<SavedActionType>(command.serializedActionId()));
     }
+    // What is done with a held body is refused where it cannot wait.
+    if (waitsForBody(action)) {
+        return false;
+    }
+    // A walk to a point, or one heading for an object, fails a creature that
+    // cannot move unless its goal is a trigger or a linked door already in
+    // reach, which it clicks or is blocked by; a walk to a location, a
+    // follow of the leader or of the owner and a drive fail it too. A walk to
+    // an object that checks its reach, a move away and a follow of another
+    // creature keep their order: only death or going down ends them. A random
+    // walk asks nothing.
     switch (command.type()) {
-    case ActionType::MoveToObject:
-        return canMove() || clicksTriggerInReach(*static_cast<const MoveToObjectAction &>(command).target());
-    case ActionType::MoveToPoint:
+    case ActionType::MoveToObject: {
+        const auto &move = static_cast<const MoveToObjectAction &>(command);
+        if (!move.usesPointPath()) {
+            return canExecuteActions();
+        }
+        return canMove() || isWalkGoalInReach(*move.target(), move.pathOffset());
+    }
+    case ActionType::MoveToPoint: {
+        const auto &goal = static_cast<const MoveToPointAction &>(command).goal();
+        return canMove() || (goal && isWalkGoalInReach(*goal));
+    }
     case ActionType::MoveToLocation:
-    case ActionType::MoveAwayFromObject:
-    case ActionType::MoveAwayFromLocation:
-    case ActionType::RandomWalk:
-    case ActionType::Follow:
     case ActionType::FollowLeader:
     case ActionType::FollowOwner:
-    case ActionType::ForceFollowObject:
+    case ActionType::Drive:
         return canMove();
+    case ActionType::RandomWalk:
+        return true;
     case ActionType::AttackObject:
         return canAttack();
     case ActionType::UseFeat:
@@ -2026,10 +2217,19 @@ bool Creature::clicksTriggerInReach(const Object &target) const {
     return trigger && !trigger->isTrap() && !isDead() && !isTemporarilyDead() && isInUseRange(*trigger, 0.0f);
 }
 
+bool Creature::isLinkedDoorInReach(const Object &goal, std::optional<float> pathOffset) const {
+    const auto *door = dyn_cast<const Door>(&goal);
+    return door && door->isLinked() && isInUseRange(*door, 0.0f, pathOffset);
+}
+
+bool Creature::isWalkGoalInReach(const Object &goal, std::optional<float> pathOffset) const {
+    return clicksTriggerInReach(goal) || isLinkedDoorInReach(goal, pathOffset);
+}
+
 bool Creature::isSelectable() const {
     // A creature the player's side has not detected cannot be picked. Its
     // items are never looted from it directly, but from its body bag.
-    return _clientPresent && !isTemporarilyDead() && (!_dead || _selectableWhenDead);
+    return _present && !isTemporarilyDead() && (!_dead || _selectableWhenDead);
 }
 
 bool Creature::isRunLimited() const {
@@ -2038,6 +2238,26 @@ bool Creature::isRunLimited() const {
 
 bool Creature::movesStealthily() const {
     return _stealthMode && (!_game.isTSL() || !hasEffectiveFeat(FeatType::StealthRun));
+}
+
+// A sneaking creature gathers speed slowly, whatever its appearance.
+float Creature::driveAcceleration() const {
+    static constexpr float kStealthDriveAcceleration = 15.0f;
+    return movesStealthily() ? kStealthDriveAcceleration : _driveAcceleration;
+}
+
+float Creature::drivenClipSpeed() const {
+    return movesStealthily() ? std::min(driveSpeed(), _stealthWalkSpeed) : driveSpeed();
+}
+
+bool Creature::drivesAtRun() const {
+    static constexpr float kDriveWalkThreshold = 0.6f;
+    return drivenClipSpeed() > kDriveWalkThreshold * driveTopSpeed();
+}
+
+// The top speed follows the movement rate as speed effects come and go.
+float Creature::driveTopSpeed() const {
+    return _driveMaxSpeed * movementRate(true);
 }
 
 void Creature::setCombatStance(CombatStance stance) {
@@ -2059,41 +2279,13 @@ void Creature::cancelAllCombatModes() {
     }
 }
 
-bool Creature::isInTotalDefense() const {
-    return _combatStance == CombatStance::TotalDefense || _roundActionKind == kTotalDefenseRoundAction;
-}
-
-bool Creature::addStanceActions(CombatStance stance, const std::shared_ptr<Object> &target,
-                                bool clearActions, bool toFront, bool fromRound) {
+bool Creature::addStanceActions(CombatStance stance) {
     if (!isCommandable()) {
         return false;
     }
     if (stance == CombatStance::Meditative) {
-        addAction(_game.newAction<CombatStanceAction>(CombatStance::Meditative));
-        return true;
+        addAction(_game.newAction<CombatStanceAction>());
     }
-    if (stance != CombatStance::TotalDefense) {
-        return true;
-    }
-    if (fromRound) {
-        if (clearActions) {
-            clearAllActions(true);
-        }
-        auto action = _game.newAction<CombatStanceAction>(CombatStance::TotalDefense, target);
-        if (toFront) {
-            addActionOnTop(std::move(action));
-        } else {
-            addAction(std::move(action));
-        }
-        broadcastCombatState(_id);
-        return true;
-    }
-    // Outside combat the stance request replaces the controlled creature's
-    // queue before the round entry and its dispatcher are installed.
-    if (!isInCombat()) {
-        _game.combat().clearControlledActions(*this);
-    }
-    _game.combat().scheduleStance(*this, target);
     return true;
 }
 
@@ -2142,16 +2334,15 @@ bool Creature::requestSwitchWeapons(bool immediate) {
     return addSwitchWeaponsAction(immediate);
 }
 
-void Creature::beginSpellActivity(int spellId, bool itemCast, bool hostile, bool interrupts) {
+void Creature::beginSpellActivity(int spellId, bool itemCast) {
     _roundActionKind = itemCast ? kItemCastRoundAction : kCastRoundAction;
     // A cast round, a power or an item, is a spell-cast round.
     _combatState.attackAction = ActionType::CastSpell;
     // The round remembers its power; an item use counts as power 0.
     _combatState.roundSpell = itemCast ? 0 : spellId;
-    // A fake cast takes the round but interrupts nothing.
-    if (!interrupts) {
-        return;
-    }
+}
+
+void Creature::interruptForSpell(int spellId, bool itemCast, bool hostile) {
     if (itemCast) {
         // Only a hostile item spell gives the user away.
         if (hostile) {
@@ -2191,7 +2382,7 @@ void Creature::interruptActivities(bool keepStealth) {
     }
 }
 
-void Creature::setStealthMode(bool enabled) {
+void Creature::setStealthMode(bool enabled, bool quiet) {
     if (_stealthMode == enabled) {
         return;
     }
@@ -2200,12 +2391,22 @@ void Creature::setStealthMode(bool enabled) {
     if (isRunLimited() && _movementType == MovementType::Run) {
         setMovementType(MovementType::Walk);
     }
+    presentStealthChange(enabled, quiet);
+}
+
+// KotOR plays the activate clip on entering and leaving stealth alike.
+void Creature::presentStealthChange(bool enabled, bool quiet) {
     presentStealth(enabled, true);
+    if (!_game.isTSL() && !quiet) {
+        playFireForgetAnimation(getAnimationName(AnimationType::FireForgetActivate),
+                                AnimationSource {kCreatureActivateAnimationId, false, true});
+    }
 }
 
 // Entering stealth plays the BeginStealth sound and wraps the creature in the
 // stealth field; leaving it removes the field with the cloak-removal effect.
-// The controlled creature also hears the stealth cue both ways.
+// The controlled creature also hears the stealth cue both ways, among the
+// GUI's sounds.
 void Creature::presentStealth(bool enabled, bool announce) {
     // A creature loaded in stealth has no model yet; its model takes up the
     // field once built.
@@ -2218,7 +2419,7 @@ void Creature::presentStealth(bool enabled, bool announce) {
     presentStealthField(enabled, announce);
     if (announce && _game.party().getLeader().get() == this) {
         if (auto cue = _services.resource.audioClips.get(kStealthCue)) {
-            _services.audio.mixer.play(std::move(cue), AudioType::Sound, 1.0f, false, _position);
+            _services.audio.mixer.play(std::move(cue), AudioType::Sound, kGuiSoundGroup, 1.0f, false, _position);
         }
     }
     // TSL shows the field on an owner's puppet too, and the owner's stealth
@@ -2250,14 +2451,15 @@ void Creature::presentStealthField(bool enabled, bool announce) {
         _stealthShell.reset();
         if (announce) {
             // The cloak removal is shown as an impact: its impact program's
-            // shell for one second, with the row's impact sound.
+            // shell for one second, with the row's impact sound above it.
             const VisualEffectDesc &removal = effects.get(kCloakRemovalVisual).value();
             const auto texture = shieldTextureForProgram(removal.progFXImpact);
             _cloakRemovalShell = texture.empty() ? nullptr : _services.resource.textures.get(texture, TextureUsage::MainTex);
             _cloakRemovalShellOrder = _nextEffectApplicationOrder;
             _cloakRemovalTime = _cloakRemovalShell ? 1.0f : 0.0f;
             if (removal.soundImpact) {
-                _services.audio.mixer.play(removal.soundImpact, AudioType::Sound, 1.0f, false, _position);
+                const glm::vec3 soundPosition {_position + glm::vec3 {0.0f, 0.0f, kEffectSoundHeight}};
+                _services.audio.mixer.play(removal.soundImpact, AudioType::Sound, kSpellEffectSoundGroup, 1.0f, false, soundPosition);
             }
         }
     }
@@ -2274,12 +2476,11 @@ std::shared_ptr<graphics::Texture> Creature::latestOwnShell(uint64_t &order) con
     return _stealthShell;
 }
 
-// TSL grants the skill through the stealth feat and the Force Camouflage powers.
-bool Creature::canUseStealthSkill() const {
-    if (_game.isTSL() && hasTSLStealthTalent()) {
-        return true;
-    }
-    return _attributes.hasSkill(SkillType::Stealth);
+bool Creature::canUseSkill(int skill) const {
+    auto hasFeat = [this](FeatType feat) {
+        return hasEffectiveFeat(feat);
+    };
+    return canCreatureUseSkill(_services.game.skills, skill, _attributes, hasFeat, _game.isTSL());
 }
 
 bool Creature::hasTSLStealthTalent() const {
@@ -2294,7 +2495,7 @@ bool Creature::isStealthCapable() const {
     if (_game.module()->area()->playerRestrictMode()) {
         return false;
     }
-    if (!canUseStealthSkill()) {
+    if (!canUseSkill(SkillType::Stealth)) {
         return false;
     }
     for (int slot : {InventorySlots::belt, InventorySlots::cArmour}) {
@@ -2310,7 +2511,7 @@ void Creature::toggleStealth() {
     if (isDead() || (isPartyMember() && currentHitPoints() <= 0)) {
         return;
     }
-    if (!canUseStealthSkill()) {
+    if (!canUseSkill(SkillType::Stealth)) {
         return;
     }
     if (_stealthMode) {
@@ -2324,14 +2525,68 @@ void Creature::toggleStealth() {
     }
 }
 
-void Creature::useStealthSkill() {
-    if (!canUseStealthSkill()) {
-        if (_game.party().getLeader().get() == this) {
-            _game.addFeedbackMessage(kSkillUnusableStrRef);
-        }
-        return;
+// The controlled creature is told it cannot use a skill.
+static void tellSkillUnusable(Game &game, const Creature &creature) {
+    if (game.party().getLeader().get() == &creature) {
+        game.addFeedbackMessage(kSkillUnusableStrRef);
     }
-    toggleStealth();
+}
+
+bool Creature::admitSkillUse(SkillType skill) const {
+    if (canUseSkill(skill)) {
+        return true;
+    }
+    tellSkillUnusable(_game, *this);
+    return false;
+}
+
+bool Creature::admitSkillUse(SkillType skill, const Object &target) const {
+    if (!admitSkillUse(skill)) {
+        return false;
+    }
+    // A skill with no row, as a Demolitions sub-skill, is not hostile.
+    const auto rules = _services.game.skills.get(skill);
+    const auto *creature = dyn_cast<const Creature>(&target);
+    if (!rules || !rules->hostile || !creature ||
+        creature->getReputationToward(*this) < kLowestFriendReputation) {
+        return true;
+    }
+    if (_game.party().getLeader().get() == this) {
+        _game.addFeedbackMessage(kHostileSkillRefusedStrRef);
+    }
+    return false;
+}
+
+std::shared_ptr<Action> Creature::useSkill(SkillType skill, std::shared_ptr<Object> target, int subSkill, std::shared_ptr<Item> item) {
+    if (!admitSkillUse(skill, *target)) {
+        return nullptr;
+    }
+    const bool controlled = _game.party().getLeader().get() == this;
+    switch (skill) {
+    case SkillType::Stealth:
+        toggleStealth();
+        return nullptr;
+    case SkillType::Security:
+        // Security is an unlock, with a spike when an item is given. The
+        // creature the player controls first clears its actions unless it is
+        // busy, whether or not it then takes the unlock.
+        if (controlled) {
+            clearOrdersUnlessBusy();
+        }
+        return _game.newAction<UnlockObjectAction>(std::move(target), std::move(item));
+    case SkillType::Demolitions:
+        // Mine work by the creature the player controls first clears its
+        // actions unless it is busy, when it can be commanded.
+        if (controlled && isCommandable()) {
+            clearOrdersUnlessBusy();
+        }
+        return _game.newAction<UseSkillAction>(skill, std::move(target), subSkill, std::move(item));
+    case SkillType::TreatInjury:
+        return _game.newAction<UseSkillAction>(skill, std::move(target), subSkill, std::move(item));
+    default:
+        // Computer Use, Awareness, Persuade and Repair have no use of their own.
+        return nullptr;
+    }
 }
 
 void Creature::updateMindTrickPerception(const Creature &target, bool heard, bool seen) {
@@ -2415,6 +2670,54 @@ void Creature::update(float dt) {
     updateCombat(dt);
     updateRegeneration(dt);
     updateLightsaberSoundPositions();
+    updateRollingFootstep();
+    updateLoopingSounds();
+    updateStealthXPTimer();
+    updateAlignmentTextures();
+}
+
+// A creature that newly sees the player's creature costs the area stealth
+// experience six seconds later.
+static constexpr int kStealthXPSightingMilliseconds = 6000;
+
+// The player's creature, for stealth experience: the player character or the
+// controlled creature.
+static bool isPlayersCreature(Game &game, const Creature &creature) {
+    return creature.isPC() || game.party().getLeader().get() == &creature;
+}
+
+void Creature::startStealthXPTimer(const Creature &seen) {
+    if (isPlayersCreature(_game, seen)) {
+        _stealthXPTimer = kStealthXPSightingMilliseconds;
+    }
+}
+
+void Creature::hastenStealthXPTimer(const Creature &victim) {
+    if (_stealthXPTimer && isPlayersCreature(_game, victim)) {
+        _stealthXPTimer = 0;
+    }
+}
+
+// The timer counts down by the frame time. A creature outside any area keeps
+// its timer as it is.
+void Creature::updateStealthXPTimer() {
+    auto area = spatialArea();
+    if (!area) {
+        return;
+    }
+    if (!area->get().isStealthXPEnabled()) {
+        _stealthXPTimer.reset();
+        return;
+    }
+    if (!_stealthXPTimer) {
+        return;
+    }
+    if (*_stealthXPTimer <= _frameMilliseconds) {
+        area->get().loseStealthXP();
+        _stealthXPTimer.reset();
+    } else {
+        *_stealthXPTimer -= _frameMilliseconds;
+    }
 }
 
 // With the clock stopped the frame takes no time, so nothing turns.
@@ -3081,6 +3384,12 @@ void Creature::updateModelAnimation() {
                                       : (AnimationFlags::loopBlend | AnimationFlags::propagate);
         auto properties = AnimationProperties::fromFlags(animFlags);
         properties.speed = movementClipSpeed;
+        // A new loop starts as far through as the loop it replaces was.
+        const auto base = model->baseAnimationChannel();
+        if (base && base->get().anim != anim.get() && (base->get().properties.flags & AnimationFlags::loop) &&
+            base->get().anim->length() > 0.0f) {
+            properties.startTime = base->get().time / base->get().anim->length() * anim->length();
+        }
         model->playAnimation(*anim, nullptr, properties);
     }
     if (newLoop) {
@@ -3092,15 +3401,17 @@ void Creature::updateModelAnimation() {
 
 // Walk and run clips play so that the feet keep pace with the ground. On a
 // path they also go at their own pace, which picks up and falls off with the
-// walk; before it has any, they play at their natural speed.
+// walk; before it has any, they play at their natural speed. The leader the
+// player drives shows the clip its drive speed calls for, at that speed.
 Creature::MovementClip Creature::movementClip(const ModelSceneNode &model) const {
     MovementClip clip;
-    const bool running = _movementType == MovementType::Run && !movesStealthily();
-    const float speed = running ? runSpeed() : walkSpeed();
+    const bool driven = _game.party().getLeader().get() == this && _game.module() && _game.module()->isPlayerMoving();
+    const bool running = driven ? drivesAtRun() : _movementType == MovementType::Run && !movesStealthily();
+    const float speed = driven ? drivenClipSpeed() : (running ? runSpeed() : walkSpeed());
     // A run slowed well below its clip's pace shows the walk instead, as does
     // a run on a path while it goes at under half its speed.
-    const bool runClip = running && speed >= _runDistance * kRunClipMinimumPace &&
-                         !(_path && _walkPace < kRunClipMinimumWalkPace);
+    const bool runClip = running && (driven || (speed >= _runDistance * kRunClipMinimumPace &&
+                                                !(_path && _walkPace < kRunClipMinimumWalkPace)));
     // Limping comes before sneaking. Creature models have no injured run,
     // and a run too slow for its clip shows the walk: the plain walk on
     // creature models. A clip the model lacks leaves the last one playing.
@@ -3123,8 +3434,9 @@ Creature::MovementClip Creature::movementClip(const ModelSceneNode &model) const
         clip.anim = model.model().getAnimation(getWalkAnimation());
         clip.id = kWalkAnimationId;
     }
-    const float loopDistance = runClip ? _runDistance : _walkDistance;
-    const float pace = _path ? _clipPace : 1.0f;
+    const float loopDistance = driven ? (runClip ? _driveRunClipSpeed : _stealthWalkSpeed)
+                                      : (runClip ? _runDistance : _walkDistance);
+    const float pace = _path && !driven ? _clipPace : 1.0f;
     if (clip.anim && speed > 0.0f && loopDistance > 0.0f && clip.anim->length() > 0.0f && pace > 0.0f) {
         clip.speed = pace * speed * clip.anim->length() / loopDistance;
     }
@@ -3173,6 +3485,8 @@ void Creature::playTopFireForgetAnimation() {
         properties.flags = AnimationFlags::overlay | AnimationFlags::layer | AnimationFlags::fireForget |
                            AnimationFlags::propagate;
     } else {
+        // A one-shot of the body takes the talk or listen loop away.
+        stopOverlayLoop();
         properties.flags = AnimationFlags::blend | AnimationFlags::propagate;
         properties.speed = static_cast<float>(entry.lengthMilliseconds) * entry.rate / static_cast<float>(length);
         if (properties.speed == 0.0f) {
@@ -3202,6 +3516,7 @@ void Creature::returnToStoredLoop() {
     // Returning to the loop shows again the items a one-shot put away.
     presentEquippedItems(_storedLoop ? _storedLoop->clip : getActiveAnimationName());
     if (_animDirty) {
+        showWaitingOverlayLoop();
         return;
     }
     const bool current = _storedLoop && boost::iequals(getActiveAnimationName(), _storedLoop->clip);
@@ -3210,39 +3525,145 @@ void Creature::returnToStoredLoop() {
     }
     if (!current && (!_storedLoop || _storedLoop->stateDriven)) {
         _animDirty = true;
+        showWaitingOverlayLoop();
         return;
     }
     if (!current) {
-        std::static_pointer_cast<ModelSceneNode>(_sceneNode)->playAnimation(_storedLoop->clip, nullptr, _storedLoop->properties);
+        auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
+        if (_storedLoop->external) {
+            model->playAnimation(*_storedLoop->external, nullptr, _storedLoop->properties);
+        } else {
+            model->playAnimation(_storedLoop->clip, nullptr, _storedLoop->properties);
+        }
+    }
+    showWaitingOverlayLoop();
+}
+
+void Creature::playOverlayLoop(const std::string &clip, AnimationProperties properties, AnimationSource source) {
+    if (_movementType != MovementType::None) {
+        return;
+    }
+    stopOverlayLoop();
+    properties.flags |= AnimationFlags::loop | AnimationFlags::overlay | AnimationFlags::layer | AnimationFlags::propagate;
+    _overlayLoop = OverlayLoop {clip, std::move(properties), source};
+    if (!isPlayingOneShotAnimation()) {
+        showWaitingOverlayLoop();
     }
 }
 
-void Creature::presentEquippedItems(const std::string &clip) {
+void Creature::showWaitingOverlayLoop() {
+    if (!_overlayLoop || _overlayLoop->shown) {
+        return;
+    }
     auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
+    if (!model) {
+        return;
+    }
+    model->playAnimation(_overlayLoop->clip, nullptr, _overlayLoop->properties);
+    _overlayLoop->shown = true;
+    setAnimationSource(_overlayLoop->source);
+    // The lip sync of a line still being spoken stays on top of it.
+    const std::string headTalk = getHeadTalkAnimation();
+    const auto &channels = model->animationChannels();
+    auto speaking = std::find_if(channels.begin(), channels.end(), [&headTalk](const ModelSceneNode::AnimationChannel &channel) {
+        return channel.lipAnim && !channel.finished && channel.anim->name() == headTalk;
+    });
+    if (speaking != channels.end()) {
+        auto lipAnim = speaking->lipAnim;
+        model->playAnimation(headTalk, std::move(lipAnim), AnimationProperties::fromFlags(kHeadTalkFlags));
+    }
+}
+
+void Creature::stopOverlayLoop() {
+    if (!_overlayLoop) {
+        return;
+    }
+    auto body = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
+    if (_overlayLoop->shown && body && body->fadeOutLayer(_overlayLoop->clip)) {
+        if (auto head = static_cast<ModelSceneNode *>(body->getAttachment(g_headHookNode))) {
+            head->fadeOutLayer(_overlayLoop->clip);
+        }
+    }
+    _overlayLoop.reset();
+}
+
+void Creature::presentEquippedItems(const std::string &clip) {
     const bool hides = _services.game.animations.hidesEquippedItems(clip);
     if (!hides && (!_equipmentHidden || _game.isConversationActive())) {
         return;
     }
-    for (const auto *hand : {&g_rightHandNode, &g_leftHandNode})
-        if (auto *weapon = model->getAttachment(*hand)) {
-            weapon->setEnabled(!hides);
-        }
     _equipmentHidden = hides;
+    presentHandItems(*std::static_pointer_cast<ModelSceneNode>(_sceneNode));
     if (!hides) {
         _services.game.projectiles.dropThrownLightsaber(*this);
     }
 }
 
+void Creature::presentHandItems(ModelSceneNode &body) const {
+    const bool shown = !_equipmentHidden && !_handWeaponsStripped;
+    if (auto *item = body.getAttachment(g_rightHandNode)) {
+        item->setEnabled(shown && !_rightHandPutAwayForConversation);
+    }
+    if (auto *item = body.getAttachment(g_leftHandNode)) {
+        item->setEnabled(shown && !_leftHandPutAwayForConversation);
+    }
+}
+
+void Creature::bringOutHandForConversation(int slot) {
+    if (slot == InventorySlots::rightWeapon) {
+        _rightHandPutAwayForConversation = false;
+    } else if (slot == InventorySlots::leftWeapon) {
+        _leftHandPutAwayForConversation = false;
+    }
+}
+
+void Creature::presentHeadItem(ModelSceneNode &body) const {
+    auto *head = static_cast<ModelSceneNode *>(body.getAttachment(g_headHookNode));
+    if (!head) {
+        return;
+    }
+    if (auto *item = head->getAttachment(g_maskHookNode)) {
+        item->setEnabled(!_headItemPutAwayForConversation);
+    }
+}
+
+// A creature without a model has no items to show.
+void Creature::setHandItemsPutAwayForConversation(bool putAway) {
+    _rightHandPutAwayForConversation = putAway;
+    _leftHandPutAwayForConversation = putAway;
+    if (auto body = std::static_pointer_cast<ModelSceneNode>(_sceneNode)) {
+        presentHandItems(*body);
+    }
+}
+
+void Creature::setHeadItemPutAwayForConversation(bool putAway) {
+    _headItemPutAwayForConversation = putAway;
+    if (auto body = std::static_pointer_cast<ModelSceneNode>(_sceneNode)) {
+        presentHeadItem(*body);
+    }
+}
+
 bool Creature::storeLoop(const std::string &clip, const AnimationProperties &properties, bool stateDriven,
-                         AnimationSource source) {
+                         AnimationSource source, std::shared_ptr<Animation> external) {
+    // Any loop asked for takes the talk or listen loop away.
+    if (!stateDriven) {
+        stopOverlayLoop();
+    }
     if (!_storedLoop || !boost::iequals(_storedLoop->clip, clip)) {
         flushFireForgetQueue();
         if (_storedLoop) {
             queueLoopTransition(source.id, _storedLoop->source.id, properties.speed);
         }
     }
-    _storedLoop = StoredLoop {clip, properties, stateDriven, source};
-    return !isPlayingOneShotAnimation();
+    _storedLoop = StoredLoop {clip, properties, stateDriven, source, std::move(external)};
+    if (isPlayingOneShotAnimation()) {
+        // A loop held behind the one-shot still places the model at once:
+        // back where the creature stands, or at the world origin for a loop
+        // played there.
+        setPlacedAtOrigin(isWorldSpaceCutClip(source.id));
+        return false;
+    }
+    return true;
 }
 
 // A loop taking over from another may first show the clip leading from one to
@@ -3356,6 +3777,8 @@ void Creature::abortFireForgetAnimation(bool clearLayers) {
     }
     auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
     if (clearLayers && model) {
+        // The talk or listen loop leaves the head too.
+        stopOverlayLoop();
         model->removeLayers();
     }
     // The running one-shot, or the flinch pose, ends in the stored loop; with
@@ -3578,25 +4001,7 @@ int Creature::skillRank(SkillType skill, bool baseOnly, const OptionalCreature &
         return 0;
     }
 
-    // Increases and decreases each count the strongest amount of every item
-    // or spell and every other effect on its own, up to 90 points.
-    struct Bucket {
-        EffectSourceKey source;
-        int amount;
-    };
-    std::vector<Bucket> increases;
-    std::vector<Bucket> decreases;
-    auto add = [](auto &buckets, EffectSourceKey source, int amount) {
-        if (source.kind != EffectSourceKind::Independent) {
-            for (auto &bucket : buckets) {
-                if (bucket.source.kind == source.kind && bucket.source.value == source.value) {
-                    bucket.amount = std::max(bucket.amount, amount);
-                    return;
-                }
-            }
-        }
-        buckets.push_back({source, amount});
-    };
+    auto reducer = EffectBonusReducer::forSkill(_game.isTSL());
     for (const auto &effect : effects()) {
         if (!effect.hasLiveRuntimeSource()) {
             continue;
@@ -3605,7 +4010,7 @@ int Creature::skillRank(SkillType skill, bool baseOnly, const OptionalCreature &
             continue;
         }
         const int selectedSkill = effect.integerParameter(0);
-        if (selectedSkill != 255 && selectedSkill != row) {
+        if (selectedSkill != kAllSkills && selectedSkill != row) {
             continue;
         }
         if (versus) {
@@ -3617,23 +4022,19 @@ int Creature::skillRank(SkillType skill, bool baseOnly, const OptionalCreature &
             // An unopposed query has no versus object.
             continue;
         }
-        add(effect.type() == EffectType::SkillIncrease ? increases : decreases,
-            getEffectSourceKey(effect), effect.integerParameter(1));
-    }
-    auto total = [](const auto &buckets) {
-        int value = 0;
-        for (const auto &bucket : buckets) {
-            value += bucket.amount;
+        if (effect.type() == EffectType::SkillIncrease) {
+            reducer.addIncrease(getEffectSourceKey(effect), effect.integerParameter(1));
+        } else {
+            reducer.addDecrease(getEffectSourceKey(effect), effect.integerParameter(1));
         }
-        return std::min(value, 90);
-    };
-    rank += total(increases) - total(decreases);
+    }
+    rank += reducer.total();
 
     const Ability ability = rules->keyAbility;
-    rank += getEffectiveAbilityModifier(ability);
-    if ((ability == Ability::Strength || ability == Ability::Dexterity) &&
-        hasEffect(EffectType::Blindness))
+    rank += ability == Ability::Dexterity ? getDexterityModifier(false) : getEffectiveAbilityModifier(ability);
+    if ((ability == Ability::Strength || ability == Ability::Dexterity) && isBlind()) {
         rank -= 4;
+    }
 
     switch (skill) {
     case SkillType::ComputerUse:
@@ -3683,6 +4084,18 @@ int Creature::skillRank(SkillType skill, bool baseOnly, const OptionalCreature &
 
 void Creature::runEndDialogScript() {
     _game.scriptRunner().run(_onEndDialogue, id());
+}
+
+void Creature::runOnDisturbed(uint32_t disturber, InventoryDisturbType type, uint32_t item) {
+    if (_onDisturbed.empty()) {
+        return;
+    }
+    _game.scriptRunner().run(
+        _onDisturbed,
+        {{script::ArgKind::Caller, Variable::ofObject(_id)},
+         {script::ArgKind::LastDisturbed, Variable::ofObject(disturber)},
+         {script::ArgKind::InventoryDisturbItem, Variable::ofObject(item)},
+         {script::ArgKind::InventoryDisturbType, Variable::ofInt(static_cast<int>(type))}});
 }
 
 void Creature::updateRegeneration(float dt) {
@@ -3896,11 +4309,12 @@ void Creature::damage(
         setLastDamager(damager);
         setLastDamageAmounts(amounts);
     }
-    applyHitPointDamage(amount, damager);
+    applyHitPointDamage(amount, amount, damager);
 }
 
 void Creature::applyHitPointDamage(
     int amount,
+    int dealt,
     const std::shared_ptr<Object> &damager,
     std::optional<DamageReaction> reaction) {
     if (_dead) {
@@ -3926,20 +4340,28 @@ void Creature::applyHitPointDamage(
         }
         _currentHitPoints = 0; // special case for Death effect
     } else {
-        const int totalBefore = currentHitPoints();
-        const int allowedDamage = isMinOneHP()
-                                      ? std::min(amount, std::max(0, totalBefore - 1))
-                                      : amount;
-        const int remainingDamage = consumeTemporaryHitPoints(allowedDamage);
+        const int hitPointDamage = consumeTemporaryHitPoints(amount);
         if (_dead) {
             return;
         }
-        _currentHitPoints -= remainingDamage;
-        const int adjustedAmount = allowedDamage;
-        if (amount > 0) {
-            _game.floatingText().addDamage(
-                *this, amount, adjustedAmount, damagerId);
+        // The difficulty settings may set a floor of 1 hit point under the
+        // player character; what the floor holds back is not shown as damage
+        // taken.
+        int hitPoints = _currentHitPoints - hitPointDamage;
+        if (difficultyKeepsAtOneHitPoint()) {
+            hitPoints = std::max(hitPoints, std::min(1, _currentHitPoints));
         }
+        const int remainingDamage = _currentHitPoints - hitPoints;
+        _currentHitPoints = hitPoints;
+        // A min-1-HP creature stops at 1 hit point once temporary hit points
+        // have taken their share; the damage shown is not reduced for it.
+        if (isMinOneHP()) {
+            _currentHitPoints = std::max(_currentHitPoints, 1);
+        }
+        // The controlled creature is shown the damage it dealt, before the
+        // difficulty weighs it. The player is shown the damage that got past
+        // temporary hit points, 0 when they took all of it.
+        _game.floatingText().addDamage(*this, dealt, remainingDamage, damagerId);
     }
 
     // The reaction comes after the vitality change and before the damaged script.
@@ -3952,7 +4374,9 @@ void Creature::applyHitPointDamage(
         return;
     }
 
-    (void)applyDeathEffect(damager, false);
+    // A creature's kill is spectacular unless its current attack is ranged.
+    const auto killer = asCreature(damager);
+    (void)applyDeathEffect(damager, killer && !killer->get().isCurrentAttackRanged(), false);
 }
 
 int Creature::getReputationToward(const Creature &target) const {
@@ -4094,9 +4518,10 @@ void Creature::setDesiredFacingToward(const glm::vec3 &point) {
 Creature::AnimationUpdater Creature::animationUpdater() const {
     auto &party = _game.party();
     const bool leader = party.getLeader().get() == this;
-    // In a conversation the leader is driven only when it neither speaks nor
-    // listens; in TSL not at all. Nor is it driven after an engaged swing.
-    if (leader && !_engagedExchange && !hasOrdinaryActionsPending() && !isPlayingDialogAnimation() &&
+    // The leader acts freely with nothing queued or under the player's drive.
+    // In a conversation it is driven only when it neither speaks nor listens;
+    // in TSL not at all. Nor is it driven after an engaged swing.
+    if (leader && !isDriveBlocked() &&
         !(_game.isTSL() ? _game.isConversationActive() : _game.isConversationSpeakerOrListener(*this))) {
         return AnimationUpdater::Drive;
     }
@@ -4262,10 +4687,10 @@ void Creature::removeEffectsOnDeath() {
 void Creature::onDestroyabilityChanged() {
     if (_destroyable && _dead && !_game.party().isMember(*this) &&
         _game.party().actualPlayer().get() != this)
-        _game.postObjectDestruction(*this, 3.0f);
+        _game.postObjectDestruction(*this, getLastKiller(), 3.0f);
 }
 
-bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
+bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager, bool spectacular,
                                 bool noFadeAway, std::optional<std::reference_wrapper<const EffectInstance>> operation) {
     if (_dead || _immortal || plotFlag()) {
         return false;
@@ -4275,12 +4700,13 @@ bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
         return false;
     }
     setOrientationLock(script::kObjectInvalid, true);
-    clearAllActions(true);
-    // Death ends a running round without its end-of-round script.
-    if (_game.combat().ownsRound(*this)) {
-        _game.combat().endRound(*this, 0);
+    // The actions, and with them the round's attacks, go before the immunity
+    // test, and only for a creature that can be commanded; the round itself
+    // only ends once the creature is known to die, so an immune one keeps it.
+    if (isCommandable()) {
+        clearAllActions(true);
+        _game.combat().cancelActions(*this);
     }
-    _game.combat().cancelActions(*this);
     _game.setLastPartyMemberTempKilled(*this);
     if (operation && shouldCheckDeathImmunity(operation->get().spellId, operation->get().category())) {
         auto creator = operation->get().boundCreator();
@@ -4308,10 +4734,16 @@ bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
     if (!partyDeath) {
         setFaction(Faction::Neutral);
     }
-    finishCombatRound();
+    // Death ends a running round without its end-of-round script; without
+    // one, the creature's round is only finished.
+    if (_game.combat().ownsRound(*this)) {
+        _game.combat().endRound(*this, 0);
+    } else {
+        finishCombatRound();
+    }
     _combatState.active = false;
     _combatState.activationType = CombatActivation::None;
-    setClientCombatMode(false);
+    setPartyCombatMode(false);
     _combatState.expiryHeld = false;
     _combatState.attackTarget.reset();
     _combatState.roundTarget.reset();
@@ -4325,9 +4757,11 @@ bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
                      : randomInt(0, 1) == 1 ? DeathPose::Dead1
                                             : DeathPose::Dead;
     }
-    // The dead stop listening and lose every AI capability.
+    // The dead stop listening, lose every AI capability and put out the
+    // lightsabers in their hands.
     _listening = false;
     _effectAIStateMask = kAIStateNone;
+    setLightsabersPowered(false, true);
     _currentHitPoints = std::min(-11, static_cast<int>(_currentHitPoints));
     if (!partyDeath) {
         if (!_livingName) {
@@ -4350,6 +4784,7 @@ bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
     }
     flushFireForgetQueue();
     _storedLoop.reset();
+    stopOverlayLoop();
     playDieTransition(leftLoopId);
     removeEffectsOnDeath();
     _currentHitPoints = std::min(-11, static_cast<int>(_currentHitPoints));
@@ -4379,7 +4814,7 @@ bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
     // its visual.
     if (partyDeath) {
         _game.queueScriptEvent(*_game.module(), *this, Event(kPlayerDeathEvent));
-    } else if (operation && operation->get().integerParameter(0) != 0 && (_destroyable || !_game.isTSL())) {
+    } else if (spectacular && (_destroyable || !_game.isTSL())) {
         applyEffect(_game.newEffect<VisualEffect>(kSpectacularDeathVisual, false, _services), DurationType::Instant);
         // A spectacular death leaves the creature's encounter at once.
         if (isEncounterCreature()) {
@@ -4389,7 +4824,7 @@ bool Creature::applyDeathEffect(const std::shared_ptr<Object> &damager,
     // Destroyability is tested when the destruction is delivered. A death
     // leaves a destruction an earlier death queued pending.
     if (!partyDeath && !noFadeAway) {
-        _game.postObjectDestruction(*this, _destroyObjectDelay);
+        _game.postObjectDestruction(*this, damager ? damager->id() : script::kObjectInvalid, _destroyObjectDelay);
     }
     return true;
 }
@@ -4450,7 +4885,7 @@ bool Creature::applyResurrectionEffect(int hpPercent) {
     finishCombatRound();
     _combatState.active = false;
     _combatState.activationType = CombatActivation::None;
-    setClientCombatMode(false);
+    setPartyCombatMode(false);
     _combatState.expiryHeld = false;
     _combatState.attackTarget.reset();
     _combatState.roundTarget.reset();
@@ -4548,8 +4983,9 @@ void Creature::clearAllActions(bool force, bool evenUncommandable) {
         return;
     }
     Object::clearAllActions(force, true);
+    _game.combat().discardSwingHits(*this);
     setMovementType(MovementType::None);
-    _useApproach.reset();
+    _useWalk.reset();
     _attemptedMovementTarget.reset();
     resetBlockingCreature();
     // Clearing the actions also ends a push or leap carrying the creature.
@@ -4565,7 +5001,7 @@ void Creature::clearOrdersUnlessBusy() {
 void Creature::teardownActions() {
     Object::teardownActions();
     setMovementType(MovementType::None);
-    _useApproach.reset();
+    _useWalk.reset();
 }
 
 void Creature::playAnimation(AnimationType type, AnimationProperties properties) {
@@ -4590,14 +5026,22 @@ void Creature::playAnimation(const std::string &name, AnimationProperties proper
     if (holdsCutsceneAnimation()) {
         return;
     }
+    // A creature's clip plays on its head along with its body: a looping
+    // pose, a scripted loop and a conversation's cut clip alike.
+    properties.flags |= AnimationFlags::propagate;
     bool fireForget = !(properties.flags & AnimationFlags::loop);
     // A clip the model lacks shows nothing and leaves the current one running.
     auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
     if (model && !model->model().getAnimation(name)) {
         return;
     }
+    // The talk and listen loops go over the loop beneath them, as layers.
+    if (!fireForget && playsAsOverlay(source.id, _game.isTSL())) {
+        playOverlayLoop(name, std::move(properties), source);
+        return;
+    }
 
-    doPlayAnimation(fireForget, [&]() {
+    const bool started = doPlayAnimation(fireForget, [&]() {
         if (!fireForget && !storeLoop(name, properties, false, source)) {
             return;
         }
@@ -4607,6 +5051,11 @@ void Creature::playAnimation(const std::string &name, AnimationProperties proper
         }
         setAnimationSource(source);
     });
+    // A loop chosen while a state-driven refresh is pending is the pose: the
+    // refresh must not put the idle back over it.
+    if (started && !fireForget) {
+        _animDirty = false;
+    }
 }
 
 bool Creature::doPlayAnimation(bool fireForget, const std::function<void()> &callback) {
@@ -4618,7 +5067,9 @@ bool Creature::doPlayAnimation(bool fireForget, const std::function<void()> &cal
     markAnimationChosen();
 
     if (fireForget) {
-        // A clip played directly takes the place of a queued one-shot.
+        // A clip played directly takes the place of a queued one-shot, and
+        // of the talk or listen loop.
+        stopOverlayLoop();
         _oneShot.reset();
         _animFireForget = true;
     } else {
@@ -4649,9 +5100,10 @@ bool Creature::playAnimation(const std::shared_ptr<Animation> &anim, AnimationPr
     });
 }
 
-// A loop the conversation gives plays at once. A one-shot first makes the
-// pause the loop, ends the running one-shot, empties the queue and starts at
-// once; when it ends the creature returns to the pause.
+// A loop the conversation gives becomes the loop, and waits for a running
+// one-shot. A one-shot first makes the pause the loop, ends the running
+// one-shot, empties the queue and starts at once; when it ends the creature
+// returns to the loop.
 bool Creature::playExternalAnimation(const std::shared_ptr<Animation> &anim, AnimationProperties properties,
                                      AnimationSource source) {
     // A world-space animation of an animated cutscene holds the creature.
@@ -4664,8 +5116,12 @@ bool Creature::playExternalAnimation(const std::shared_ptr<Animation> &anim, Ani
         abortFireForgetAnimation();
         flushFireForgetQueue();
     }
-    properties.flags |= AnimationFlags::retargetRoot;
+    // The clip plays on the creature's head too, as any of its clips does.
+    properties.flags |= AnimationFlags::external | AnimationFlags::propagate;
     bool started = doPlayAnimation(fireForget, [&]() {
+        if (!fireForget && !storeLoop(anim->name(), properties, false, source, anim)) {
+            return;
+        }
         auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
         if (model) {
             // The one-shot played again starts over. The ended one is still
@@ -4741,10 +5197,6 @@ void Creature::playFireForgetAnimation(const std::string &clip, AnimationSource 
 
 // A dialog loop plays at once. A dialog one-shot makes the pause the loop
 // first, then waits in the fire-and-forget queue.
-void Creature::playDialogAnimation(AnimationType type, bool looping, AnimationSource source) {
-    playDialogAnimation(getAnimationName(type), looping, source);
-}
-
 void Creature::playDialogAnimation(const std::string &clip, bool looping, AnimationSource source) {
     if (clip.empty()) {
         return;
@@ -4918,7 +5370,9 @@ void Creature::showReadyAnimation() {
     playAnimation(AnimationType::LoopingReady, AnimationProperties(), AnimationSource {kReadyAnimationId});
 }
 
+// The pause or ready pose takes the talk or listen loop away.
 void Creature::refreshPauseAnimation() {
+    stopOverlayLoop();
     _injuredIdle = false;
     _damageFlinchHeld = false;
     _animDirty = true;
@@ -5037,11 +5491,11 @@ bool Creature::showsPauseReadyAnimation() const {
 Creature::ScriptAnimation Creature::getScriptAnimation(int id) const {
     ScriptAnimation result;
     const bool characterModel = _modelType != ModelType::Creature;
-    if (id == kReadyAnimationId) {
+    if (id == kReadyAnimationId || id == kSecondReadyAnimationId) {
         result.clip = getAnimationName(AnimationType::LoopingReady);
         result.loop = true;
     } else {
-        const int row = id < kPauseAnimationId ? id : scriptAnimationRow(id, characterModel);
+        const int row = id < kPauseAnimationId ? id : scriptAnimationRow(id, characterModel, getWieldType());
         if (row >= 0) {
             result.clip = _services.game.animations.getNameById(static_cast<uint32_t>(row));
         }
@@ -5052,7 +5506,7 @@ Creature::ScriptAnimation Creature::getScriptAnimation(int id) const {
         }
         if (result.clip.empty() && id != kNoPauseFallbackAnimationId) {
             result.clip = _services.game.animations.getNameById(
-                static_cast<uint32_t>(scriptAnimationRow(kPauseAnimationId, characterModel)));
+                static_cast<uint32_t>(scriptAnimationRow(kPauseAnimationId, characterModel, getWieldType())));
         }
         result.loop = !isFireForgetCutClip(id) &&
                       (row < 0 || !_services.game.animations.isFireForgetById(static_cast<uint32_t>(row)));
@@ -5069,6 +5523,31 @@ Creature::ScriptAnimation Creature::getScriptAnimation(int id) const {
 }
 
 // A loop plays at once; a one-shot waits in the fire-and-forget queue.
+std::optional<int> Creature::heldScriptLoop() const {
+    const int id = _animationSource.id;
+    if (id < 0 || id == kPauseAnimationId || _animationSource.dialog ||
+        _movementType != MovementType::None) {
+        return std::nullopt;
+    }
+    const auto animation = getScriptAnimation(id);
+    if (animation.clip.empty() || !animation.loop) {
+        return std::nullopt;
+    }
+    return id;
+}
+
+void Creature::resumeSavedScriptLoop() {
+    if (!_savedScriptLoop) {
+        return;
+    }
+    const auto animation = getScriptAnimation(*_savedScriptLoop);
+    _savedScriptLoop.reset();
+    // Only a loop is held; a one-shot has played out.
+    if (animation.loop) {
+        playScriptAnimation(animation, 1.0f);
+    }
+}
+
 void Creature::playScriptAnimation(const ScriptAnimation &animation, float speed) {
     if (animation.clip.empty()) {
         return;
@@ -5081,7 +5560,9 @@ void Creature::playScriptAnimation(const ScriptAnimation &animation, float speed
     AnimationProperties properties;
     properties.speed = speed;
     properties.flags |= AnimationFlags::loop;
-    playAnimation(animation.clip, std::move(properties), animation.source);
+    auto source = animation.source;
+    source.speed = speed;
+    playAnimation(animation.clip, std::move(properties), source);
 }
 
 // A creature idling in its plain pause glances or fidgets now and then: first
@@ -5203,21 +5684,42 @@ void Creature::removeDisguiseAppearance() {
 // she has turned to the dark side, and in any other armour the appearance
 // whose models fit the player's armour.
 static constexpr char kHandmaidenTag[] = "handmaiden";
-static constexpr char kHandmaidenClothingVariation = 'b';
+static constexpr int kHandmaidenClothingVariation = 1;
 static constexpr int kHandmaidenAppearance = 454;
 static constexpr int kHandmaidenDarkAppearance = 669;
 static constexpr int kHandmaidenArmouredAppearance = 638;
 static constexpr int kHandmaidenDarkAlignment = 40;
 // Body variations past L use the L models.
-static constexpr char kLastArmourModelVariation = 'l';
+static constexpr int kLastArmourModelVariation = 11;
+
+// The body variation a worn body item gives, 0 for the first (A); an item
+// with none gives the first.
+static int wornBodyVariation(const Item &item) {
+    return std::max(item.bodyVariation(), 1) - 1;
+}
+
+void Creature::noteBodyLook(int slot, const Item &item) {
+    if (slot == InventorySlots::body && item.isBodyModel()) {
+        _shownTextureVariation = item.textureVariation();
+    }
+}
+
+// A body item of the body model type is drawn with its own look; any other
+// with the first body model and the texture variation shown.
+std::pair<int, int> Creature::bodyLookOf(const Item &body) const {
+    if (body.isBodyModel()) {
+        return {wornBodyVariation(body), body.textureVariation()};
+    }
+    return {0, _shownTextureVariation};
+}
 
 void Creature::updateArmourAppearance(const std::shared_ptr<Item> &armour) {
     if (!_game.isTSL()) {
         return;
     }
-    char variation = 'a';
-    if (armour && !armour->baseBodyVariation().empty()) {
-        variation = std::min(armour->baseBodyVariation().front(), kLastArmourModelVariation);
+    int variation = 0;
+    if (armour) {
+        variation = std::min(wornBodyVariation(*armour), kLastArmourModelVariation);
     }
     if (armour && boost::iequals(_tag, kHandmaidenTag)) {
         if (variation == kHandmaidenClothingVariation) {
@@ -5231,11 +5733,7 @@ void Creature::updateArmourAppearance(const std::shared_ptr<Item> &armour) {
             changeAppearance(kHandmaidenArmouredAppearance);
         }
     }
-    // A variation before A has no model column.
-    if (variation < 'a') {
-        return;
-    }
-    const int appearance = _armourAppearances[variation - 'a'];
+    const int appearance = _armourAppearances[variation];
     if (appearance != 0 && appearance != _appearance) {
         changeAppearance(appearance);
     }
@@ -5330,13 +5828,20 @@ bool Creature::equip(int slot, const std::shared_ptr<Item> &item) {
     if (getEquippedItem(slot) == item) {
         return true;
     }
+    putInSlot(slot, item);
+    return true;
+}
+
+void Creature::putInSlot(int slot, const std::shared_ptr<Item> &item) {
     auto replacementEffects = effectsWithoutEquippedSource(std::nullopt);
     appendEquippedItemEffects(replacementEffects, slot, item);
 
     _equipment[slot] = item;
     item->setEquipped(true);
-    item->setOwner(_id);
+    item->setOwner(*this);
+    noteBodyLook(slot, *item);
     replaceEffectState(std::move(replacementEffects));
+    bringOutHandForConversation(slot);
 
     updateEquipmentPresentation();
     if (_sceneNode && _combatState.active &&
@@ -5344,8 +5849,6 @@ bool Creature::equip(int slot, const std::shared_ptr<Item> &item) {
          slot == InventorySlots::leftWeapon)) {
         setLightsabersPowered(true, true);
     }
-
-    return true;
 }
 
 bool Creature::canReplaceEquipment(
@@ -5398,15 +5901,19 @@ bool Creature::replaceEquipment(
         if (slot == InventorySlots::rightWeapon || slot == InventorySlots::leftWeapon) {
             updatePoweredHands(*previous, false);
         }
-        previous->powerDown(_position, true);
+        previous->powerDown(_position, true, isPresent());
     }
     previous->setEquipped(false);
     previous->clearOwner();
     _equipment[slot] = item;
     item->setEquipped(true);
-    item->setOwner(_id);
+    item->setOwner(*this);
+    // Worn straight over the last, an item keeps or takes the look as an
+    // equip does; nothing was unequipped.
+    noteBodyLook(slot, *item);
     displacedReceiver.addItem(previous);
     replaceEffectState(std::move(replacementEffects));
+    bringOutHandForConversation(slot);
     updateEquipmentPresentation();
     if (previous->itemType() == Item::kStealthUnitItemType && _stealthMode) {
         toggleStealth();
@@ -5430,7 +5937,7 @@ std::shared_ptr<Item> Creature::takeEquippedItem(
         if (equipped->first == InventorySlots::rightWeapon || equipped->first == InventorySlots::leftWeapon) {
             updatePoweredHands(*result, false);
         }
-        result->powerDown(_position, true);
+        result->powerDown(_position, true, isPresent());
     }
     result->setEquipped(false);
     result->clearOwner();
@@ -5446,20 +5953,20 @@ std::shared_ptr<Item> Creature::takeEquippedItem(
     return result;
 }
 
-bool Creature::moveEquippedItemTo(
+std::shared_ptr<Item> Creature::moveEquippedItemTo(
     const std::shared_ptr<Item> &item,
-    Object &receiver) {
+    Object &receiver,
+    ItemStacking stacking) {
     if (!item ||
         (!receiver.isRuntimeLive() && !receiver.isPresentationOnly()) ||
         (isPresentationOnly() != receiver.isPresentationOnly())) {
-        return false;
+        return nullptr;
     }
     auto taken = takeEquippedItem(item);
     if (!taken) {
-        return false;
+        return nullptr;
     }
-    receiver.addItem(taken);
-    return true;
+    return receiver.addItem(taken, stacking);
 }
 
 void Creature::updateEquipmentPresentation() {
@@ -5476,13 +5983,16 @@ void Creature::updateEquipmentPresentation() {
     }
 }
 
-// Only the first sixteen equipment slots leave items in a body bag.
-static constexpr int kBodyBagEquipmentSlots = 16;
+// Only the first fourteen equipment slots leave items in a body bag, sixteen
+// in TSL.
+static constexpr int kBodyBagEquipmentSlots = 14;
+static constexpr int kTslBodyBagEquipmentSlots = 16;
 
 std::vector<std::shared_ptr<Item>> Creature::dropableItems() const {
     std::vector<std::shared_ptr<Item>> result;
+    const int bodyBagSlots = _game.isTSL() ? kTslBodyBagEquipmentSlots : kBodyBagEquipmentSlots;
     for (const auto &[slot, item] : _equipment) {
-        if (slot < kBodyBagEquipmentSlots && item->isDropable()) {
+        if (slot < bodyBagSlots && item->isDropable()) {
             result.push_back(item);
         }
     }
@@ -5495,19 +6005,25 @@ std::vector<std::shared_ptr<Item>> Creature::dropableItems() const {
 }
 
 void Creature::stripHandWeapons() {
-    auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
-    for (const auto *hand : {&g_rightHandNode, &g_leftHandNode}) {
-        if (auto weapon = model->getAttachment(*hand)) {
-            weapon->setEnabled(false);
-        }
-    }
     // Stripped weapons stay away whatever the body shows next.
-    _equipmentHidden = false;
+    _handWeaponsStripped = true;
+    presentHandItems(*std::static_pointer_cast<ModelSceneNode>(_sceneNode));
 }
 
 std::shared_ptr<Item> Creature::getEquippedItem(int slot) const {
     auto equipped = _equipment.find(slot);
     return equipped != _equipment.end() ? equipped->second : nullptr;
+}
+
+std::shared_ptr<Item> Creature::getEquippedItemByTag(const std::string &tag) const {
+    const int slots = _game.isTSL() ? InventorySlots::count : InventorySlots::rightWeapon2;
+    for (int slot = 0; slot < slots; ++slot) {
+        auto item = getEquippedItem(slot);
+        if (item && item->tag() == tag) {
+            return item;
+        }
+    }
+    return nullptr;
 }
 
 void Creature::setFaction(Faction faction) {
@@ -5525,13 +6041,15 @@ void Creature::setMovementType(MovementType type) {
     _movementType = type;
     _animDirty = true;
     // A walk or run ends the running one-shot, though a layer goes on over
-    // it; the queue waits until the creature stands again.
+    // it, and takes the talk or listen loop away; the queue waits until the
+    // creature stands again.
     _oneShot.reset();
     _animFireForget = false;
     _damageFlinchHeld = false;
     _castAnimation.reset();
     if (type != MovementType::None) {
         _injuredPause = _injuredIdle = false;
+        stopOverlayLoop();
     }
 }
 
@@ -5620,10 +6138,12 @@ int Creature::experienceToNextLevel() const {
 
 void Creature::runSpawnScript() {
     // The creation script fires at most once per creature rather than once
-    // per area attachment. A party member carried through an ordinary module
-    // transition is the same creature: the destination area takes it in
-    // without recreating it, and its OnSpawn does not run a second time. The
-    // flag is set whether or not a script was authored.
+    // per area attachment. The player character, and a companion under
+    // control, carried through an ordinary module transition is the same
+    // creature: the destination area takes it in without recreating it, and
+    // its OnSpawn does not run a second time. A companion or puppet made from
+    // its roster record is a new creature and runs it again. The flag is set
+    // whether or not a script was authored.
     if (_spawnScriptFired) {
         return;
     }
@@ -5646,7 +6166,8 @@ void Creature::runSpawnScript() {
     // The heartbeat follows at once, whatever the throttle, and its interval
     // starts over. Outside TSL only a party member or an encounter's creature
     // gets it; any other creature counts as spawned straight after its
-    // creation script, so its first due heartbeat only starts the interval.
+    // creation script, so its first due heartbeat only starts the interval
+    // and its first look around waits a full interval.
     if (_game.isTSL() || isPartyMember() || isEncounterCreature()) {
         _heartbeatThrottle = 0;
         runHeartbeat();
@@ -5654,10 +6175,14 @@ void Creature::runSpawnScript() {
         _stateSupportTimer.reset(_heartbeatInterval / 1000.0f);
     } else {
         startUnstampedHeartbeat();
+        _firstLookWaits = true;
     }
 }
 
 void Creature::runBlockedScript(uint32_t blockingDoorId) {
+    if (_game.party().getLeader().get() == this) {
+        return;
+    }
     // The creature keeps the door until its next blocked event; every run
     // asking for it, this one's continuations included, sees the latest.
     _lastBlockingDoorId = blockingDoorId;
@@ -5665,6 +6190,25 @@ void Creature::runBlockedScript(uint32_t blockingDoorId) {
         return;
     }
     _game.scriptRunner().run(_onBlocked, _id);
+}
+
+void Creature::setFormation(const Object &anchor, int formation, int slot) {
+    auto formations = _services.resource.twoDas.get("formations");
+    if (!formations || formation < 0 || formation >= formations->getRowCount()) {
+        return;
+    }
+    auto angle = formations->getIntOpt(formation, "angle_" + std::to_string(slot));
+    auto distance = formations->getIntOpt(formation, "distance_" + std::to_string(slot));
+    if (!angle || !distance) {
+        return;
+    }
+    const float facing = anchor.getFacing();
+    const float slotAngle = glm::radians(static_cast<float>(*angle)) + facing;
+    const glm::vec3 point = anchor.position() + static_cast<float>(*distance) * glm::vec3(std::cos(slotAngle), std::sin(slotAngle), 0.0f);
+    const glm::vec3 ahead(-std::sin(facing), std::cos(facing), 0.0f);
+    auto move = _game.newAction<MoveToPointAction>(point, true, 0.0f);
+    addAction(move);
+    addAction(_game.newAction<ChangeFacingAction>(point + ahead), actionGroup(*move));
 }
 
 void Creature::refreshCombatDecisionTimer() {
@@ -5734,7 +6278,8 @@ void Creature::setXP(int xp) {
 }
 
 void Creature::playSound(SoundSetEntry entry, bool positional) {
-    if (!_soundSet) {
+    // A creature the player does not perceive is not heard.
+    if (!_soundSet || !isPresent()) {
         return;
     }
     auto maybeSound = _soundSet->find(entry);
@@ -5752,12 +6297,48 @@ void Creature::playSound(SoundSetEntry entry, bool positional) {
     if (_audioSourceVoice) {
         _audioSourceVoice->stop();
     }
+    // The controlled creature speaks as the player; any other as a large
+    // creature from the large size up, and as a medium or small one below it.
+    int group = kPlayerChatSoundGroup;
+    if (_game.party().getLeader().get() != this) {
+        group = _size < CreatureSize::Large ? kCreatureVocalizationSoundGroup : kLargeCreatureVocalizationSoundGroup;
+    }
+    // A vocalization keeps its pitch, and follows the voice volume.
     _audioSourceVoice = _services.audio.mixer.play(
         maybeSound->second,
-        AudioType::Sound,
+        AudioType::Voice,
+        group,
         1.0f,
         false,
-        std::move(position));
+        std::move(position),
+        std::nullopt,
+        0.0f);
+}
+
+void Creature::setPresent(bool present) {
+    if (present == isPresent()) {
+        return;
+    }
+    Object::setPresent(present);
+    if (!present) {
+        stopVoiceAndFootsteps();
+    }
+    for (const auto &[slot, item] : _equipment) {
+        present ? item->startPoweredSound(_position) : item->stopPoweredSound();
+    }
+}
+
+void Creature::stopVoiceAndFootsteps() {
+    if (_audioSourceVoice) {
+        _audioSourceVoice->stop();
+    }
+    if (_audioSourceFootstep) {
+        _audioSourceFootstep->stop();
+    }
+    _audioSourceVoice.reset();
+    _audioSourceFootstep.reset();
+    stopRollingFootstep();
+    stopLoopingSounds();
 }
 
 void Creature::runAttackedScript(uint32_t attackerId) {
@@ -5772,7 +6353,9 @@ void Creature::runAttackedScript(uint32_t attackerId) {
 
 void Creature::runDamagedScript() {
     // HP has already changed, but the death lifecycle may not have run yet.
-    if (_onDamaged.empty() || currentHitPoints() <= 0 ||
+    // A creature acting as the player character runs no damaged script, even
+    // while a companion is controlled in its place.
+    if (_onDamaged.empty() || actsAsPC() || currentHitPoints() <= 0 ||
         _game.party().getLeader().get() == this) {
         return;
     }
@@ -5831,6 +6414,14 @@ void Creature::startTalking(const std::shared_ptr<LipAnimation> &animation) {
     }
 }
 
+void Creature::talkOnce(const std::shared_ptr<LipAnimation> &animation) {
+    _lipAnimation.reset();
+    _talking = false;
+    if (auto model = std::static_pointer_cast<ModelSceneNode>(_sceneNode)) {
+        model->playAnimation(getHeadTalkAnimation(), animation, AnimationProperties::fromFlags(kHeadTalkFlags));
+    }
+}
+
 // The talking head blends out.
 void Creature::stopTalking() {
     if (!_talking && !_lipAnimation) {
@@ -5866,6 +6457,7 @@ void Creature::setObjectSeen(const std::shared_ptr<Object> &object, bool seen) {
     } else {
         _perception.seen.erase(object->id());
     }
+    _perception.reorder(object->id());
 }
 
 void Creature::setObjectHeard(const std::shared_ptr<Object> &object, bool heard) {
@@ -5874,6 +6466,7 @@ void Creature::setObjectHeard(const std::shared_ptr<Object> &object, bool heard)
     } else {
         _perception.heard.erase(object->id());
     }
+    _perception.reorder(object->id());
 }
 
 void Creature::setObjectInvisible(const std::shared_ptr<Object> &object, bool invisible) {
@@ -5882,12 +6475,21 @@ void Creature::setObjectInvisible(const std::shared_ptr<Object> &object, bool in
     } else {
         _perception.invisible.erase(object->id());
     }
+    _perception.reorder(object->id());
+}
+
+void Creature::perceiveAtOnce(const std::shared_ptr<Object> &object) {
+    if (!_perception.has(object->id())) {
+        setObjectSeen(object, true);
+        setObjectHeard(object, true);
+    }
 }
 
 void Creature::forgetPerceived(uint32_t id) {
     _perception.seen.erase(id);
     _perception.heard.erase(id);
     _perception.invisible.erase(id);
+    _perception.reorder(id);
 }
 
 // Each change is its own notice: the perceived creature and exactly one kind
@@ -5910,6 +6512,8 @@ bool Creature::isBlind() const {
            (_visibilityCounterBits & (kDarknessCounter | kUltravisionCounter)) == kDarknessCounter;
 }
 
+// In combat a creature other than the controlled one sees and hears as far as
+// the party combat ranges reach; a range left blank is 0.
 float Creature::spotRange() const {
     if (_combatState.active && _game.party().getLeader().get() != this) {
         return _services.game.spells.range(kCombatPerceptionRangeRow).primary.value_or(0.0f);
@@ -5964,8 +6568,29 @@ void Creature::refreshPerceptionRolls() {
     _perceptionRolls.age = 0.0f;
 }
 
+// A creature counts as still unless it shows one of its moving animations.
+// Under a clip that is only shown it is still unless it walks or runs.
 bool Creature::isStationaryForDetection() const {
-    return _movementType == MovementType::None;
+    if (_animationSource.shownOnly) {
+        return _movementType == MovementType::None;
+    }
+    switch (currentAnimationId()) {
+    case kWalkAnimationId:
+    case kWalkBackAnimationId:
+    case kRunAnimationId:
+    case kTurnInPlaceLeftAnimationId:
+    case kTurnInPlaceRightAnimationId:
+    case kWalkTurnLeftAnimationId:
+    case kWalkTurnRightAnimationId:
+    case kRunTurnLeftAnimationId:
+    case kRunTurnRightAnimationId:
+    case kInjuredWalkAnimationId:
+    case kInjuredRunAnimationId:
+    case kStealthWalkAnimationId:
+        return false;
+    default:
+        return true;
+    }
 }
 
 float Creature::maxAttackRange(const Object &target, bool choreographed, bool enemySearch) const {
@@ -6087,8 +6712,12 @@ bool Creature::detectsBySight(const Creature &target, bool invisible) const {
 // its stealth and move-silently roll, with the area, occlusion, running,
 // combat, stillness, distance and size terms.
 bool Creature::detectsBySound(const Creature &target, bool invisible) const {
+    // A silenced creature makes no sound.
+    if (target.isSilenced()) {
+        return false;
+    }
     auto area = _game.module()->area();
-    const glm::vec3 lift {0.0f, 0.0f, 1.5f};
+    const glm::vec3 lift {0.0f, 0.0f, Object::kEyeHeight};
     const glm::vec3 eye {_position + lift};
     const glm::vec3 targetEye {target._position + lift};
     const glm::vec3 offset {targetEye - eye};
@@ -6103,10 +6732,7 @@ bool Creature::detectsBySound(const Creature &target, bool invisible) const {
     if (distance2 > listen * listen) {
         return false;
     }
-    const auto occlusion = area->soundOcclusion(*this, target, eye, targetEye);
-    if (!occlusion) {
-        return false;
-    }
+    // Sound always gets through, so a creature not hiding is heard.
     if (!target._stealthMode) {
         return true;
     }
@@ -6114,9 +6740,10 @@ bool Creature::detectsBySound(const Creature &target, bool invisible) const {
     if (rank == 0) {
         return true;
     }
+    const int occlusion = area->soundOcclusion(*this, target, eye, targetEye);
 
     const int aware = getSkillRankVersus(SkillType::Awareness, target);
-    int total = *occlusion - (rank + target._perceptionRolls.moveSilently) + aware + _perceptionRolls.listen +
+    int total = occlusion - (rank + target._perceptionRolls.moveSilently) + aware + _perceptionRolls.listen +
                 area->modListenCheck();
     if (_movementType == MovementType::Run) {
         total -= 5;
@@ -6215,6 +6842,7 @@ void Creature::takePerception(Creature &other) {
     _perception.seen = std::move(other._perception.seen);
     _perception.heard = std::move(other._perception.heard);
     _perception.invisible = std::move(other._perception.invisible);
+    _perception.order = std::move(other._perception.order);
     other._perception.clear();
     forgetPerceived(_id);
     if (auto previous = _game.getObjectById(other.id())) {
@@ -6307,10 +6935,10 @@ void Creature::setCombatState(bool active, CombatActivation activationType, bool
         }
     }
 
-    // Entering combat state does not enter client combat mode; that follows
+    // Entering combat state does not enter party combat mode; that follows
     // the member's own attempted target. A direct exit still leaves it.
     if (!active && activationType == CombatActivation::Direct) {
-        setClientCombatMode(false);
+        setPartyCombatMode(false);
     }
     // Only a change of combat state powers the hand items on or off; leaving
     // it again puts out only the blades a weapon draw lit.
@@ -6422,7 +7050,7 @@ void Creature::powerSlotItem(int slot, bool powered, bool animate) {
     }
     weapon->playAnimation(animate ? (powered ? "powerup" : "powerdown") : (powered ? "powered" : "off"));
     if (item) {
-        powered ? item->powerUp(_position, animate) : item->powerDown(_position, animate);
+        powered ? item->powerUp(_position, animate, isPresent()) : item->powerDown(_position, animate, isPresent());
     }
 }
 
@@ -6511,6 +7139,12 @@ AttackResultType Creature::currentCombatAttackResult() const {
     return action ? action->combatAction().currentCombatAttackResult() : AttackResultType::Invalid;
 }
 
+bool Creature::isCurrentAttackRanged() const {
+    const auto action = _currentCombatAction.lock();
+    const auto attacks = action ? action->combatAction().combatAttacks() : std::nullopt;
+    return attacks && attacks->get().recordRanged();
+}
+
 void Creature::beginCombatAttack(Object &targetObject, FeatType feat) {
     _roundActionKind = kAttackRoundAction;
     interruptActivities();
@@ -6525,6 +7159,28 @@ void Creature::setAttemptedAttackTarget(uint32_t target) {
 
 void Creature::setOrderedAttackTarget(uint32_t target) {
     _combatState.orderedAttackTarget = _game.getObjectById(target);
+}
+
+void Creature::forgetFallenCombatTargets() {
+    // A target that is gone or dead is forgotten: a dead creature, or a door or
+    // container that is not plot at no hit points.
+    const auto fallen = [](const std::shared_ptr<Object> &object) {
+        return !object || object->isDead();
+    };
+    if (fallen(_combatState.attackTarget.resolve())) {
+        _combatState.attackTarget.reset();
+    }
+    if (fallen(_combatState.attemptedAttackTarget.resolve())) {
+        _combatState.attemptedAttackTarget.reset();
+    }
+    auto &spellContext = spellScriptContext();
+    if (fallen(spellContext.activeTarget())) {
+        spellContext.clearActiveTarget();
+    }
+    if (fallen(_combatState.attemptedSpellTarget.resolve())) {
+        _combatState.attemptedSpellTarget.reset();
+    }
+    releaseRoundAttackers();
 }
 
 void Creature::recordQueuedAttack(Object &target) {
@@ -6546,9 +7202,9 @@ void Creature::recordQueuedAttack(Object &target) {
     if (!_combatState.attemptedAttackTarget.resolve()) {
         setAttemptedAttackTarget(target.id());
     }
-    // A plot door or placeable told it is attacked fails to open for the
-    // attacker.
-    if ((isa<Door>(&target) || isa<Placeable>(&target)) && target.plotFlag()) {
+    // A plot door, or in TSL a plot placeable, fails to open for the attacker
+    // when told it is attacked.
+    if ((isa<Door>(&target) || (_game.isTSL() && isa<Placeable>(&target))) && target.plotFlag()) {
         signalFailToOpen(target, *this);
     }
 }
@@ -6565,17 +7221,16 @@ uint32_t Creature::getFirstAttacker() {
             return creature && creature->getAttackTarget().get() == this; }, [](const auto &object) { return object->id(); });
 }
 
-void Creature::setClientCombatMode(bool active) {
-    _clientCombatMode = active;
-    _game.syncClientCombatMode();
+void Creature::setPartyCombatMode(bool active) {
+    _partyCombatMode = active;
+    _game.syncPartyCombatMode();
 }
 
 void Creature::removeCombatInvisibilityEffects() {
     std::vector<EffectId> packages;
     for (const auto &effect : effects()) {
-        if ((effect.type() == EffectType::Invisibility &&
-             effect.integerParameter(0) == static_cast<int>(InvisibilityType::Normal)) ||
-            effect.type() == EffectType::Sanctuary) {
+        if (effect.type() == EffectType::Invisibility &&
+            effect.integerParameter(0) == static_cast<int>(InvisibilityType::Normal)) {
             if (std::find(packages.begin(), packages.end(), effect.id) == packages.end()) {
                 packages.push_back(effect.id);
             }
@@ -6606,6 +7261,30 @@ void Creature::removeMindTrickEffects() {
         }
         const EffectId id = effect.id;
         removeEffectsById(id);
+    }
+}
+
+void Creature::disturbCast(int damage) {
+    const auto current = getCurrentAction();
+    const auto *cast = current ? dyn_cast<CastSpellAction>(&current->combatAction()) : nullptr;
+    if (!cast || !cast->breaksConcentration(*this, damage)) {
+        return;
+    }
+    debug(str(boost::format("Concentration lost: actor=%u spell=%d") % id() % static_cast<int>(cast->spell()->type)), LogChannel::Combat);
+    // The cast ends where it stands, unless it can no longer be cleared, and
+    // leaves the queue as a finished action does.
+    if (current->isClearable()) {
+        current->cancel(current, *this);
+        current->markCancelled();
+        releaseOrientationLock();
+    }
+    playDamageFlinch();
+    // A special ability of no explicit level is used up; a power costs its
+    // Force points.
+    if (spellCastContext().castingClass == kSpellLikeAbilityClass) {
+        consumeSpellLikeAbility(cast->spell()->type, kUnspecifiedCasterLevel);
+    } else {
+        paySpellForcePointCost(*cast->spell());
     }
 }
 
@@ -6645,7 +7324,7 @@ void Creature::broadcastCombatState(uint32_t opponentId) {
         if (!member->isRuntimeLive() || member.get() == this || member->faction() != faction()) {
             continue;
         }
-        const float range = isPartyMember() ? 30.0f : member->perception().sightRange;
+        const float range = isPartyMember() ? 30.0f : member->spotRange();
         if (!alwaysInRange && getSquareDistanceTo(*member) > range * range) {
             continue;
         }
@@ -6747,17 +7426,17 @@ void Creature::receiveSpellCastAt(uint32_t casterId, int spell, int harmful) {
     setExcitedState(1);
 }
 
-bool Creature::updateClientCombatMode(std::optional<std::reference_wrapper<const Object>> storedTarget, bool holdDeadTarget) {
+bool Creature::updatePartyCombatMode(const Creature *storedCreature, const Object *carriedObject, bool holdDeadTarget) {
     if (!isPartyMember()) {
         return false;
     }
     const auto attack = _combatState.attemptedAttackTarget.resolve();
     const auto spell = _combatState.attemptedSpellTarget.resolve();
     const bool attacking = attack && !attack->isDead();
-    if (!_clientCombatMode) {
+    if (!_partyCombatMode) {
         const bool casting = spell && spell.get() != this && spell != attack && !spell->isDead();
         if (attacking || casting) {
-            setClientCombatMode(true);
+            setPartyCombatMode(true);
         }
         return false;
     }
@@ -6768,17 +7447,16 @@ bool Creature::updateClientCombatMode(std::optional<std::reference_wrapper<const
     if (holdDeadTarget) {
         return false;
     }
-    if (storedTarget) {
-        // A hostile stored target keeps the mode even once it is dead, as does
-        // a locked door or placeable.
-        const auto &target = storedTarget->get();
-        if (auto creature = asCreature(target); creature && isHostile(creature->get())) {
+    // A hostile stored creature keeps the mode even once it is dead, as does a
+    // locked door or placeable carried to this member.
+    if (storedCreature && isHostile(*storedCreature)) {
+        return false;
+    }
+    if (carriedObject) {
+        if (auto *door = dyn_cast<Door>(carriedObject); door && door->isLocked()) {
             return false;
         }
-        if (auto *door = dyn_cast<Door>(&target); door && door->isLocked()) {
-            return false;
-        }
-        if (auto *placeable = dyn_cast<Placeable>(&target); placeable && placeable->isLocked()) {
+        if (auto *placeable = dyn_cast<Placeable>(carriedObject); placeable && placeable->isLocked()) {
             return false;
         }
     }
@@ -6795,7 +7473,7 @@ bool Creature::updateClientCombatMode(std::optional<std::reference_wrapper<const
             return false;
         }
     }
-    setClientCombatMode(false);
+    setPartyCombatMode(false);
     return true;
 }
 
@@ -6808,7 +7486,7 @@ void Creature::cancelCombat(int runEndRound) {
     _game.combat().endRound(*this, runEndRound);
     _combatState.attackTarget.reset();
     _combatState.roundTarget.reset();
-    setClientCombatMode(false);
+    setPartyCombatMode(false);
 }
 
 // The farthest an object can be seen in an area.
@@ -6858,11 +7536,19 @@ void Creature::refreshBodyFuel() {
 }
 
 void Creature::finishCombatRound() {
+    releaseRoundAttackers();
+    recordCombatRound();
+}
+
+void Creature::releaseRoundAttackers() {
     const auto incoming = _incomingAttacker.boundObject();
     if (!incoming || incoming->isDead()) {
         _incomingAttacker = SavedObjectReference {};
     }
     _attackerList.clear();
+}
+
+void Creature::recordCombatRound() {
     if (auto target = _combatState.attackTarget.resolve()) {
         _lastHostileTarget = target;
     } else {
@@ -6918,7 +7604,6 @@ Alignment Creature::alignment() const {
 
 namespace {
 
-constexpr int kMaxGoodEvil = 100;
 constexpr char kPlayerAlignmentGlobal[] = "G_PC_Align_Val";
 
 // Mastery of a side of the Force strengthens influence by the level held in
@@ -6952,12 +7637,12 @@ int influenceAlignment(int base, int influence, int charismaBonus, float factor,
     const float push = static_cast<float>(playerAlignment - 50) / 50.0f * pull;
     const float value = push <= 0.0f
                             ? static_cast<float>(base) * (1.0f + push)
-                            : static_cast<float>(base) + static_cast<float>(100 - base) * push;
-    if (value > 100.0f) {
-        return 100;
+                            : static_cast<float>(base) + static_cast<float>(kMaxGoodEvil - base) * push;
+    if (value > static_cast<float>(kMaxGoodEvil)) {
+        return kMaxGoodEvil;
     }
-    if (value < 0.0f) {
-        return 0;
+    if (value < static_cast<float>(kMinGoodEvil)) {
+        return kMinGoodEvil;
     }
     return static_cast<int>(value);
 }
@@ -6966,7 +7651,7 @@ int influenceAlignment(int base, int influence, int charismaBonus, float factor,
 
 void Creature::modifyAlignment(int shift, bool dontModifyNPCs) {
     const auto clampGoodEvil = [](int value) {
-        return std::clamp(value, 0, kMaxGoodEvil);
+        return std::clamp(value, kMinGoodEvil, kMaxGoodEvil);
     };
     const auto shifted = [&]() {
         return clampGoodEvil(_goodEvil + shift);
@@ -6997,7 +7682,7 @@ void Creature::updatePureGoodEvilPowers() {
     if (_goodEvil == kMaxGoodEvil) {
         removePureAlignmentPowers(false);
         addPureAlignmentPowers(true);
-    } else if (_goodEvil == 0) {
+    } else if (_goodEvil == kMinGoodEvil) {
         removePureAlignmentPowers(true);
         addPureAlignmentPowers(false);
     } else {
@@ -7033,7 +7718,7 @@ void Creature::recomputeInfluenceAlignment() {
     }
     // Kreia's alignment is her own, whatever her influence.
     if (boost::iequals(_tag, "kreia")) {
-        _goodEvil = std::clamp(_baseCNPCAlignment, 0, kMaxGoodEvil);
+        _goodEvil = std::clamp(_baseCNPCAlignment, kMinGoodEvil, kMaxGoodEvil);
         return;
     }
     // Influence belongs to a companion's roster slot, and its base to the
@@ -7127,7 +7812,7 @@ bool Creature::hasEffectImmunity(
 }
 
 int Creature::getAbilityEffectModifier(Ability ability) const {
-    AbilityEffectReducer reducer(_game.isTSL());
+    auto reducer = EffectBonusReducer::forAbility(_game.isTSL());
     for (const EffectInstance &effect : effects()) {
         if (!effect.hasLiveRuntimeSource() ||
             effect.integerParameter(0, -1) != static_cast<int>(ability))
@@ -7143,6 +7828,10 @@ int Creature::getAbilityEffectModifier(Ability ability) const {
 
 const Race &Creature::race() const {
     return _services.game.races.get(_race);
+}
+
+bool Creature::hasPlayerRace() const {
+    return race().playerRace;
 }
 
 void Creature::setRacialType(RacialType race) {
@@ -7162,6 +7851,24 @@ int Creature::getEffectiveAbilityScore(Ability ability) const {
 
 int Creature::getEffectiveAbilityModifier(Ability ability) const {
     return getAbilityModifierFromScore(getEffectiveAbilityScore(ability));
+}
+
+int Creature::getDexterityModifier(bool armourCapped) const {
+    const int modifier = getEffectiveAbilityModifier(Ability::Dexterity);
+    if (isDebilitated(true)) {
+        return std::min(modifier, 0);
+    }
+    if (!armourCapped) {
+        return modifier;
+    }
+    // Only armour drawn as the body model with an armour class limits Dexterity.
+    auto armor = getEquippedItem(InventorySlots::body);
+    if (!armor || armor->bodyArmorClass() <= 0) {
+        return modifier;
+    }
+    const int cap = getEffectiveArmorMaxDexterityBonus(_game.isTSL(), armor->maxDexterityBonus(),
+                                                       armor->maxDexterityBonusAdjustment());
+    return cap >= 0 ? std::min(modifier, cap) : modifier;
 }
 
 // A live bonus feat effect gives the creature its feat.
@@ -7312,7 +8019,8 @@ void Creature::appendEquippedItemEffects(
                     static_cast<SkillType>(property.subtype), property.costValue));
             break;
         case ItemProperty::DecreasedSkillModifier: {
-            const int amount = getCostTableValue(_services, kDecreaseCostTable, property.costValue, CostColumn::Value, 0);
+            const int amount = costCell(_services.game.combatTables.costTableAt(kDecreasedSkillCostTable),
+                                        property.costValue, CostColumn::Value, 0);
             if (amount != 0)
                 append(_game.newEffect<SkillDecreaseEffect>(
                     static_cast<SkillType>(property.subtype), -amount));
@@ -7547,12 +8255,13 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
     std::optional<std::reference_wrapper<const Creature>> target,
     const std::shared_ptr<Item> &weapon,
     bool offHand,
-    std::optional<AttackBonus> handType) const {
+    std::optional<AttackBonus> handType,
+    const std::shared_ptr<Item> &unarmedGloves) const {
 
     AttackBonusBreakdown result;
 
     int strengthModifier = getEffectiveAbilityModifier(Ability::Strength);
-    int dexterityModifier = getEffectiveAbilityModifier(Ability::Dexterity);
+    int dexterityModifier = getDexterityModifier(false);
 
     if (weapon && weapon->isRanged()) {
         result.dexterityModifier = dexterityModifier;
@@ -7582,7 +8291,8 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
                                                                                            : AttackBonus::Unarmed;
     int modifierBonus = 0;
     int modifierPenalty = 0;
-    EffectModifierReducer miscModifierReducer;
+    EffectSourceSlots miscIncreases {getEffectSourceCapacity(_game.isTSL())};
+    EffectSourceSlots miscDecreases {getEffectSourceCapacity(_game.isTSL())};
 
     for (const auto &applied : effects()) {
         if (!applied.hasLiveRuntimeSource()) {
@@ -7599,10 +8309,7 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
             if (bonus > 0 &&
                 attackModifierApplies(modifierType, attackType)) {
                 if (modifierType == AttackBonus::Misc) {
-                    miscModifierReducer.addIncrease(
-                        getEffectSourceKey(applied),
-                        static_cast<int>(AttackBonus::Misc),
-                        bonus);
+                    miscIncreases.add(getEffectSpellKey(applied), bonus);
                 } else {
                     modifierBonus += bonus;
                 }
@@ -7614,10 +8321,7 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
             if (penalty > 0 &&
                 attackModifierApplies(modifierType, attackType)) {
                 if (modifierType == AttackBonus::Misc) {
-                    miscModifierReducer.addDecrease(
-                        getEffectSourceKey(applied),
-                        static_cast<int>(AttackBonus::Misc),
-                        penalty);
+                    miscDecreases.add(getEffectSpellKey(applied), penalty);
                 } else {
                     modifierPenalty += penalty;
                 }
@@ -7634,8 +8338,6 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
             continue;
         }
 
-        int itemBonus = 0;
-        int itemPenalty = 0;
         for (const auto &property : item->properties()) {
             if (!item->isPropertyActive(property)) {
                 continue;
@@ -7689,25 +8391,24 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
             if (isHandSpecificAttackModifierSlot(slot)) {
                 addAttackModifier(modifier, modifierBonus, modifierPenalty);
             } else if (modifier > 0) {
-                itemBonus = std::max(itemBonus, modifier);
+                // Each property counts as a source of its own.
+                miscIncreases.add({}, modifier);
             } else {
-                itemPenalty = std::max(itemPenalty, -modifier);
+                miscDecreases.add({}, -modifier);
             }
         }
-        EffectSourceKey source {EffectSourceKind::Item, item->runtimeIncarnation()};
-        miscModifierReducer.addIncrease(source, static_cast<int>(AttackBonus::Misc), itemBonus);
-        miscModifierReducer.addDecrease(source, static_cast<int>(AttackBonus::Misc), itemPenalty);
     }
 
     int attackEffectCap = getAttackEffectModifierCap(_game.isTSL());
-    modifierBonus += miscModifierReducer.totalIncrease(attackEffectCap);
-    modifierPenalty += miscModifierReducer.totalDecrease(attackEffectCap);
+    modifierBonus += miscIncreases.total();
+    modifierPenalty += miscDecreases.total();
     result.effectBonus = std::min(modifierBonus, attackEffectCap) -
                          std::min(modifierPenalty, attackEffectCap);
 
-    if (weapon &&
-        weapon->weaponFocusFeat() != FeatType::Invalid &&
-        hasEffectiveFeat(weapon->weaponFocusFeat())) {
+    const auto &focusItem = weapon ? weapon : unarmedGloves;
+    if (focusItem &&
+        focusItem->weaponFocusFeat() != FeatType::Invalid &&
+        hasEffectiveFeat(focusItem->weaponFocusFeat())) {
         result.weaponFocusBonus = 1;
     }
 
@@ -7766,9 +8467,13 @@ AttackBonusBreakdown Creature::getAttackBonusBreakdown(
             result.meleeOnRangedBonus);
     }
 
-    const auto twoWeapon = getTwoWeaponAttackPenalty(weapon, offHand);
-    result.smallOffhandBonus = twoWeapon.smallOffhandBonus;
-    result.dualWieldPenalty = -twoWeapon.penalty - result.smallOffhandBonus;
+    // Only an on-hand or off-hand attack takes the two-weapon terms; an extra
+    // attack takes none.
+    if (attackType == AttackBonus::Onhand || attackType == AttackBonus::Offhand) {
+        const auto twoWeapon = getTwoWeaponAttackPenalty(weapon, offHand);
+        result.smallOffhandBonus = twoWeapon.smallOffhandBonus;
+        result.dualWieldPenalty = -twoWeapon.penalty - result.smallOffhandBonus;
+    }
 
     if (!offHand) {
         result.duelingBonus = getDuelingBonus();
@@ -7928,7 +8633,6 @@ AttackResultType Creature::resolveRangedDefense(const Creature &shooter, int dam
         }
     }
     record.baseAttackBonus = getAttackBonusBreakdown(std::nullopt, weapon, false).baseAttackBonus;
-    record.dexterity = getEffectiveAbilityModifier(Ability::Dexterity);
     record.effects = 0;
     for (const auto &effect : effects()) {
         // The deflection amount is the effect's second integer. KotOR adds a
@@ -7939,7 +8643,7 @@ AttackResultType Creature::resolveRangedDefense(const Creature &shooter, int dam
             record.effects += _game.isTSL() ? -effect.integerParameter(1) : effect.integerParameter(1);
         }
     }
-    const int total = record.roll + bonuses + record.baseAttackBonus + record.dexterity + record.effects;
+    const int total = record.roll + bonuses + record.baseAttackBonus + record.effects;
     record.total = total;
     record.attackTotal = attackTotal;
     if (total < attackTotal) {
@@ -7994,7 +8698,7 @@ AttackBonusBreakdown Creature::getHandAttackBonusBreakdown(
         AttackBonusBreakdown result = getAttackBonusBreakdown(std::nullopt, weapon, offHand, handType);
         // A ranged attack always uses Dexterity, and targeting needs no weapon.
         result.strengthModifier = 0;
-        result.dexterityModifier = getEffectiveAbilityModifier(Ability::Dexterity);
+        result.dexterityModifier = getDexterityModifier(false);
         result.targetingBonus = getTargetingAttackBonus(
             _game.isTSL(),
             true,
@@ -8068,26 +8772,8 @@ void Creature::updateArmorClassEffectCursor() {
     _armorClassCursor.update(effects().size(), [&](size_t i) { return effects()[i].serializedType; });
 }
 
-int Creature::defenseDexterityModifier() const {
-    int dexterityModifier = getEffectiveAbilityModifier(Ability::Dexterity);
-    auto armor = getEquippedItem(InventorySlots::body);
-    int armorMaxDexterityBonus = armor
-                                     ? getEffectiveArmorMaxDexterityBonus(_game.isTSL(), armor->maxDexterityBonus(),
-                                                                          armor->maxDexterityBonusAdjustment())
-                                     : -1;
-    // Only armour drawn as the body model with an armour class limits Dexterity.
-    if (isDebilitated(true)) {
-        dexterityModifier = std::min(dexterityModifier, 0);
-    } else if (armor && armor->bodyArmorClass() > 0 && armorMaxDexterityBonus >= 0) {
-        dexterityModifier = std::min(
-            dexterityModifier,
-            armorMaxDexterityBonus);
-    }
-    return dexterityModifier;
-}
-
 DefenseBreakdown Creature::getDefenseBreakdown(std::optional<std::reference_wrapper<const Creature>> attacker, int damageFlags, bool touch) const {
-    int dexterityModifier = defenseDexterityModifier();
+    int dexterityModifier = getDexterityModifier(true);
     auto armor = getEquippedItem(InventorySlots::body);
     int armorDefense = armor ? armor->baseDefense() : 0;
 
@@ -8133,13 +8819,9 @@ DefenseBreakdown Creature::getDefenseBreakdown(std::optional<std::reference_wrap
     breakdown.natural = ac.natural;
     breakdown.dodgeAndDeflection = ac.shield + ac.dodgeAndDeflection;
     breakdown.feat = getDuelingBonus();
-    // Total Defense, the lightsaber form and Battle Precognition answer an
-    // attacker; the general Defense has none of them.
+    // The lightsaber form and Battle Precognition answer an attacker; the
+    // general Defense has neither.
     if (attacker) {
-        breakdown.stance = getTotalDefenseBonus(
-            _game.isTSL(),
-            isInTotalDefense(),
-            getHighestTotalDefenseClassLevel(_attributes));
         const bool attackerIsCombatTarget =
             _combatState.attemptedAttackTarget.resolve().get() == &attacker->get() ||
             _combatState.attackTarget.resolve().get() == &attacker->get();
@@ -8161,7 +8843,7 @@ DefenseBreakdown Creature::getDefenseBreakdown(std::optional<std::reference_wrap
     breakdown.debilitationPenalty = isDebilitated(true) ? -4 : 0;
     breakdown.total = 10 + breakdown.armor + breakdown.dexterity +
                       breakdown.classDefense + breakdown.natural + breakdown.dodgeAndDeflection +
-                      breakdown.feat + breakdown.stance + breakdown.form + breakdown.debilitationPenalty;
+                      breakdown.feat + breakdown.form + breakdown.debilitationPenalty;
     return breakdown;
 }
 
@@ -8202,7 +8884,8 @@ int Creature::getSavingThrowEffectBonus(
     const int save = static_cast<int>(savingThrow);
 
     const auto versusCreature = versus ? asCreature(versus->get()) : std::nullopt;
-    EffectModifierReducer modifierReducer;
+    EffectSourceSlots increases {getEffectSourceCapacity(_game.isTSL())};
+    EffectSourceSlots decreases {getEffectSourceCapacity(_game.isTSL())};
     for (const EffectInstance &applied : effects()) {
         if (!applied.hasLiveRuntimeSource() || !applied.appliesVersus(versusCreature)) {
             continue;
@@ -8217,10 +8900,13 @@ int Creature::getSavingThrowEffectBonus(
         }
         auto source = getEffectSourceKey(applied);
         int value = applied.integerParameter(0);
+        if (value <= 0) {
+            continue;
+        }
         if (applied.type() == EffectType::SavingThrowIncrease) {
-            modifierReducer.addIncrease(source, 0, value);
+            increases.add(source, value);
         } else {
-            modifierReducer.addDecrease(source, 0, value);
+            decreases.add(source, value);
         }
     }
 
@@ -8252,20 +8938,22 @@ int Creature::getSavingThrowEffectBonus(
                 propertyType == ItemProperty::ImprovedSavingThrowSpecific) {
                 const int value = costCell(_services.game.combatTables.costTableAt(kImprovedSavingThrowCostTable),
                                            property.costValue, CostColumn::Value, 0);
-                modifierReducer.addIncrease(source, 0, value);
+                if (value > 0) {
+                    increases.add(source, value);
+                }
             } else {
                 // The cost table holds the decrease as a negative value.
                 const int value = getCostTableValue(_services, kDecreaseCostTable, property.costValue, CostColumn::Value, 0);
-                modifierReducer.addDecrease(source, 0, -value);
+                if (value < 0) {
+                    decreases.add(source, -value);
+                }
             }
         }
     }
 
     const int survival = getSurvivalSavingThrowBonus(
         _game.isTSL(), hasEffectiveFeat(FeatType::Survival), currentHitPoints(), maxHitPoints());
-    const int cap = _game.isTSL() ? 60 : 20;
-    return getSavingThrowEffectTotal(_game.isTSL(),
-                                     modifierReducer.totalIncrease(cap), modifierReducer.totalDecrease(cap), survival);
+    return getSavingThrowEffectTotal(_game.isTSL(), increases.total(), decreases.total(), survival);
 }
 
 int Creature::getSavingThrowBase(SavingThrow savingThrow) const {
@@ -8279,7 +8967,7 @@ int Creature::getSavingThrowBase(SavingThrow savingThrow) const {
         baseBonus = _fortBonus;
         break;
     case kReflexSavingThrow:
-        abilityModifier = getEffectiveAbilityModifier(Ability::Dexterity);
+        abilityModifier = getDexterityModifier(false);
         baseBonus = _refBonus;
         break;
     case kWillSavingThrow:
@@ -8359,7 +9047,8 @@ SavingThrowResult Creature::getSavingThrowResult(
 
 PhysicalDamageBonus Creature::getPhysicalDamageBonus(
     const std::shared_ptr<Item> &weapon,
-    bool offHand) const {
+    bool offHand,
+    const std::shared_ptr<Item> &unarmedGloves) const {
 
     int strengthModifier = getEffectiveAbilityModifier(Ability::Strength);
     int abilityModifier = strengthModifier;
@@ -8388,13 +9077,14 @@ PhysicalDamageBonus Creature::getPhysicalDamageBonus(
     }
 
     int specialization = 0;
-    if (weapon &&
-        weapon->weaponSpecializationFeat() != FeatType::Invalid &&
-        hasEffectiveFeat(weapon->weaponSpecializationFeat())) {
+    const auto &specializationItem = weapon ? weapon : unarmedGloves;
+    if (specializationItem &&
+        specializationItem->weaponSpecializationFeat() != FeatType::Invalid &&
+        hasEffectiveFeat(specializationItem->weaponSpecializationFeat())) {
         specialization = 2;
     }
 
-    PhysicalDamageBonus result {abilityModifier, strengthModifier, specialization};
+    PhysicalDamageBonus result {abilityModifier, specialization};
     if (_game.isTSL() && _furyDamageBonus > 0) {
         result.furyDamage = _furyDamageBonus;
     }
@@ -8446,11 +9136,16 @@ int Creature::getMassiveCriticalDamage(
         return 0;
     }
 
-    // KotOR takes the first Massive Criticals property; TSL adds them all.
+    // KotOR counts one Massive Criticals property; TSL counts them all once
+    // one is in force.
+    const bool tsl = _game.isTSL();
+    if (tsl && !sourceItem->hasActiveProperty(ItemProperty::MassiveCriticals)) {
+        return 0;
+    }
     int damage = 0;
     for (const auto &property : sourceItem->properties()) {
-        if (!sourceItem->isPropertyActive(property) ||
-            property.type() != ItemProperty::MassiveCriticals) {
+        if (property.type() != ItemProperty::MassiveCriticals ||
+            (!tsl && !sourceItem->isPropertyActive(property))) {
             continue;
         }
 
@@ -8459,14 +9154,14 @@ int Creature::getMassiveCriticalDamage(
         const auto cost = _services.game.combatTables.damageCost(property.costValue);
         const int numDice = cost.numDice;
         DamageModifier modifier {property.costValue, numDice, 0, property.costValue,
-                                 weapon ? getPrimaryDamageType(sourceItem->damageFlags()) : DamageType::Bludgeoning};
+                                 getPrimaryDamageType(sourceItem->damageFlags())};
         modifier.usesDice = numDice != 0;
         if (modifier.usesDice) {
             modifier.flat = 0;
             modifier.die = cost.die;
         }
         damage += rollDamageModifier(modifier, 1);
-        if (!_game.isTSL()) {
+        if (!tsl) {
             break;
         }
     }
@@ -8818,9 +9513,13 @@ void Creature::onEventSignalled(const std::string &name) {
         playSwingSound("parry", 2);
         return;
     }
+    // A draw lights the lightsabers it brings out. Outside combat they go out
+    // again eight seconds later, unless a conversation is running: a weapon
+    // brought out during one stays lit until combat comes and goes, a script
+    // puts it out, or its holder dies.
     if (name == "draw_weapon") {
         setLightsabersPowered(true, true);
-        if (!_combatState.active) {
+        if (!_combatState.active && !_game.isConversationActive()) {
             _lightsaberIdlePowerDownPending = true;
             _lightsaberIdlePowerDownTimer.reset(8.0f);
         }
@@ -8838,47 +9537,211 @@ void Creature::onEventSignalled(const std::string &name) {
     if (!area) {
         return;
     }
+    // A rolling footstep type plays its loop in place of steps.
+    auto ownSounds = _services.game.footstepSounds.get(_footstepType);
+    if (ownSounds && !rollingFootstepSound(*ownSounds).empty()) {
+        return;
+    }
     // A stealthed creature steps softly.
-    std::shared_ptr<FootstepTypeSounds> sounds(_services.game.footstepSounds.get(_stealthMode ? 0 : _footstepType));
+    const int footstepType = _stealthMode ? 0 : _footstepType;
+    std::shared_ptr<FootstepTypeSounds> sounds(_services.game.footstepSounds.get(footstepType));
     if (!sounds) {
         return;
     }
     // A step sounds one of three variants of the sound of the surface under
     // the creature, named by the surface; a surface without a name is silent.
-    const Surface &surface = _services.game.surfaces.getSurface(area->get().getSurfaceMaterial(_position));
+    const int material = area->get().getSurfaceMaterial(_position);
+    const Surface &surface = _services.game.surfaces.getSurface(material);
     if (surface.name.empty()) {
         return;
     }
     const auto cell = sounds->cells.find(boost::to_lower_copy(surface.name) + std::to_string(randomInt(0, 2)));
     auto clip = cell != sounds->cells.end() ? _services.resource.audioClips.get(cell->second) : nullptr;
     // TSL's Dampen Sound silences a stealthed creature's steps.
-    if (clip && _stealthMode && hasSilentMove()) {
-        return;
-    }
-    if (clip) {
+    if (clip && !(_stealthMode && hasSilentMove())) {
+        // The step's pitch strays at random by the footstep type's offset, or
+        // by its group's variance when the type has none.
+        std::optional<float> pitchVariance;
+        if (sounds->pitchOffset != 0.0f) {
+            pitchVariance = sounds->pitchOffset;
+        }
         _audioSourceFootstep = _services.audio.mixer.play(
             std::move(clip),
             AudioType::Sound,
+            footstepSoundGroup(),
             1.0f,
             false,
-            _position);
-        // The step's pitch strays at random by the footstep type's offset: on
-        // one step in two up by as much, on the other down by half as much.
-        const float variance = std::clamp(sounds->pitchOffset, 0.0f, 1.0f);
-        if (_audioSourceFootstep && variance > 0.0f) {
-            const bool up = randomInt(0, 1) == 1;
-            const float stray = randomFloat(0.0f, variance);
-            _audioSourceFootstep->setPitch(up ? 1.0f + stray : 1.0f - 0.5f * stray);
+            _position,
+            std::nullopt,
+            pitchVariance);
+    }
+    // The controlled creature's steps on wood, but for wings, creak one time
+    // in twenty.
+    const bool wings = footstepType == kWingsFootstepType || footstepType == kHugeWingsFootstepType;
+    if (material == kWoodSurfaceMaterial && !wings && _game.party().getLeader().get() == this &&
+        randomInt(0, 99) < kFloorCreakPercent) {
+        if (auto creak = _services.resource.audioClips.get(kFloorCreakResRef + std::to_string(randomInt(1, 3)))) {
+            _services.audio.mixer.play(std::move(creak), AudioType::Sound, kPlayerFootstepSoundGroup, 1.0f, false, _position);
         }
     }
 }
 
-void Creature::giveGold(int amount) {
-    _gold += amount;
+// The controlled creature steps as the player; any other as a medium or small
+// creature when tiny, small or medium, and as a large one otherwise.
+int Creature::footstepSoundGroup() const {
+    if (_game.party().getLeader().get() == this) {
+        return kPlayerFootstepSoundGroup;
+    }
+    return _size >= CreatureSize::Tiny && _size <= CreatureSize::Medium ? kCreatureFootstepSoundGroup
+                                                                        : kLargeCreatureFootstepSoundGroup;
+}
+
+// A rolling footstep type's loop plays where the creature is while it walks,
+// and raised by the type's pitch offset while it runs; any other animation
+// stops it.
+void Creature::updateRollingFootstep() {
+    // An absent creature, or one moving silently in stealth, makes no sound.
+    if (!isPresent() || (_stealthMode && hasSilentMove())) {
+        stopRollingFootstep();
+        return;
+    }
+    auto sounds = _footstepType != -1 ? _services.game.footstepSounds.get(_footstepType) : nullptr;
+    const std::string resRef = sounds ? rollingFootstepSound(*sounds) : std::string();
+    if (resRef.empty()) {
+        return;
+    }
+    std::optional<float> pitch;
+    switch (currentAnimationId()) {
+    case kWalkAnimationId:
+    case kWalkBackAnimationId:
+    case kStealthWalkAnimationId:
+    case kInjuredWalkAnimationId:
+        pitch = 1.0f;
+        break;
+    case kRunAnimationId:
+    case kInjuredRunAnimationId:
+        pitch = 1.0f + sounds->pitchOffset;
+        break;
+    default:
+        break;
+    }
+    if (!pitch) {
+        stopRollingFootstep();
+        return;
+    }
+    if (!_rollingFootstep || !_rollingFootstep->isPlaying()) {
+        _rollingFootstep = _services.audio.mixer.play(
+            _services.resource.audioClips.get(resRef), AudioType::Sound, footstepSoundGroup(), 1.0f, true, _position, std::nullopt, 0.0f);
+        if (!_rollingFootstep) {
+            return;
+        }
+    }
+    _rollingFootstep->setPosition(_position);
+    _rollingFootstep->setPitch(*pitch);
+}
+
+// The appearance's loop is the controlled creature's own group's when it
+// starts, and every other creature's otherwise. The light source loops at a
+// tenth of full volume, in the controlled creature's group.
+void Creature::updateLoopingSounds() {
+    static constexpr float kLoopingSoundHeight = 1.5f;
+    static constexpr char kLightSourceSound[] = "al_cv_firetorch1";
+    static constexpr float kLightSourceGain = 10.0f / 127.0f;
+    static constexpr int kLightSourceItemType = 29;
+    if (!isPresent()) {
+        return;
+    }
+    const bool controlled = _game.party().getLeader().get() == this;
+    const glm::vec3 position = _position + glm::vec3(0.0f, 0.0f, kLoopingSoundHeight);
+    if (!_appearanceSoundSet.looping.empty() && !_loopingSound && _loopingSoundResRef.empty()) {
+        _loopingSoundResRef = _appearanceSoundSet.looping;
+        _loopingSound = _services.audio.mixer.play(
+            _services.resource.audioClips.get(_loopingSoundResRef), AudioType::Sound,
+            controlled ? kLoopingPlayerSoundGroup : kLoopingNonPlayerSoundGroup, 1.0f, true, position);
+    }
+    if (_loopingSound) {
+        _loopingSound->setPosition(position);
+    }
+    auto held = getEquippedItem(InventorySlots::leftWeapon);
+    const bool lit = controlled && held && held->itemType() == kLightSourceItemType;
+    if (!lit) {
+        if (_lightSourceSound) {
+            _lightSourceSound->stop();
+            _lightSourceSound.reset();
+        }
+        return;
+    }
+    // It sounds where the light source is in the hand.
+    glm::vec3 lightPosition = _position;
+    if (auto *body = dynamic_cast<ModelSceneNode *>(_sceneNode.get())) {
+        if (auto *light = body->getAttachment(g_leftHandNode)) {
+            lightPosition = light->origin();
+        }
+    }
+    if (!_lightSourceSound) {
+        _lightSourceSound = _services.audio.mixer.play(
+            _services.resource.audioClips.get(kLightSourceSound), AudioType::Sound, kLoopingPlayerSoundGroup,
+            kLightSourceGain, true, lightPosition);
+    }
+    if (_lightSourceSound) {
+        _lightSourceSound->setPosition(lightPosition);
+    }
+}
+
+// A creature that comes back starts its loop again.
+void Creature::stopLoopingSounds() {
+    _loopingSoundResRef.clear();
+    for (auto *source : {&_loopingSound, &_lightSourceSound}) {
+        if (*source) {
+            (*source)->stop();
+            source->reset();
+        }
+    }
+}
+
+Creature::~Creature() {
+    stopRollingFootstep();
+    stopLoopingSounds();
+}
+
+void Creature::stopRollingFootstep() {
+    if (_rollingFootstep) {
+        _rollingFootstep->stop();
+        _rollingFootstep.reset();
+    }
 }
 
 void Creature::takeGold(int amount) {
     _gold -= amount;
+}
+
+int Creature::heldCount(HeldCount count) const {
+    switch (count) {
+    case HeldCount::Credits:
+        return _gold;
+    case HeldCount::Components:
+        return _components;
+    default:
+        return _chemicals;
+    }
+}
+
+void Creature::setHeldCount(HeldCount count, int value) {
+    switch (count) {
+    case HeldCount::Credits:
+        _gold = value;
+        break;
+    case HeldCount::Components:
+        _components = value;
+        break;
+    default:
+        _chemicals = value;
+        break;
+    }
+}
+
+void Creature::clearHeldCounts() {
+    _gold = _components = _chemicals = 0;
 }
 
 glm::vec3 Creature::computeSteeringForce(const Uniwalk &uni, const glm::vec3 &next, float dt) {
@@ -8887,7 +9750,18 @@ glm::vec3 Creature::computeSteeringForce(const Uniwalk &uni, const glm::vec3 &ne
 
     // If we're not making progress - move in a random direction and
     // hope. If we wander off too far, the path will be recalculated.
-    const bool noProgress = _previousPosition && glm::length2(_position - *_previousPosition) < 0.0001;
+    bool noProgress = false;
+    if (_previousPosition) {
+        _progressTime += dt;
+        if (_progressTime >= kProgressCheckInterval) {
+            noProgress = glm::length(_position - *_previousPosition) < kMinimumProgressSpeed * _progressTime;
+            _previousPosition = _position;
+            _progressTime = 0.0f;
+        }
+    } else {
+        _previousPosition = _position;
+        _progressTime = 0.0f;
+    }
     if (!_stuckTimer.elapsed() || noProgress) {
         // Try to unstuck for some time even if we're moving
         // again. Otherwise desiredForce kicks in again next frame.
@@ -8906,7 +9780,6 @@ glm::vec3 Creature::computeSteeringForce(const Uniwalk &uni, const glm::vec3 &ne
     } else {
         _stuckForce = glm::vec3 {0.0f, 0.0f, 0.0f};
     }
-    _previousPosition = _position;
 
     glm::vec3 combinedForce = desiredForce + 0.1f * keepoutForce + _stuckForce;
 
@@ -8961,8 +9834,7 @@ bool Creature::navigateTo(const glm::vec3 &dest, bool run, float distance, float
                           std::optional<std::reference_wrapper<const Object>> pathTarget,
                           bool straight) {
     _navigationFailed = false;
-    const bool clicksTrigger = pathTarget && clicksTriggerInReach(pathTarget->get());
-    if (isMovementRestricted() && !clicksTrigger) {
+    if (isMovementRestricted()) {
         setMovementType(MovementType::None);
         return false;
     }
@@ -8991,26 +9863,6 @@ bool Creature::navigateTo(const glm::vec3 &dest, bool run, float distance, float
         distance = 0.0f;
     }
 
-    // A walk heading for a trigger that is not a mine ends once the walker is
-    // within use range of it, as it sets out or on the way, and the trigger
-    // hears that as a click.
-    if (clicksTrigger) {
-        setMovementType(MovementType::None);
-        clearPath();
-        static constexpr int kClickedEvent = static_cast<int>(SavedSignalEventType::Clicked);
-        auto clicked = _game.getObjectById(pathTarget->get().id());
-        _game.queueScriptEvent(*clicked, *this, Event(kClickedEvent, {}, {}, {}, {_game.getObjectById(_id)}));
-        return true;
-    }
-
-    // Stop if we reached the destination.
-    float distToDest2 = getSquareDistanceTo(glm::vec2(dest));
-    if (distToDest2 <= distance * distance) {
-        setMovementType(Creature::MovementType::None);
-        clearPath();
-        return true;
-    }
-
     float eps2 = std::min(0.5f * 0.5f, distance * distance);
     if (_path && getSquareDistanceTo(getLastPathPoint(pf, *_path)) < eps2) {
         // Reached the last point, but not reached the destination. Find another
@@ -9019,14 +9871,23 @@ bool Creature::navigateTo(const glm::vec3 &dest, bool run, float distance, float
         _path = std::nullopt;
     }
 
-    // A walk onto a point that sets out within a tenth of a metre of it ends
-    // at once, the creature stepping onto the point if it fits there.
-    if (!_path && distance <= kNoMoveRange && getSquareDistanceTo(dest) <= kArrivalSnapDistance2) {
+    // A walk that sets out within a tenth of a metre of its point ends at
+    // once, whatever its range, the creature stepping onto the point if it
+    // fits there.
+    if (!_path && getSquareDistanceTo(dest) <= kArrivalSnapDistance2) {
         if (area.isSafeLocationPoint(dest, *this)) {
             setPosition(dest);
             area.determineObjectRoom(*this);
         }
         setMovementType(MovementType::None);
+        return true;
+    }
+
+    // Stop if we reached the destination.
+    float distToDest2 = getSquareDistanceTo(glm::vec2(dest));
+    if (distToDest2 <= distance * distance) {
+        setMovementType(Creature::MovementType::None);
+        clearPath();
         return true;
     }
 
@@ -9108,7 +9969,7 @@ bool Creature::navigateTo(const glm::vec3 &dest, bool run, float distance, float
         const float step = std::min(pacedStep, endsOnPoint ? glm::length(toLast) : getDistanceTo(stepLimit));
         const glm::vec3 stepEnd {_position.x + dir.x * step, _position.y + dir.y * step, _position.z};
         const glm::vec2 stepDir {glm::normalize(glm::vec2(dir))};
-        const auto test = area.testDirectLine(*this, _position, stepEnd);
+        const auto test = area.testWalkStep(*this, _position, stepEnd);
         const Area::DirectLine line = test.result;
         const auto &door = test.door;
 
@@ -9119,8 +9980,7 @@ bool Creature::navigateTo(const glm::vec3 &dest, bool run, float distance, float
             _previousPosition.reset();
             setMovementType(MovementType::None);
             clearPath();
-            if (door && door->get().state() == DoorState::Closed && !door->get().isOpening() &&
-                _game.party().getLeader().get() != this) {
+            if (door && door->get().state() == DoorState::Closed && !door->get().isOpening()) {
                 runBlockedScript(door->get().id());
             }
             return true;
@@ -9274,6 +10134,13 @@ Creature::Avoidance Creature::plotPathAroundCreature(const std::shared_ptr<Creat
         for (auto &point : way.points) {
             point.z = groundAt(glm::vec2(point));
         }
+        // A way over ground the pathfinder does not walk is blocked: walked,
+        // it would leave the walker where no path can be planned from.
+        for (const auto &point : way.points) {
+            if (!walkmeshElevationAt(pf.uni, glm::vec2(point), point.z)) {
+                return way;
+            }
+        }
         for (size_t i = 1; i < way.points.size(); ++i) {
             const auto test = area.testDirectLine(*this, way.points[i - 1], way.points[i], targetCreature);
             if (test.result == Area::DirectLine::Clear) {
@@ -9315,7 +10182,7 @@ Creature::Avoidance Creature::plotPathAroundCreature(const std::shared_ptr<Creat
 }
 
 bool Creature::canPushAside(const Creature &other) const {
-    if (!_game.isTSL() || _game.globalFade().dialogPending()) {
+    if (!_game.isTSL() || _game.isDialogUnderWay()) {
         return false;
     }
     if (_game.party().getLeader().get() != this) {
@@ -9332,7 +10199,9 @@ bool Creature::pushAside(Creature &other, glm::vec3 a, glm::vec3 b, const glm::v
 
     // The spot looked for stands off the line through a and b, on the side
     // the other creature already stands, far enough out for both creatures
-    // and a little more. A creature right on the line goes along +x.
+    // and a little more. A creature right on the line goes along +x. Its way
+    // there is kept clear of door walls up its height from the lower of where
+    // it stands and that spot, and a little below.
     Area &area = *_game.module()->area();
     const glm::vec3 standing {other.position()};
     const glm::vec3 line {b - a};
@@ -9343,14 +10212,16 @@ bool Creature::pushAside(Creature &other, glm::vec3 a, glm::vec3 b, const glm::v
     const float offsetLength = glm::length(offset);
     const glm::vec3 away = offsetLength < kDirectionEpsilon ? glm::vec3(1.0f, 0.0f, 0.0f) : offset / offsetLength;
     const float reach = other.creaturePersonalSpace() + kPushAsideSpace + creaturePersonalSpace();
+    const glm::vec3 wanted {nearest + away * reach};
+    const float wayFloor = std::min(wanted.z, standing.z);
 
     // This creature stands on its line, nearest the other, while the spot is
     // chosen, and goes back where it was once done.
     const glm::vec3 saved {_position};
     setPosition(nearest);
     bool handled = false;
-    const auto spot = area.computeSafeLocation(nearest + away * reach, kPushAsideSpotRadius, other, true);
-    if (spot && area.testDirectLine(other, standing, *spot).result != Area::DirectLine::Blocked) {
+    const auto spot = area.computeSafeLocation(wanted, kPushAsideSpotRadius, other, true);
+    if (spot && !area.hasDoorWallAlong(standing, *spot, other, wayFloor - kPushAsideDoorBand, wayFloor + other.collisionHeight())) {
         // A creature already set on a move is left to it.
         const bool moving = std::any_of(other.actions().nodes.begin(), other.actions().nodes.end(),
                                         [](const OrdinaryActionQueue::Node &node) {
@@ -9384,14 +10255,14 @@ void Creature::planStraightPath(const glm::vec3 &point) {
     resetBlockingCreature();
 }
 
-Creature::UseRange Creature::useRange(const Object &target, bool ignorePreciseUse) const {
+Creature::UseRange Creature::useRange(const Object &target, bool ignorePreciseUse, std::optional<float> pathOffset) const {
     UseRange use {target.position(), _personalSpace};
     switch (target.type()) {
     case ObjectType::Creature: {
         const auto &creature = static_cast<const Creature &>(target);
         use.range = _game.isTSL()
                         ? kCreatureUseRange
-                        : _creaturePersonalSpace + creature._creaturePersonalSpace + kCreatureUseSpacing;
+                        : (pathOffset ? *pathOffset : _creaturePersonalSpace) + creature._creaturePersonalSpace + kCreatureUseSpacing;
         break;
     }
     case ObjectType::Trigger: {
@@ -9424,6 +10295,12 @@ Creature::UseRange Creature::useRange(const Object &target, bool ignorePreciseUs
         // over no room.
         auto doorArea = door.spatialArea();
         use.point.z = doorArea ? doorArea->get().groundHeight(use.point, Area::GroundFace::Locating) : 0.0f;
+        // The door an attack's walk heads for is used from the walk's offset
+        // beyond the personal space.
+        if (pathOffset) {
+            use.range += *pathOffset;
+            break;
+        }
         auto area = spatialArea();
         // In TSL, while a door saber is anywhere in the queue, every door is
         // used from exactly a metre.
@@ -9446,7 +10323,7 @@ Creature::UseRange Creature::useRange(const Object &target, bool ignorePreciseUs
     return use;
 }
 
-bool Creature::isInUseRange(const Object &target, float extra) const {
+bool Creature::isInUseRange(const Object &target, float extra, std::optional<float> pathOffset) const {
     auto area = target.spatialArea();
     if (!area || !sharesSpatialArea(target)) {
         return false;
@@ -9454,14 +10331,96 @@ bool Creature::isInUseRange(const Object &target, float extra) const {
     if (auto *trigger = dyn_cast<Trigger>(&target); trigger && trigger->isAreaTransition()) {
         return trigger->isIn(_position);
     }
-    const UseRange use = useRange(target);
-    const glm::vec3 lift {0.0f, 0.0f, kUseLineHeight};
+    const UseRange use = useRange(target, false, pathOffset);
+    const glm::vec3 lift {0.0f, 0.0f, Object::kEyeHeight};
     if (!area->get().isEyeLineClear(_position + lift, use.point + lift, *this, target)) {
         return false;
     }
     const glm::vec2 offset {glm::vec2(use.point) - glm::vec2(_position)};
     const float reach = use.range + extra + kUseRangeAllowance;
     return glm::dot(offset, offset) <= reach * reach;
+}
+
+bool Creature::endsWalkToward(const Object &goal, float range, bool inClearLine, std::optional<float> pathOffset) const {
+    const UseRange use = useRange(goal, false, pathOffset);
+    const float distance2 = glm::distance2(_position, use.point);
+    if (distance2 <= use.range * use.range) {
+        return true;
+    }
+    // A walk all the way onto its point closes to no range.
+    if (!inClearLine || (_path && _walksOntoPoint)) {
+        return false;
+    }
+    Area &area = *_game.module()->area();
+    const glm::vec3 lift {0.0f, 0.0f, kEyeHeight};
+    const glm::vec3 eye {_position + lift};
+    auto isClearTo = [&](const glm::vec3 &point, std::optional<std::reference_wrapper<const Object>> target) {
+        const glm::vec3 to {point + lift};
+        return area.isEyeLineClear(eye, to, *this, target) &&
+               !area.findStaticWallAlong(eye, to, *this, eye.z - kClearLineWallBand, eye.z + kClearLineWallBand);
+    };
+    if (range > use.range && distance2 <= range * range && isClearTo(use.point, goal)) {
+        return true;
+    }
+    // In KotOR the walk also ends with the end of its path within range, in a
+    // clear line to the ground there.
+    if (_game.isTSL() || !_path) {
+        return false;
+    }
+    const glm::vec3 end = getLastPathPoint(area.pathfinder(), *_path);
+    const glm::vec2 toEnd {glm::vec2(end) - glm::vec2(_position)};
+    if (glm::dot(toEnd, toEnd) > range * range) {
+        return false;
+    }
+    return isClearTo(glm::vec3(end.x, end.y, area.groundHeight(end, Area::GroundFace::Locating)), std::nullopt);
+}
+
+void Creature::clickInReach(const Object &target) {
+    setMovementType(MovementType::None);
+    clearPath();
+    _game.queueClick(target, *this, *this);
+}
+
+bool Creature::reachesWalkGoal(const Object &goal, std::optional<float> pathOffset) {
+    if (clicksTriggerInReach(goal)) {
+        clickInReach(goal);
+        return true;
+    }
+    if (!isLinkedDoorInReach(goal, pathOffset)) {
+        return false;
+    }
+    const auto *door = static_cast<const Door *>(&goal);
+    if (door->isOpen()) {
+        clickInReach(*door);
+        return true;
+    }
+    runBlockedScript(door->id());
+    setMovementType(MovementType::None);
+    clearPath();
+    return true;
+}
+
+bool Creature::walkToward(std::optional<std::reference_wrapper<const Object>> goal, const glm::vec3 &dest, bool run, float range, float dt,
+                          std::optional<std::reference_wrapper<const Object>> pathTarget, bool inClearLine,
+                          std::optional<float> pathOffset) {
+    // A walk heading for a trigger that is not a mine, or for a linked door,
+    // ends once it comes within use range of it, as it sets out, on the way or
+    // with its last step.
+    if (goal && reachesWalkGoal(goal->get(), pathOffset)) {
+        return true;
+    }
+    if (goal && endsWalkToward(goal->get(), range, inClearLine, pathOffset)) {
+        setMovementType(MovementType::None);
+        clearPath();
+        return true;
+    }
+    if (!navigateTo(dest, run, range, dt, pathTarget)) {
+        return false;
+    }
+    if (goal) {
+        reachesWalkGoal(goal->get(), pathOffset);
+    }
+    return true;
 }
 
 void Creature::UseApproach::follow(const UseRange &current) {
@@ -9475,32 +10434,94 @@ void Creature::UseApproach::follow(const UseRange &current) {
     fixed = true;
 }
 
-bool Creature::navigateToUse(const Object &target, float extra, float dt, bool run, bool followsPoint, bool targetsPath) {
+bool Creature::navigateToUse(const Object &target, float extra, float dt, bool run, bool followsPoint, bool targetsPath,
+                             bool toGoal, float walkExtra, bool inClearLine) {
     std::optional<std::reference_wrapper<const Object>> pathTarget;
     if (targetsPath) {
         pathTarget = target;
     }
-    if (isInUseRange(target, extra)) {
+    std::optional<std::reference_wrapper<const Object>> goal;
+    if (toGoal) {
+        goal = target;
+    }
+    // The use range is tested before a walk sets out and again once it has
+    // ended; a walk under way runs to its own end. The walk belongs to the
+    // action that set it out, and ends with it.
+    const auto walker = _executingActionNode.lock();
+    const bool walking = _useWalk && _useWalk->walker.lock() == walker;
+    if (!walking && isInUseRange(target, extra)) {
         setMovementType(MovementType::None);
         clearPath();
-        _useApproach.reset();
+        _useWalk.reset();
         return true;
     }
+    // A walk to a door or placeable keeps the use point it set out for;
+    // anything else heads for its use point of the moment.
     const UseRange use = useRange(target);
-    if (target.type() != ObjectType::Door && target.type() != ObjectType::Placeable) {
-        navigateTo(use.point, run, use.range + extra, dt, pathTarget);
+    if (!walking) {
+        _useWalk = UseWalk {walker};
+        if (target.type() == ObjectType::Door || target.type() == ObjectType::Placeable) {
+            _useWalk->kept = UseApproach {use, !followsPoint};
+        }
+        if (target.type() == ObjectType::Placeable) {
+            _useWalk->beside = walkablePointBeside(target, use.point);
+        }
+    } else if (_useWalk->kept) {
+        _useWalk->kept->follow(use);
+    }
+    // A placeable with no use point on the ground, used from its own origin
+    // inside its footprint, is used from the ground beside it. A walk to the
+    // origin itself would find no path and give up where the creature stands.
+    if (_useWalk->beside) {
+        if (!walkToward(goal, *_useWalk->beside, run, kUseBesideArrival, dt, pathTarget, inClearLine)) {
+            return false;
+        }
+        _useWalk.reset();
+        return true;
+    }
+    const UseRange &walk = _useWalk->kept ? _useWalk->kept->use : use;
+    if (!walkToward(goal, walk.point, run, walk.range + walkExtra, dt, pathTarget, inClearLine)) {
         return false;
     }
-    if (!_useApproach || _useApproach->target != target.id()) {
-        _useApproach = UseApproach {target.id(), use, !followsPoint};
-    } else {
-        _useApproach->follow(use);
-    }
     // Arriving ends the walk; the next one sets out afresh.
-    if (navigateTo(_useApproach->use.point, run, _useApproach->use.range + extra, dt, pathTarget)) {
-        _useApproach.reset();
+    _useWalk.reset();
+    return isInUseRange(target, extra);
+}
+
+std::optional<glm::vec3> Creature::walkablePointBeside(const Object &target, const glm::vec3 &point) const {
+    if (!_game.module() || !_game.module()->area()) {
+        return std::nullopt;
     }
-    return false;
+    Area &area = *_game.module()->area();
+    const Pathfinder &pf = area.pathfinder();
+    if (pf.uni.regions.empty() || !pathExists(pf, _position, _position) || pathExists(pf, _position, point)) {
+        return std::nullopt;
+    }
+    const glm::vec3 lift {0.0f, 0.0f, kEyeHeight};
+    for (float ring = kUseBesideStep; ring <= kUseBesideRadius + 1e-4f; ring += kUseBesideStep) {
+        std::optional<glm::vec3> best;
+        float bestDistance2 = 0.0f;
+        for (int i = 0; i < kUseBesideDirections; ++i) {
+            const float angle = static_cast<float>(i) * glm::two_pi<float>() / kUseBesideDirections;
+            const glm::vec3 candidate {point.x + ring * std::sin(angle), point.y + ring * std::cos(angle), _position.z};
+            if (!pathExists(pf, _position, candidate) ||
+                !area.isEyeLineClear(candidate + lift, point + lift, *this, target)) {
+                continue;
+            }
+            // Of a ring's points, the one nearest the creature: it walks round
+            // the object no farther than it must.
+            const glm::vec2 offset {glm::vec2(candidate) - glm::vec2(_position)};
+            const float distance2 = glm::dot(offset, offset);
+            if (!best || distance2 < bestDistance2) {
+                best = candidate;
+                bestDistance2 = distance2;
+            }
+        }
+        if (best) {
+            return best;
+        }
+    }
+    return std::nullopt;
 }
 
 void Creature::advanceOnPath(const glm::vec3 &dest, const glm::vec3 &dir, bool run, float distance, float dt) {
@@ -9685,6 +10706,13 @@ void Creature::playDieTransition(int leftLoopId) {
 
 // In TSL a character model's knock-down fall waits in the one-shot queue. KotOR
 // shows no fall, nor does a creature model.
+bool Creature::isKnockedDown() const {
+    return std::any_of(effects().begin(), effects().end(), [](const EffectInstance &applied) {
+        const auto *knockdown = dynamic_cast<const KnockdownEffect *>(applied.effect.get());
+        return knockdown && knockdown->holdsRound() && applied.hasLiveRuntimeSource();
+    });
+}
+
 void Creature::showKnockdownFall(int animationId) {
     if (!_game.isTSL() || _modelType == ModelType::Creature) {
         return;
@@ -10102,6 +11130,8 @@ void Creature::finalizeModel(ModelSceneNode &body) {
             body.setMainTexture(texture.get());
         }
     }
+    _bodyAlignmentTexture.clear();
+    applyBodyAlignment(body);
 
     // Mask
 
@@ -10119,6 +11149,8 @@ void Creature::finalizeModel(ModelSceneNode &body) {
         if (headModel) {
             std::shared_ptr<ModelSceneNode> headSceneNode(sceneGraph.newModel(*headModel, ModelUsage::Creature));
             body.attach(g_headHookNode, *headSceneNode);
+            _headAlignmentTexture.clear();
+            applyHeadAlignment(*headSceneNode);
             if (maskModel) {
                 auto maskSceneNode = sceneGraph.newModel(*maskModel, ModelUsage::Equipment);
                 headSceneNode->attach(g_maskHookNode, *maskSceneNode);
@@ -10153,6 +11185,10 @@ void Creature::finalizeModel(ModelSceneNode &body) {
             }
         }
     }
+
+    // A rebuilt body keeps whatever its hands and head have put away.
+    presentHandItems(body);
+    presentHeadItem(body);
 }
 
 CreaturePresentation Creature::presentation() const {
@@ -10163,10 +11199,8 @@ CreaturePresentation Creature::presentation() const {
     result.gender = static_cast<int>(_gender);
     result.appearance = _appearance;
     auto body = getEquippedItem(InventorySlots::body);
-    if (body && !body->baseBodyVariation().empty()) {
-        auto variation = boost::to_lower_copy(body->baseBodyVariation());
-        result.bodyVariation = variation.front() - 'a';
-        result.textureVariation = body->textureVariation();
+    if (body) {
+        std::tie(result.bodyVariation, result.textureVariation) = bodyLookOf(*body);
     }
     return result;
 }
@@ -10186,6 +11220,17 @@ void Creature::setPresentation(const CreaturePresentation &presentation) {
     _gender = static_cast<Gender>(presentation.gender);
 }
 
+// The last body model and texture columns of appearance.2da, J in KotOR and
+// N in TSL, which every body variation past them uses.
+static constexpr int kK1LastBodyColumn = 9;
+static constexpr int kTSLLastBodyColumn = 13;
+
+// The letter of the body model and texture columns for a body variation
+// counted from 0.
+static char bodyColumnLetter(int bodyVariation, bool tsl) {
+    return static_cast<char>('a' + std::min(bodyVariation, tsl ? kTSLLastBodyColumn : kK1LastBodyColumn));
+}
+
 std::string Creature::getBodyModelName() const {
     std::string column;
 
@@ -10194,10 +11239,9 @@ std::string Creature::getBodyModelName() const {
 
         std::shared_ptr<Item> bodyItem(getEquippedItem(InventorySlots::body));
         if (_presentation) {
-            column += static_cast<char>('a' + _presentation->bodyVariation);
+            column += bodyColumnLetter(_presentation->bodyVariation, _game.isTSL());
         } else if (bodyItem) {
-            std::string baseBodyVar(bodyItem->baseBodyVariation());
-            column += baseBodyVar;
+            column += bodyColumnLetter(bodyLookOf(*bodyItem).first, _game.isTSL());
         } else {
             column += "a";
         }
@@ -10225,10 +11269,9 @@ std::string Creature::getBodyTextureName() const {
         column = "tex";
 
         if (_presentation) {
-            column += static_cast<char>('a' + _presentation->bodyVariation);
+            column += bodyColumnLetter(_presentation->bodyVariation, _game.isTSL());
         } else if (bodyItem) {
-            std::string baseBodyVar(bodyItem->baseBodyVariation());
-            column += baseBodyVar;
+            column += bodyColumnLetter(bodyLookOf(*bodyItem).first, _game.isTSL());
         } else {
             column += "a";
         }
@@ -10249,7 +11292,7 @@ std::string Creature::getBodyTextureName() const {
     if (_modelType == Creature::ModelType::Character) {
         bool texFound = false;
         if (_presentation || bodyItem) {
-            auto variation = _presentation ? _presentation->textureVariation : bodyItem->textureVariation();
+            auto variation = _presentation ? _presentation->textureVariation : bodyLookOf(*bodyItem).second;
             std::string tmp(str(boost::format("%s%02d") % texName % variation));
             std::shared_ptr<Texture> texture(_services.resource.textures.get(tmp, TextureUsage::MainTex));
             if (texture) {
@@ -10266,26 +11309,166 @@ std::string Creature::getBodyTextureName() const {
 }
 
 std::string Creature::getHeadModelName() const {
+    return _modelType == Creature::ModelType::Character ? _headModelName : std::string();
+}
+
+int Creature::headRow(const TwoDA &appearances) const {
+    if (_duplicatedHead != 0xff) {
+        return _duplicatedHead;
+    }
+    // A blank backup head reads as row 0.
+    if (useBackupHead()) {
+        return appearances.getInt(_appearance, "backuphead", 0);
+    }
+    return appearances.getInt(_appearance, "normalhead", -1);
+}
+
+void Creature::refreshHead() {
+    loadHeadProperties(*getRequiredTwoDA(_services.resource.twoDas, "appearance"));
+    if (_sceneNode) {
+        updateModel();
+    }
+}
+
+void Creature::duplicateHead(int row) {
+    _duplicatedHead = static_cast<uint8_t>(row);
+    refreshHead();
+}
+
+void Creature::wearBackupHead() {
+    const bool shown = useBackupHead();
+    _wearsBackupHead = true;
+    if (!shown) {
+        refreshHead();
+    }
+}
+
+// A head has a texture for each dark side band and, in TSL, for good/evil of
+// 70 and above and of 90 and above; between them it shows its own.
+std::string Creature::getHeadAlignmentTextureName() const {
     if (_modelType != Creature::ModelType::Character) {
         return "";
     }
-    std::shared_ptr<TwoDA> appearance(_services.resource.twoDas.get("appearance"));
-    if (!appearance) {
-        throw ResourceNotFoundException("appearance 2DA not found");
+    if (_goodEvil <= kEvilMaxGoodEvil) {
+        const size_t band = _goodEvil <= kVeryVeryVeryEvilMaxGoodEvil ? 0
+                            : _goodEvil <= kVeryVeryEvilMaxGoodEvil   ? 1
+                            : _goodEvil <= kVeryEvilMaxGoodEvil       ? 2
+                                                                      : 3;
+        return _headAlignmentTextures[band];
     }
-    int headIdx = appearance->getInt(_appearance, "normalhead", -1);
-    if (headIdx == -1) {
+    if (_game.isTSL() && _goodEvil >= kGoodMinGoodEvil) {
+        return _headAlignmentTextures[_goodEvil >= kVeryGoodMinGoodEvil ? 5 : 4];
+    }
+    return "";
+}
+
+// TSL's evil body texture column for armour of a body variation, 0 for A:
+// those of B, I, L and N; none for the others.
+static const char *tslEvilBodyColumn(int variation) {
+    switch (variation) {
+    case 'b' - 'a':
+        return "texbevil";
+    case 'i' - 'a':
+        return "texievil";
+    case 'l' - 'a':
+        return "texlevil";
+    case 'n' - 'a':
+        return "texnevil";
+    default:
+        return nullptr;
+    }
+}
+
+std::string Creature::getEvilBodyTextureName() const {
+    // In KotOR only the unarmoured body is darkened, at 30 and below; in TSL
+    // also armour of body variation B, I, L and N, at 40 and below. A
+    // creature without a head shows no good/evil at all.
+    const bool tsl = _game.isTSL();
+    if (_goodEvil > (tsl ? kEvilMaxGoodEvil : kVeryEvilMaxGoodEvil) || getHeadModelName().empty()) {
         return "";
     }
-    std::shared_ptr<TwoDA> heads(_services.resource.twoDas.get("heads"));
-    if (!heads) {
-        throw ResourceNotFoundException("heads 2DA not found");
+    // A presented body counts as worn armour of its variation.
+    std::optional<int> variation;
+    if (_presentation) {
+        variation = _presentation->bodyVariation;
+    } else if (auto armour = getEquippedItem(InventorySlots::body)) {
+        variation = wornBodyVariation(*armour);
     }
+    const char *column = nullptr;
+    if (!variation) {
+        column = "texaevil";
+    } else if (tsl) {
+        column = tslEvilBodyColumn(*variation);
+    }
+    if (!column) {
+        return "";
+    }
+    // A column the appearance has not been read for names no texture.
+    const auto texture = _evilBodyTextures.find(column);
+    if (texture == _evilBodyTextures.end() || texture->second.empty()) {
+        return "";
+    }
+    return texture->second + "01";
+}
 
-    std::string modelName(heads->getString(headIdx, "head"));
-    boost::to_lower(modelName);
+void Creature::applyHeadAlignment(ModelSceneNode &head) {
+    auto name = getHeadAlignmentTextureName();
+    if (name.empty() || name == _headAlignmentTexture) {
+        return;
+    }
+    // A texture that doesn't exist leaves the head as it is.
+    if (auto texture = _services.resource.textures.get(name, TextureUsage::MainTex)) {
+        head.setMainTexture(texture.get());
+        _headAlignmentTexture = std::move(name);
+    }
+}
 
-    return modelName;
+void Creature::applyBodyAlignment(ModelSceneNode &body) {
+    _alignmentGoodEvil = _goodEvil;
+    auto name = getEvilBodyTextureName();
+    if (name.empty()) {
+        // Without an evil texture for its good/evil the body shows its own.
+        if (!_bodyAlignmentTexture.empty()) {
+            _bodyAlignmentTexture.clear();
+            const auto own = getBodyTextureName();
+            if (auto texture = own.empty() ? nullptr : _services.resource.textures.get(own, TextureUsage::MainTex)) {
+                body.setMainTexture(texture.get());
+            }
+        }
+        return;
+    }
+    if (name == _bodyAlignmentTexture) {
+        return;
+    }
+    // A texture that doesn't exist leaves the body as it is.
+    if (auto texture = _services.resource.textures.get(name, TextureUsage::MainTex)) {
+        body.setMainTexture(texture.get());
+        _bodyAlignmentTexture = std::move(name);
+    }
+}
+
+// The portrait follows good/evil whether or not the creature is drawn; the
+// body and head follow it while they are.
+void Creature::updateAlignmentTextures() {
+    if (_goodEvil == _alignmentGoodEvil) {
+        return;
+    }
+    refreshPortrait();
+    if (!_sceneNode) {
+        _alignmentGoodEvil = _goodEvil;
+        return;
+    }
+    auto body = std::static_pointer_cast<ModelSceneNode>(_sceneNode);
+    applyBodyAlignment(*body);
+    auto *head = static_cast<ModelSceneNode *>(body->getAttachment(g_headHookNode));
+    if (!head) {
+        return;
+    }
+    if (!_headAlignmentTexture.empty() && getHeadAlignmentTextureName().empty()) {
+        updateModel();
+        return;
+    }
+    applyHeadAlignment(*head);
 }
 
 std::string Creature::getMaskModelName() const {
@@ -10294,10 +11477,7 @@ std::string Creature::getMaskModelName() const {
         return "";
     }
 
-    std::string modelName(boost::to_lower_copy(headItem->itemClass()));
-    modelName += str(boost::format("_%03d") % headItem->modelVariation());
-
-    return modelName;
+    return headItem->modelResRef(_game.itemModelGenderLetter());
 }
 
 std::string Creature::getWeaponModelName(int slot) const {
@@ -10306,17 +11486,25 @@ std::string Creature::getWeaponModelName(int slot) const {
         return "";
     }
 
-    std::string modelName(bodyItem->itemClass());
-    boost::to_lower(modelName);
-
-    modelName += str(boost::format("_%03d") % bodyItem->modelVariation());
-
-    return modelName;
+    return bodyItem->modelResRef(_game.itemModelGenderLetter());
 }
 
 void Creature::deserialize(
     const resource::Gff &gff,
     const SerializedIdentityContext &identityContext) {
+    deserializeRecord(gff, identityContext, false);
+}
+
+void Creature::deserializeAsPartyMember(
+    const resource::Gff &gff,
+    const SerializedIdentityContext &identityContext) {
+    deserializeRecord(gff, identityContext, true);
+}
+
+void Creature::deserializeRecord(
+    const resource::Gff &gff,
+    const SerializedIdentityContext &identityContext,
+    bool partyMember) {
     std::string templateRes;
     std::shared_ptr<Gff> utc;
     if (!identityContext.isSerializedState() &&
@@ -10326,9 +11514,22 @@ void Creature::deserialize(
             deserializeAll(
                 *utc,
                 SerializedIdentityContext::templateResource(templateRes));
+            deserializeHeldCounts(*utc);
         }
     }
-    deserializeAll(gff, identityContext);
+    // An entry placed from a template gives only where the creature stands
+    // and which way it faces, each missing value being 0, and the creature
+    // keeps the template's counts; a party member's record holds none of its
+    // own.
+    if (utc) {
+        _position = glm::vec3(gff.getFloat("XPosition"), gff.getFloat("YPosition"), gff.getFloat("ZPosition"));
+        setFacing(-glm::atan(gff.getFloat("XOrientation"), gff.getFloat("YOrientation")));
+    } else {
+        deserializeAll(gff, identityContext);
+        if (!partyMember) {
+            deserializeHeldCounts(gff);
+        }
+    }
 
     // Vitality is rebuilt from the record before equipment is worn, so worn
     // Constitution, Wisdom and Charisma move the rebuilt pools.
@@ -10336,9 +11537,10 @@ void Creature::deserialize(
     if (utc) {
         deserializeOwnedItemsAndEquipment(
             *utc, SerializedIdentityContext::templateResource(templateRes), true);
+    } else {
+        deserializeOwnedItemsAndEquipment(gff, identityContext, false);
     }
-    deserializeOwnedItemsAndEquipment(gff, identityContext, false);
-    countLoadedItems();
+    countLoadedItems(partyMember);
     // A reloaded corpse lies, without dying again, in the dead pose it was
     // saved in; one saved in no dead pose lies in the second.
     if (_dead) {
@@ -10347,10 +11549,22 @@ void Creature::deserialize(
         _deathPose = animation == kDeadAnimationId    ? DeathPose::Dead
                      : animation == kDead3AnimationId ? DeathPose::Dead3
                                                       : DeathPose::Dead1;
+    } else if (int32_t animation = kPauseAnimationId;
+               gff.readInt(animation, "Animation") && animation != kPauseAnimationId &&
+               animation != kReadyAnimationId && animation != kDamageFlinchAnimationId) {
+        // A living creature saved holding another animation takes it up again
+        // once the world it belongs to is published. The pause and the ready
+        // stance follow the creature's state, and a flinch has passed, so a
+        // creature saved in one of them is not held in it.
+        _savedScriptLoop = animation;
     }
 
     updateTransform();
     loadAppearance();
+    // A creature that comes into the world in stealth shows it arriving.
+    if (_stealthMode) {
+        presentStealthChange(true, false);
+    }
 }
 
 void Creature::deserializeAll(
@@ -10376,10 +11590,15 @@ void Creature::deserializeAll(
     // IsPC is read before hit points are rebuilt. A player character stays
     // incapacitated and resumable through 0..-9 HP and is dead only at -10 HP.
     gff.readByte(_isPC, "IsPC");
+    if (auto followInfo = gff.findStruct("FollowInfo")) {
+        uint8_t withinSafetyRange = _withinSafetyRange;
+        followInfo->readByte(withinSafetyRange, "InSafetyRange");
+        _withinSafetyRange = withinSafetyRange != 0;
+    }
     _actsAsPC = _isPC;
     gff.readBool(_playerCreated, "PlayerCreated");
-    // Only the value 1 is stealth.
-    setStealthMode(gff.getUint("StealthMode", _stealthMode ? 1 : 0) == 1);
+    // Only the value 1 is stealth. It shows once the model is built.
+    setStealthMode(gff.getUint("StealthMode", _stealthMode ? 1 : 0) == 1, true);
     gff.readInt(_assignedPuppet, "AssignedPup");
 
     // index into racialtypes.2da
@@ -10391,6 +11610,10 @@ void Creature::deserializeAll(
 
     // index into appearance.2da
     gff.readEnum(_appearance, "Appearance_Type");
+    uint8_t useBackupHead;
+    if (gff.readByte(useBackupHead, "UseBackupHead")) {
+        _useBackupHead = useBackupHead != 0;
+    }
 
     // Savegames keep the visible disguise appearance in Appearance_Type and
     // the normal appearance separately. Restore this before equipped items
@@ -10433,6 +11656,11 @@ void Creature::deserializeAll(
     gff.readByte(_bodyVariation, "BodyVariation");
     gff.readByte(_textureVar, "TextureVar");
     gff.readBool(_partyInteract, "PartyInteract");
+    // A TSL creature can start with its rendering off.
+    uint8_t willNotRender {0};
+    if (_game.isTSL() && gff.readByte(willNotRender, "WillNotRender")) {
+        _visible = willNotRender == 0;
+    }
 
     // index into creaturespeed.2da
     gff.readInt(_walkRate, "WalkRate");
@@ -10444,17 +11672,10 @@ void Creature::deserializeAll(
     loadAppearanceMoveRate(*getRequiredTwoDA(_services.resource.twoDas, "appearance"));
     setMovementRate(_walkRate);
     gff.readBool(_listening, "Listening");
+    // A saved pattern that does not parse is set as any other: it matches
+    // nothing, and a new entry is saved again with the empty pattern.
     for (const auto &expression : gff.getList("ExpressionList")) {
-        const auto pattern = expression->getString("ExpressionString");
-        const int32_t number = expression->getInt("ExpressionId");
-        setListenPattern(pattern, number);
-        // A saved pattern that does not parse here matches nothing, and is
-        // saved again as it was loaded.
-        auto entry = std::find_if(_listenExpressions.begin(), _listenExpressions.end(),
-                                  [number](const ListenExpression &value) { return value.number == number; });
-        if (entry != _listenExpressions.end() && !entry->parsed) {
-            entry->pattern = pattern;
-        }
+        setListenPattern(expression->getString("ExpressionString"), expression->getInt("ExpressionId"));
     }
 
     gff.readByte(_naturalAC, "NaturalAC");
@@ -10514,10 +11735,12 @@ void Creature::deserializeAll(
     gff.readResRef(_onBlocked, "ScriptOnBlocked");
 
     // Only a saved creature record carries CreatnScrptFird; a blueprint leaves
-    // the flag clear so a freshly materialized creature still spawns once.
+    // the flag clear so a freshly materialized creature still spawns once. A
+    // creature restored with it set waits for its first look around.
     uint8_t spawnScriptFired = 0;
     if (gff.readByte(spawnScriptFired, "CreatnScrptFird")) {
         _spawnScriptFired = spawnScriptFired != 0;
+        _firstLookWaits = _spawnScriptFired;
     }
     // The record does not keep the heartbeat stamp.
     startUnstampedHeartbeat();
@@ -10615,17 +11838,35 @@ void Creature::deserializeAttributes(const resource::Gff &gff) {
         _spellLikeAbilities.push_back({spell, flags, casterLevel});
     }
 
-    int skillType = 0;
-    for (const auto &skill : gff.getList("SkillList")) {
-        attributes.setSkillRank(
-            static_cast<SkillType>(skillType++), skill->getUint("Rank"));
-    }
-
-    // Only a feat the feat table defines is held.
+    // Only a feat the feat table defines is held. The feats come before the
+    // skills, whose default ranks count them.
     for (const auto &feat : gff.getList("FeatList")) {
         auto featType = static_cast<FeatType>(feat->getUint("Feat"));
         if (_services.game.feats.get(featType)) {
             _attributes.addFeat(featType);
+        }
+    }
+
+    // A record with a skill list sets the ranks of the eight skills, a skill
+    // the list leaves out to 0; a record without one, as a module's instance
+    // of a template, keeps the ranks it has. A saved rank from 128 up reads
+    // as that value less 256: the save writes a negative rank so. An entry
+    // without its rank gives the skill's total rank on a base of 0, at most
+    // 127 either way, and only a skill the skills table defines takes it.
+    if (gff.has("SkillList")) {
+        static constexpr int kMaxSkillRank = 127;
+        const auto skills = gff.getList("SkillList");
+        for (int index = 0; index < kSkillListSize; ++index) {
+            attributes.setSkillRank(static_cast<SkillType>(index), 0);
+        }
+        const int entries = std::min(kSkillListSize, static_cast<int>(skills.size()));
+        for (int index = 0; index < entries; ++index) {
+            const auto skill = static_cast<SkillType>(index);
+            auto rank = static_cast<uint8_t>(std::clamp(getUnopposedSkillRank(skill), -kMaxSkillRank, kMaxSkillRank));
+            skills[index]->readByte(rank, "Rank");
+            if (_services.game.skills.get(skill)) {
+                attributes.setSkillRank(skill, static_cast<int8_t>(rank));
+            }
         }
     }
 }
@@ -10714,20 +11955,16 @@ void Creature::forceEquipClothing() {
     }
     _bodyRefusedOnLoad = false;
     static constexpr char kClothing[] = "g_a_clothes01";
-    // The party's own clothing is taken first; otherwise a new, droppable set.
+    // The party's own clothing is worn first, its whole stack, found wherever
+    // it is and taken from what holds it. Otherwise a new, droppable set.
     auto self = _game.getObjectById(_id);
     auto repository = self ? _game.party().sharedInventoryReceiver(self) : nullptr;
     std::shared_ptr<Item> clothing;
     if (repository) {
-        std::shared_ptr<Item> found;
-        for (const auto &item : repository->items()) {
-            if (item && boost::iequals(item->tag(), kClothing)) {
-                found = item;
-                break;
-            }
-        }
-        if (found) {
-            clothing = takeEquipmentCandidate(_game, *repository, found);
+        if (const auto found = repository->getItemByTag(kClothing)) {
+            const auto holder = _game.getObjectById(found->owner());
+            (holder ? *holder : *repository).removeItemStack(found);
+            clothing = found;
         }
     }
     if (!clothing) {
@@ -10737,17 +11974,28 @@ void Creature::forceEquipClothing() {
         }
         clothing->setDropable(true);
     }
-    if (!equip(InventorySlots::body, clothing)) {
-        if (repository) {
-            repository->addItem(clothing);
-        }
-        return;
-    }
+    putInSlot(InventorySlots::body, clothing);
     // The member has already joined, so the clothing breaks a no-armour forfeit.
-    _game.finishEquip(*this, InventorySlots::body, clothing);
+    _game.finishEquip(*this, InventorySlots::body, clothing, false);
 }
 
-void Creature::countLoadedItems() {
+// The credits, components and chemicals the creature holds itself; a record
+// never holds the party's. Each is a signed count, held up to kMaxHeldCount as
+// when it is set.
+void Creature::deserializeHeldCounts(const resource::Gff &gff) {
+    auto readHeldCount = [&gff](int &count, std::string_view label) {
+        auto value = static_cast<uint32_t>(count);
+        gff.readDword(value, label);
+        count = std::min(static_cast<int>(value), kMaxHeldCount);
+    };
+    readHeldCount(_gold, "Gold");
+    if (_game.isTSL()) {
+        readHeldCount(_components, "ItemComponent");
+        readHeldCount(_chemicals, "Chemicals");
+    }
+}
+
+void Creature::countLoadedItems(bool partyMember) {
     std::vector<std::shared_ptr<Item>> counted;
     for (const auto &item : _items) {
         if (_game.party().isCountedItem(*item)) {
@@ -10779,7 +12027,11 @@ void Creature::countLoadedItems() {
             _itemAttributes = std::move(keptAttributes);
         });
     for (const auto &item : counted) {
-        _game.party().acquireCountedItem(*this, *item);
+        if (partyMember) {
+            _game.party().acquireCountedItemAsPlayer(*this, *item);
+        } else {
+            _game.party().acquireCountedItem(*this, *item);
+        }
     }
 }
 
@@ -10792,6 +12044,7 @@ void Creature::deserializeOwnedItemsAndEquipment(
     if (!replaceItems && !replaceEquipment) {
         return;
     }
+    const ItemLoadScope loading(*this);
     bool bodyRefused = false;
 
     if (!identityContext.isSerializedState()) {
@@ -10822,9 +12075,9 @@ void Creature::deserializeOwnedItemsAndEquipment(
                     return nullptr;
                 }
                 auto item = _game.newItemFromBlueprint(resRef);
-                uint8_t dropable = 0;
-                entry.readByte(dropable, "Dropable");
-                item->setDropable((dropable & 1) != 0);
+                bool dropable = false;
+                entry.readBool(dropable, "Dropable");
+                item->setDropable(dropable);
                 return item;
             }
             if (Item::namesMissingTemplate(entry, _services.resource.gffs)) {
@@ -10835,7 +12088,8 @@ void Creature::deserializeOwnedItemsAndEquipment(
         _game.replaceRuntimeObjectGraph(
             obsolete,
             [&]() {
-                // Refused equipment enters the inventory before the carried items.
+                // Refused equipment enters the inventory before the carried items
+                // and joins a stack it matches.
                 if (replaceEquipment) {
                     for (const auto &itemGff : gff.getList("Equip_ItemList")) {
                         auto item = loadEntry(*itemGff, "EquippedRes");
@@ -10844,26 +12098,32 @@ void Creature::deserializeOwnedItemsAndEquipment(
                         }
                         const auto slot = admitLoadedEquipment(*item, itemGff->type(), replacementEquipment, bodyRefused, false);
                         if (!slot || replacementEquipment.count(*slot) != 0) {
-                            item->setOwner(_id);
-                            appendOwnedItemCandidate(
-                                replacementItems, item, true);
+                            item->setOwner(*this);
+                            _game.recordCarriedOnLoad(appendOwnedItemCandidate(
+                                replacementItems, item));
                             continue;
                         }
-                        item->setOwner(_id);
+                        // Worn first, the item stays possessed by its wearer.
                         item->setEquipped(true);
-                        _game.recordEquippedOnLoad(*slot, item);
+                        item->setOwner(*this);
+                        _game.recordEquippedOnLoad(*slot, item, true);
                         replacementEquipment.emplace(*slot, std::move(item));
                     }
                 }
-                // Carried items keep their own stacks.
                 if (replaceItems) {
                     for (const auto &itemGff : gff.getList("ItemList")) {
                         auto item = loadEntry(*itemGff, "InventoryRes");
                         if (!item) {
                             continue;
                         }
-                        item->setOwner(_id);
-                        replacementItems.push_back(std::move(item));
+                        item->setOwner(*this);
+                        // The creature acquires what it carries, but not what
+                        // it counts, which goes as it is counted.
+                        if (!_game.party().isCountedItem(*item)) {
+                            _game.recordCarriedOnLoad(item);
+                        }
+                        // Carried items keep their own stacks.
+                        placeItem(replacementItems, std::move(item));
                     }
                 }
                 for (const auto &item : replacementItems) {
@@ -10883,8 +12143,13 @@ void Creature::deserializeOwnedItemsAndEquipment(
                     replaceEffectState(std::move(replacementEffects));
                 }
             });
-        // Body armour read with the creature is put on like any other.
+        // Body armour read with the creature is put on like any other, and the
+        // body look starts from what the creature wears.
+        if (replaceEquipment) {
+            _shownTextureVariation = kFirstTextureVariation;
+        }
         if (auto armour = replaceEquipment ? getEquippedItem(InventorySlots::body) : nullptr) {
+            noteBodyLook(InventorySlots::body, *armour);
             updateArmourAppearance(armour);
         }
         return;
@@ -10923,9 +12188,9 @@ void Creature::deserializeOwnedItemsAndEquipment(
                     // A saved player character is told why it may no longer wear an item.
                     const auto slot = admitLoadedEquipment(*item, itemGff->type(), replacementEquipment, bodyRefused, _isPC);
                     if (!slot) {
-                        item->setOwner(_id);
+                        item->restoreOwner(*this);
                         appendOwnedItemCandidate(
-                            replacementItems, item, false);
+                            replacementItems, item);
                         continue;
                     }
                     if (replacementEquipment.count(*slot) != 0) {
@@ -10933,8 +12198,9 @@ void Creature::deserializeOwnedItemsAndEquipment(
                             "Multiple saved items occupy equipment slot " +
                             std::to_string(*slot));
                     }
-                    item->setOwner(_id);
+                    // Worn first, the item stays possessed by its wearer.
                     item->setEquipped(true);
+                    item->restoreOwner(*this);
                     _game.recordEquippedOnLoad(*slot, item);
                     replacementEquipment.emplace(*slot, std::move(item));
                 }
@@ -10948,8 +12214,9 @@ void Creature::deserializeOwnedItemsAndEquipment(
                         *itemGff,
                         identityContext,
                         {SaveRecordOriginKind::ContainedItem, std::to_string(_id)});
-                    item->setOwner(_id);
-                    replacementItems.push_back(std::move(item));
+                    item->restoreOwner(*this);
+                    // Carried items keep their own stacks.
+                    placeItem(replacementItems, std::move(item));
                 }
             }
             for (const auto &item : replacementItems) {
@@ -10989,8 +12256,13 @@ void Creature::deserializeOwnedItemsAndEquipment(
     if (_appearance != previousAppearance) {
         loadAppearanceProperties();
     }
-    // Body armour read with the creature is put on like any other.
+    // Body armour read with the creature is put on like any other, and the
+    // body look starts from what the creature wears.
+    if (replaceEquipment) {
+        _shownTextureVariation = kFirstTextureVariation;
+    }
     if (auto armour = replaceEquipment ? getEquippedItem(InventorySlots::body) : nullptr) {
+        noteBodyLook(InventorySlots::body, *armour);
         updateArmourAppearance(armour);
     }
 }
@@ -11001,6 +12273,7 @@ bool Creature::isPartyMember() const {
 
 void Creature::applyDamageEffect(
     int amount,
+    int dealt,
     const std::shared_ptr<Object> &damager,
     std::optional<DamageReaction> reaction) {
 
@@ -11009,6 +12282,10 @@ void Creature::applyDamageEffect(
     }
 
     if (amount == 0) {
+        // Damage the difficulty weighs down to nothing still shows its number.
+        if (dealt > 0) {
+            _game.floatingText().addDamage(*this, dealt, 0, damager ? damager->id() : script::kObjectInvalid);
+        }
         if (reaction) {
             _game.combat().reactToDamage(*this, damager, *reaction);
         }
@@ -11016,7 +12293,7 @@ void Creature::applyDamageEffect(
         return;
     }
 
-    applyHitPointDamage(amount, damager, reaction);
+    applyHitPointDamage(amount, dealt, damager, reaction);
 }
 
 int Creature::selectMeleeAttackVariant(bool cinematic) {
@@ -11087,7 +12364,7 @@ float Creature::walkSpeed() const {
     if (speed <= kMinimumWalkSpeed) {
         return 0.0f;
     }
-    if (movesStealthily() && isClientPresent()) {
+    if (movesStealthily() && isPresent()) {
         return _stealthWalkSpeed;
     }
     return speed;
@@ -11096,6 +12373,15 @@ float Creature::walkSpeed() const {
 // However slowed, a run covers at least a metre a second.
 float Creature::runSpeed() const {
     return std::max(kMinimumRunSpeed, _runSpeed * movementRate(true));
+}
+
+bool Creature::isDriven() const {
+    const auto action = getCurrentAction();
+    return action && isa<DriveAction>(action);
+}
+
+float Creature::driveSpeed() const {
+    return isDriven() ? cast<DriveAction>(getCurrentAction())->speed(*this) : 0.0f;
 }
 
 int Creature::maxForcePoints() const {
@@ -11178,8 +12464,8 @@ int Creature::adjustedSpellForcePointCost(const Spell &spell, bool partyModifier
 }
 
 PowerMenuStatus Creature::powerMenuStatus(const Spell &spell, std::optional<std::reference_wrapper<const Object>> target) const {
-    // This is the client menu's read-only status, not casting admission or
-    // payment. Menus count the party cost modifiers for every subject.
+    // The power menu only reports a power's status; it neither admits nor
+    // pays for a cast. Menus count the party cost modifiers for every subject.
     PowerMenuStatus status;
     // A power offered against a mine reads Force points alone, counts a
     // missing Force Body as its first level, and skips the range and
@@ -11597,18 +12883,22 @@ int Creature::forceBodyLevel() const {
     return -1;
 }
 
+ForcePointCharge Creature::spellForcePointCharge(const Spell &spell) const {
+    return forcePointCharge(adjustedSpellForcePointCost(spell, isPartyMember()), forceBodyLevel());
+}
+
 bool Creature::canPaySpellForcePointCost(const Spell &spell) const {
-    return canPayForcePointCharge(forcePointCharge(adjustedSpellForcePointCost(spell, isPartyMember()), forceBodyLevel()),
+    return canPayForcePointCharge(spellForcePointCharge(spell),
                                   _currentForce + _temporaryForcePoints, _currentHitPoints + _temporaryHitPoints);
 }
 
 int Creature::recordedSpellForcePointCost(const Spell &spell) const {
-    return forcePointCharge(adjustedSpellForcePointCost(spell, isPartyMember()), forceBodyLevel()).spentForce;
+    return spellForcePointCharge(spell).spentForce;
 }
 
 void Creature::paySpellForcePointCost(const Spell &spell) {
     ForcePointPools pools {_currentForce, _temporaryForcePoints, _currentHitPoints, _temporaryHitPoints};
-    payForcePointCharge(pools, forcePointCharge(adjustedSpellForcePointCost(spell, isPartyMember()), forceBodyLevel()));
+    payForcePointCharge(pools, spellForcePointCharge(spell));
     const int spentTemporaryHitPoints = _temporaryHitPoints - pools.temporaryHitPoints;
     _currentForce = pools.force;
     _temporaryForcePoints = pools.temporaryForce;
@@ -11652,6 +12942,10 @@ void Creature::addTemporaryHitPoints(int amount, bool restoring) {
     }
 }
 
+bool Creature::difficultyKeepsAtOneHitPoint() const {
+    return isPCValue() == 1 && _services.game.difficultyOptions.keepsPlayerCharacterAtOneHitPoint();
+}
+
 int Creature::consumeTemporaryHitPoints(int amount) {
     amount = std::max(0, amount);
     const int remainder = consumeTemporaryResource(_temporaryHitPoints, amount);
@@ -11691,7 +12985,7 @@ void Creature::removeTemporaryHitPoints(int amount) {
     // The creature bleeds as the loss kills it.
     if (wasAlive && currentHitPoints() <= 0 && !_immortal) {
         applyBloodVisual(*this);
-        (void)applyDeathEffect(nullptr, false);
+        (void)applyDeathEffect(nullptr, false, false);
     }
 }
 
@@ -11841,6 +13135,11 @@ void Creature::rebuildStateEffects(std::optional<std::reference_wrapper<const Ef
         setCommandable(false);
     }
     auto internal = makeInternalStateInstance(*winner, removal);
+    if (removal) {
+        if (auto creator = winner->boundCreator()) {
+            internal.spellId = creator->effectSpellId();
+        }
+    }
     internal.id = _game.allocateEffectId();
     setInternalStateEffect(static_cast<int>(state), getStateAmbientCode(state, _game.isTSL()), internal.id);
     _activeStateRootId = winner->id;
@@ -12292,8 +13591,10 @@ bool Creature::canLearnPower(SpellType power, ClassType owner) const {
 }
 
 const Object &Creature::itemRepositoryOwner(bool useParty) const {
+    // The party's items are held by the player character, whoever is
+    // controlled.
     if ((isPartyMember() && useParty) || _game.inventoryMenuCharacter() != -1) {
-        return *_game.party().player();
+        return *_game.party().actualPlayer();
     }
     return *this;
 }
@@ -12454,7 +13755,7 @@ std::shared_ptr<Talent> Creature::selectTalent(int category, int crMax, int incl
             } else if (!categoryMatches(category, static_cast<int>(spell->category))) {
                 continue;
             }
-            pool.add({TalentType::Spell, id, kUnselectedCastingClass, source.item->id(), static_cast<int>(source.property)},
+            pool.add({TalentType::Spell, id, kUnselectedCastingClass, source.item->id(), static_cast<int>(source.item->usePropertyPlace(source.property))},
                      spell->maxCR, ranked);
         }
         return pool.choose(_game);

@@ -45,6 +45,8 @@ static constexpr char kComputerSpikeTag[] = "k_computer_spike";
 static constexpr char kRepairPartTag[] = "k_repair_part";
 static constexpr float kStaticBandAlpha = 0.4f;
 static constexpr char kComputerTypesResRef[] = "comptypes";
+// The videoeffects.2da row of the security camera look without its label.
+static constexpr int kUnlabelledSecurityCameraVideoEffect = 10;
 
 void ComputerGUI::init() {
     Conversation::init();
@@ -90,8 +92,46 @@ void ComputerGUI::onLoadEntry() {
     int cameraId = 0;
     setPresentation(getCamera(cameraId) == CameraType::Static ? Presentation::Camera : Presentation::Normal);
     if (_presentation == Presentation::Camera) {
+        if (placesCameras()) {
+            aimPlacedCamera(cameraId);
+        }
         _cameraGUI.clearSelection();
+        const int effect = _currentEntry->camVidEffect;
+        // TSL: a shot carrying -2, which shows no effect there, or the
+        // security camera look without its label hides the return label.
+        const bool returnless = effect == kKeepShotVideoEffect || effect == kUnlabelledSecurityCameraVideoEffect;
+        _cameraGUI.setReturnLabelVisible(!(_game.isTSL() && returnless));
     }
+}
+
+bool ComputerGUI::placesCameras() const {
+    auto module = _game.module();
+    return module && !module->area()->getObjectsByType(ObjectType::Camera).empty();
+}
+
+// In place of a camera the area doesn't place, the dialog camera shows its
+// unturned view from the world origin.
+void ComputerGUI::aimPlacedCamera(int cameraId) {
+    auto area = _game.module()->area();
+    area->setStaticCamera(cameraId);
+    const Camera *placed = area->getCamera(CameraType::Static);
+    if (!placed || placed->cameraId() != cameraId) {
+        showShotOnDialogCamera();
+        area->getCamera<DialogCamera>(CameraType::Dialog)->takePlacedShot(glm::vec3(0.0f));
+    }
+}
+
+// An area that places no camera leaves the view as it is.
+bool ComputerGUI::takePlacedCameraView(int cameraId) {
+    if (!placesCameras()) {
+        return false;
+    }
+    Conversation::takePlacedCameraView(cameraId);
+    aimPlacedCamera(cameraId);
+    setPresentation(Presentation::Camera);
+    _cameraGUI.clearSelection();
+    _cameraGUI.setReturnLabelVisible(true);
+    return true;
 }
 
 void ComputerGUI::onEntryEnded() {
@@ -112,7 +152,8 @@ void ComputerGUI::setPresentation(Presentation presentation) {
 
 void ComputerGUI::playHum() {
     stopHum();
-    _hum = _services.audio.mixer.play(_humClip, AudioType::Sound, kHumGain, true);
+    // The hum stays in the default group, 23, which no sound mode keeps.
+    _hum = _services.audio.mixer.play(_humClip, AudioType::Sound, kDefaultSoundGroup, kHumGain, true);
 }
 
 void ComputerGUI::stopHum() {
@@ -129,6 +170,7 @@ void ComputerGUI::preload(IGUI &gui) {
 
 void ComputerGUI::onGUILoaded() {
     bindControls();
+    _gui->setHilightFollowsKeyboard(true);
     configureMessage();
     configureReplies();
     configureSkillLabels();
@@ -144,8 +186,6 @@ void ComputerGUI::configureMessage() {
 
 void ComputerGUI::configureReplies() {
     _controls.LB_REPLIES->setProtoMatchContent(true);
-    // The selected reply stays selected when the pointer moves off it.
-    _controls.LB_REPLIES->setKeepsSelection(true);
     _controls.LB_REPLIES->protoItem().setHilightColor(_hilightColor);
     _controls.LB_REPLIES->protoItem().setTextColor(_baseColor);
     _controls.LB_REPLIES->setOnItemClick([this](auto &item) {
@@ -231,8 +271,12 @@ void ComputerGUI::setReplyLines(std::vector<std::string> lines) {
         item.text = lines[i];
         _controls.LB_REPLIES->addItem(std::move(item));
     }
-    // The first reply is selected as the replies are listed.
+    // The first reply is selected as the replies are listed, and replies the
+    // player chooses from hold the keyboard.
     _controls.LB_REPLIES->setSelectedItemIndex(0);
+    if (!autoPicksFirstReply()) {
+        _gui->setActiveControl(*_controls.LB_REPLIES);
+    }
     // The numbers are written when an entry's message is set and again when
     // its replies are listed, as the entry ends.
     refreshSkills();

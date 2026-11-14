@@ -25,7 +25,10 @@
 #include <glm/geometric.hpp>
 
 #include "reone/audio/mixer.h"
+#include "reone/game/animationutil.h"
+#include "reone/game/combatfeedback.h"
 #include "reone/game/d20/class.h"
+#include "reone/game/d20/races.h"
 #include "reone/game/d20/spell.h"
 #include "reone/game/d20/spells.h"
 #include "reone/game/di/services.h"
@@ -70,7 +73,6 @@ static constexpr int kWristLaunchAnimationId = 10417;
 static constexpr int kNearThrowAnimationId = 10130;
 static constexpr int kThrowAnimationId = 10129;
 static constexpr int kInjectAnimationId = 10070;
-static constexpr int kActivateAnimationId = 10136;
 static constexpr int kDroidUtilityAnimationId = 11001;
 
 // A grenade thrown at a target nearer than this takes the near throw.
@@ -112,6 +114,11 @@ SpellType itemSpellForActor(const Object &actor, SpellType propertySpell) {
         }
     }
     return propertySpell;
+}
+
+bool isHandThrownGrenadeSpell(SpellType spell) {
+    // Every spell a wrist launcher fires follows the grenade spells.
+    return static_cast<int>(spell) < kWristLauncherSpells.front().second;
 }
 
 void publishItemCastLevel(Creature &caster) {
@@ -507,7 +514,7 @@ static ItemUsePresentation itemUsePresentation(const Creature &user, int itemTyp
             break;
         }
         look.clip = "activate";
-        look.clipId = kActivateAnimationId;
+        look.clipId = kCreatureActivateAnimationId;
         break;
     case Item::kForearmBandsItemType:
         look.impact = 0.6f;
@@ -517,7 +524,7 @@ static ItemUsePresentation itemUsePresentation(const Creature &user, int itemTyp
             break;
         }
         look.clip = "activate";
-        look.clipId = kActivateAnimationId;
+        look.clipId = kCreatureActivateAnimationId;
         break;
     case Item::kDroidUtilityItemType: {
         // Its conjure, then its loop; it takes effect as the loop starts.
@@ -616,10 +623,30 @@ void SpellCastVisuals::detach(Set &set) {
     }
 }
 
+// The conjure's sounds play above the caster's conjuring hand, or above the
+// caster when its body has none: the caster's voice, by its gender, for a
+// player race only, then the visuals' sound.
+static void playConjureSounds(Creature &caster, const Spell &spell) {
+    glm::vec3 position {caster.position()};
+    auto body = std::dynamic_pointer_cast<scene::ModelSceneNode>(caster.sceneNode());
+    if (body)
+        if (auto *hand = body->getNodeByName(kCastVisualHooks[1])) {
+            position = hand->origin();
+        }
+    position.z += kEffectSoundHeight;
+    auto &services = caster.services();
+    if (services.game.races.get(caster.racialType()).playerRace) {
+        const auto &voice = caster.gender() == Gender::Female ? spell.conjureSoundFemale : spell.conjureSoundMale;
+        services.audio.mixer.play(voice, audio::AudioType::Sound, kSpellEffectSoundGroup, 1.0f, false, position);
+    }
+    services.audio.mixer.play(spell.conjureSoundVisual, audio::AudioType::Sound, kSpellEffectSoundGroup, 1.0f, false, position);
+}
+
 void SpellCastVisuals::showConjure(Creature &caster, const Spell &spell) {
     detach(_conjure);
     detach(_cast);
     attach(_conjure, caster, spell.conjureVisuals, "conjure01");
+    playConjureSounds(caster, spell);
     _released = false;
     _conjureRemaining = _castRemaining = kCastVisualSeconds;
 }
@@ -845,9 +872,11 @@ std::optional<SpellSelection> scriptCastingSource(const Creature &caster, const 
     return SpellSelection {kSpellLikeAbilityClass, caster.spellLikeAbilityCasterLevel(static_cast<int>(spell.type))};
 }
 
+// The cast sound plays above the caster.
 void presentSpellRelease(Object &caster, const Spell &spell) {
     if (spell.castSound) {
-        caster.services().audio.mixer.play(spell.castSound, audio::AudioType::Sound, 1.0f, false, caster.position());
+        const glm::vec3 soundPosition {caster.position() + glm::vec3 {0.0f, 0.0f, kEffectSoundHeight}};
+        caster.services().audio.mixer.play(spell.castSound, audio::AudioType::Sound, kSpellEffectSoundGroup, 1.0f, false, soundPosition);
     }
     if (auto *creature = dyn_cast<Creature>(&caster)) {
         creature->spellCastVisuals().showCast(*creature, spell);
@@ -865,15 +894,12 @@ static constexpr double kUntimedFlightMilliseconds = 4294967296.0;
 
 uint32_t spellProjectileTimeMilliseconds(
     const Spell &spell, const glm::vec3 &origin, const glm::vec3 &destination,
-    ProjectilePathType overridePath, bool tsl) {
+    ProjectilePathType overridePath) {
     if (!spell.projectile) {
         return 0;
     }
     const float distance = glm::distance(origin, destination);
-    // KotOR takes the logarithm in single precision; TSL takes it in double
-    // precision and rounds it to single.
-    const float logarithm = tsl ? static_cast<float>(std::log(static_cast<double>(distance)))
-                                : std::log(distance);
+    const float logarithm = static_cast<float>(std::log(static_cast<double>(distance)));
     float speed = logarithm * 3.0f + 2.0f;
     const auto path = effectiveProjectilePath(spell, overridePath);
     if (path == ProjectilePathType::HighBallistic) {
@@ -922,9 +948,6 @@ bool admitSpellCast(const Object &actor, const Spell &spell, bool freeCast, bool
     const auto *creature = dyn_cast<Creature>(&actor);
     if (!creature) {
         return isa<Placeable>(&actor) || reject("unsupported caster");
-    }
-    if (!creature->canCastSpells()) {
-        return reject("caster cannot act");
     }
     if (!itemCast && !equipmentAllowsSpell(*creature, spell)) {
         return reject("equipment disallows power");
@@ -1057,11 +1080,13 @@ void useItemAtOnce(Game &game, Creature &user, const std::shared_ptr<Item> &item
         user.setSpellCastContext(context);
         queueSpellImpact(game, *spell, user, game.getObjectById(user.id()), glm::vec3(0.0f),
                          context, item, user.lastSpellProjectileMilliseconds());
-        // The impact goes out with the same release presentation as a cast.
+        // The impact goes out with the same release presentation and
+        // announcement as a cast.
         presentSpellRelease(user, *spell);
+        addPowerUseFeedback(game, user, *spell, item);
     }
     if (item->consumeSpellUse(index)) {
-        game.postObjectDestruction(*item, 0.0f);
+        game.postObjectDestruction(*item, user.id(), 0.0f);
     }
     if (user.isInCombat()) {
         user.startItemUseCooldown();
@@ -1129,7 +1154,7 @@ bool queueSpellImpact(Game &game, const Spell &spell, Object &caster,
         return false;
     }
     debug(str(boost::format("Spell queued: actor=%u spell=%d delay=%u script=%s") % caster.id() % context.spellId % delayMilliseconds % spell.impactScript), LogChannel::Combat);
-    module->enqueueBoundSaveEvent(std::move(event), true);
+    module->enqueueBoundSaveEvent(std::move(event));
     return true;
 }
 

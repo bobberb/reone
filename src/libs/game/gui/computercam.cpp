@@ -10,6 +10,7 @@
 #include "reone/game/gui/computercam.h"
 
 #include "reone/game/game.h"
+#include "reone/gui/control/label.h"
 
 namespace reone {
 
@@ -24,6 +25,15 @@ void ComputerCamGUI::preload(gui::IGUI &gui) {
     GameGUI::preload(gui);
     // Both games author the camera overlay on a 640x480 canvas.
     gui.setResolution(640, 480);
+}
+
+void ComputerCamGUI::onGUILoaded() {
+    _gui->setHilightFollowsKeyboard(true);
+    _returnLabel = findControl<gui::Label>("LBL_RETURN");
+}
+
+void ComputerCamGUI::setReturnLabelVisible(bool visible) {
+    _returnLabel->setVisible(visible);
 }
 
 } // namespace game

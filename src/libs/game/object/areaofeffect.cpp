@@ -23,6 +23,9 @@
 
 #include <boost/algorithm/string.hpp>
 
+#include "reone/audio/di/services.h"
+#include "reone/audio/mixer.h"
+#include "reone/audio/source.h"
 #include "reone/game/d20/spell.h"
 #include "reone/game/d20/spells.h"
 #include "reone/game/di/services.h"
@@ -34,10 +37,12 @@
 #include "reone/game/object/creature.h"
 #include "reone/game/savedruntime.h"
 #include "reone/game/script/runner.h"
+#include "reone/game/shaperules.h"
 #include "reone/game/twodautil.h"
 #include "reone/resource/2da.h"
 #include "reone/resource/di/services.h"
 #include "reone/resource/provider/2das.h"
+#include "reone/resource/provider/audioclips.h"
 
 using namespace reone::resource;
 
@@ -53,6 +58,9 @@ static constexpr float kMinOrientationLength2 = 1.0e-4f;
 void AreaOfEffect::deserialize(
     const Gff &gff,
     const SerializedIdentityContext &identityContext) {
+    // An area of effect a module's GIT places is new; one read from a save
+    // has played its impact already.
+    _restored = identityContext.isSerializedState();
     deserializeRuntimeState(gff, identityContext);
     if (gff.readString(_tag, "Tag")) {
         boost::to_lower(_tag);
@@ -236,10 +244,30 @@ bool AreaOfEffect::contains(const glm::vec3 &point) const {
     return true;
 }
 
+bool AreaOfEffect::crosses(const glm::vec3 &from, const glm::vec3 &to) const {
+    if (_shape == Shape::Circle) {
+        return shape::crossesSphere(from, to, center(), _radius);
+    }
+    return shape::crossesOutline(glm::vec2(from), glm::vec2(to), _corners);
+}
+
+AreaOfEffect::~AreaOfEffect() {
+    if (_durationSound) {
+        _durationSound->stop();
+    }
+}
+
 void AreaOfEffect::update(float dt) {
+    if (!_soundsStarted) {
+        startSounds();
+    }
     updateStampedHeartbeat(_onHeartbeat);
     if (isCarried() && _shape == Shape::Circle) {
         followCarrier();
+    }
+    // The duration loop goes where the effect goes.
+    if (_durationSound) {
+        _durationSound->setPosition(soundPosition());
     }
     if (_durationType == DurationType::Temporary) {
         if (_remainingDuration <= dt) {
@@ -272,10 +300,15 @@ void AreaOfEffect::scanOccupants(bool announce) {
     });
 }
 
-void AreaOfEffect::updateOccupancy(const std::shared_ptr<Creature> &creature, bool announce) {
+void AreaOfEffect::updateOccupancy(const std::shared_ptr<Creature> &creature, bool announce, std::optional<glm::vec3> from) {
     const bool inside = contains(creature->position());
     const bool known = _occupants.count(creature->id()) != 0;
     if (inside == known) {
+        // A step that passes through the edge signals both, in the order it
+        // crossed.
+        if (announce && from && crosses(*from, creature->position())) {
+            _game.queuePassage(*this, creature, inside);
+        }
         return;
     }
     if (inside) {
@@ -341,8 +374,36 @@ void AreaOfEffect::receiveExitedSignal(const std::shared_ptr<Object> &exiting) {
     _game.scriptRunner().run(_onExit, _id);
 }
 
+glm::vec3 AreaOfEffect::soundPosition() const {
+    return _position + glm::vec3(0.0f, 0.0f, kEffectSoundHeight);
+}
+
+// The sounds are the vfx_persistent row's: a blank cell plays none. A
+// restored effect starts only its duration loop.
+void AreaOfEffect::startSounds() {
+    _soundsStarted = true;
+    auto table = getRequiredTwoDA(_services.resource.twoDas, "vfx_persistent");
+    auto clip = [&](const char *column) {
+        const auto name = boost::to_lower_copy(table->getString(_areaEffectId, column));
+        return name.empty() ? nullptr : _services.resource.audioClips.get(name);
+    };
+    if (!_restored) {
+        _services.audio.mixer.play(clip("soundimpact"), audio::AudioType::Sound, kAreaOfEffectSoundGroup, 1.0f, false, soundPosition());
+    }
+    _durationSound = _services.audio.mixer.play(clip("soundduration"), audio::AudioType::Sound, kAreaOfEffectSoundGroup, 1.0f, true, soundPosition());
+    _cessationSound = clip("soundcessation");
+}
+
+void AreaOfEffect::stopSounds() {
+    _services.audio.mixer.play(_cessationSound, audio::AudioType::Sound, kAreaOfEffectSoundGroup, 1.0f, false, soundPosition());
+    if (_durationSound) {
+        _durationSound->stop();
+        _durationSound.reset();
+    }
+}
+
 void AreaOfEffect::destroy() {
-    _game.postObjectDestruction(*this, std::nullopt, 0.0f, true);
+    _game.postObjectDestruction(*this, script::kObjectInvalid, 0.0f, true);
 }
 
 EffectApplicationResult AreaOfEffectEffect::onApply(Object &object, EffectInstance &instance) {
@@ -365,7 +426,7 @@ EffectApplicationResult AreaOfEffectEffect::onApply(Object &object, EffectInstan
 void AreaOfEffectEffect::onRemove(Object &object, const EffectInstance &instance) {
     if (isa<Creature>(&object)) {
         if (auto areaOfEffect = instance.boundObjectParameter(0)) {
-            object.game().postObjectDestruction(*areaOfEffect, std::nullopt, 0.0f, true);
+            object.game().postObjectDestruction(*areaOfEffect, script::kObjectInvalid, 0.0f, true);
         }
     }
 }

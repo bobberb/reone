@@ -84,8 +84,13 @@ static constexpr char kStagedRootId[] = "currentgame";
 
 static constexpr char kModuleSaveTableName[] = "modulesave";
 static constexpr char kIncludeInSaveColumn[] = "includeinsave";
+static constexpr char kAutoSaveOnEnterColumn[] = "autosaveonenter";
+static constexpr char kSaveGroupColumn[] = "savegroup";
+static constexpr char kDeleteSaveGroupOnEnterColumn[] = "deletesavegrouponenter";
+static constexpr char kModuleNameColumn[] = "modulename";
 
 static const std::vector<std::string> g_globalLipFiles {"global.mod", "localization.mod"};
+static constexpr char kK1LipFilename[] = "localization.mod";
 
 static const std::unordered_map<TextureQuality, std::string> kTexQualityToTexPack {
     {TextureQuality::High, kTexturePackFilenameHigh},
@@ -601,6 +606,14 @@ void ResourceDirector::loadK1GlobalResources() {
     loadGlobalRimResource();
     loadTexturePackResources();
     loadPlayerSupportResource();
+    // The lips of lines heard in any module, the party's among them.
+    for (const auto &lipsPath : lipsRoots(_gameId, _gamePath, _odysseyRoots)) {
+        if (auto localizationPath = findFileIgnoreCase(lipsPath, kK1LipFilename)) {
+            _resources.addERF(*localizationPath,
+                              ResourceOwner::Global,
+                              bucketOf(ResourceSourceBucket::EncapsulatedClass2));
+        }
+    }
 }
 
 void ResourceDirector::loadLiveResources() {
@@ -750,25 +763,49 @@ void ResourceDirector::addStagedModuleSources(const std::string &moduleRoot,
 }
 
 /**
- * Whether saved state for this module may be selected at all.
+ * A module's part in saved games.
  *
- * The table is keyed by row label, which is the module root. Every way of
- * failing to find an exclusion means include: no table, no row, or no cell.
+ * The table is keyed by row label, which is the module root. A module the
+ * table does not describe - no table, no row, or no cell - is included in
+ * saves and autosaves on every entry.
  */
-bool ResourceDirector::includeModuleInSave(const std::string &moduleRoot) {
+ModuleSaveRules ResourceDirector::moduleSaveRules(const std::string &module) {
+    ModuleSaveRules rules;
+    rules.autosaveOnEnter = ModuleAutosave::Always;
     auto table = _twoDas.get(kModuleSaveTableName);
     if (!table) {
-        return true;
+        return rules;
     }
-    int row = table->indexByLabel(moduleRoot);
+    int row = table->indexByLabel(module);
     if (row == -1) {
-        return true;
+        return rules;
     }
-    auto include = table->getIntOpt(row, kIncludeInSaveColumn);
-    if (!include) {
-        return true;
+    rules.includeInSave = table->getIntOpt(row, kIncludeInSaveColumn).value_or(1) != 0;
+    rules.deleteSaveGroupOnEnter = table->getIntOpt(row, kDeleteSaveGroupOnEnterColumn);
+    auto autosave = boost::to_lower_copy(table->getString(row, kAutoSaveOnEnterColumn));
+    if (autosave == "no") {
+        rules.autosaveOnEnter = ModuleAutosave::Never;
+    } else if (autosave == "yes") {
+        rules.autosaveOnEnter = ModuleAutosave::WhenEnabledAndDue;
+    } else if (!autosave.empty() && autosave != "force") {
+        rules.autosaveOnEnter = ModuleAutosave::WhenDue;
     }
-    return *include != 0;
+    return rules;
+}
+
+std::vector<std::string> ResourceDirector::saveGroupModules(int group) {
+    std::vector<std::string> modules;
+    auto table = _twoDas.get(kModuleSaveTableName);
+    if (!table) {
+        return modules;
+    }
+    for (int row = 0; row < table->getRowCount(); ++row) {
+        if (table->getIntOpt(row, kSaveGroupColumn) == group) {
+            modules.push_back(
+                boost::to_lower_copy(table->getString(row, kModuleNameColumn)));
+        }
+    }
+    return modules;
 }
 
 std::unique_ptr<PreparedModuleLoad> ResourceDirector::planModuleLoad(
@@ -792,7 +829,7 @@ std::unique_ptr<PreparedModuleLoad> ResourceDirector::planModuleLoad(
     ModulePolicyRequest request;
     request.game = _gameId;
     request.moduleName = discovered.moduleRoot;
-    request.includeInSave = includeModuleInSave(discovered.moduleRoot);
+    request.includeInSave = moduleSaveRules(discovered.moduleRoot).includeInSave;
 
     auto inventory = index.inventory();
     // Saved mode is a property of the form the active table takes, not of the

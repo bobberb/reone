@@ -25,9 +25,11 @@
 
 #include "reone/game/combattables.h"
 #include "reone/game/d20/class.h"
+#include "reone/game/d20/skills.h"
 #include "reone/game/d20/spell.h"
 #include "reone/game/d20/spells.h"
 #include "reone/game/di/services.h"
+#include "reone/game/equipmentoperation.h"
 #include "reone/game/game.h"
 #include "reone/game/object.h"
 #include "reone/game/object/area.h"
@@ -183,8 +185,6 @@ static bool meetsAlignmentLimits(const Creature &creature, const Item &item, boo
             return static_cast<Alignment>(property.subtype) == alignment;
         });
     }
-    static constexpr int kPureDarkSideGoodEvil = 0;
-    static constexpr int kPureLightSideGoodEvil = 100;
     const int goodEvil = creature.goodEvil();
     return anyActiveProperty(item, ItemProperty::UseLimitationAlignmentGroup, [&](const Item::PropertyEntry &property) {
         switch (static_cast<Alignment>(property.subtype)) {
@@ -195,9 +195,9 @@ static bool meetsAlignmentLimits(const Creature &creature, const Item &item, boo
         case Alignment::DarkSide:
             return static_cast<Alignment>(property.subtype) == alignment;
         case Alignment::PureDarkSide:
-            return goodEvil == kPureDarkSideGoodEvil;
+            return goodEvil == kMinGoodEvil;
         case Alignment::PureLightSide:
-            return goodEvil == kPureLightSideGoodEvil;
+            return goodEvil == kMaxGoodEvil;
         default:
             return false;
         }
@@ -371,13 +371,14 @@ bool isLeaderUsableItem(const Creature &leader, const Item &item, int flags) {
     Game &game = leader.game();
     const bool tsl = game.isTSL();
     const bool mineKit = (flags & LeaderUsableFlags::mines) && item.itemType() == Item::kTrapKitItemType;
-    // A mine kit asks for a usable trap and the Demolitions skill.
+    // A mine kit asks for a usable trap and a leader who can use the
+    // Demolitions skill.
     auto trapUsable = [&]() {
         const auto trap = firstActiveProperty(item, ItemProperty::Trap);
         if (!trap) {
             return canUseItem(leader, item, true);
         }
-        return trap->get().usable && leader.attributes().hasSkill(SkillType::Demolitions) && canUseItem(leader, item, true);
+        return trap->get().usable && leader.canUseSkill(SkillType::Demolitions) && canUseItem(leader, item, true);
     };
     const auto castSpell = firstActiveProperty(item, ItemProperty::ActivateItem);
     if (item.plotFlag()) {
@@ -606,6 +607,7 @@ std::shared_ptr<Item> takeEquipmentCandidate(
 
     auto split = game.newItemClone(*item);
     split->setStackSize(1);
+    split->keepMarksOf(*item);
     return split;
 }
 
@@ -642,10 +644,33 @@ bool releaseAreaOwnedItem(
     return area && area->releaseObject(item);
 }
 
+std::shared_ptr<Item> releaseHeldItem(
+    Game &game,
+    const std::shared_ptr<Item> &item) {
+    auto owner = game.getObjectById(item->owner());
+    if (!owner) {
+        return nullptr;
+    }
+    auto leaving = item;
+    if (auto creature = std::dynamic_pointer_cast<Creature>(owner);
+        creature && item->isEquipped()) {
+        leaving = runUnequip(game, *creature, item, nullptr, ItemStacking::Own, false);
+        if (!leaving) {
+            return nullptr;
+        }
+        owner = game.getObjectById(leaving->owner());
+        if (!owner) {
+            return nullptr;
+        }
+    }
+    return owner->removeItemStack(leaving) ? leaving : nullptr;
+}
+
 ItemTransfer transferItemTo(
     Game &game,
     const std::shared_ptr<Item> &item,
-    Object &receiver) {
+    Object &receiver,
+    ItemLossNotice loss) {
     if (!item || (!item->isRuntimeLive() && !item->isPresentationOnly()) ||
         (!receiver.isRuntimeLive() && !receiver.isPresentationOnly()) ||
         (item->isPresentationOnly() != receiver.isPresentationOnly()) ||
@@ -654,8 +679,15 @@ ItemTransfer transferItemTo(
     }
 
     uint32_t ownerId = item->owner();
-    if (ownerId == receiver.id() && !item->isEquipped())
+    if (ownerId == receiver.id() && !item->isEquipped()) {
+        // A placeable takes back an item it holds: the item leaves its list
+        // and is added again, as its newest item or joining a stack there.
+        if (receiver.type() == ObjectType::Placeable) {
+            receiver.removeItemStack(item);
+            return {true, receiver.addItem(item)};
+        }
         return {true, item};
+    }
 
     if (!item->isHeld()) {
         // owner() describes nested inventory/equipment ownership; it does not
@@ -670,22 +702,86 @@ ItemTransfer transferItemTo(
         if (!releaseAreaOwnedItem(game, item)) {
             return {};
         }
+        game.party().noteItemReceived(*item, receiver, nullptr);
         return {true, receiver.addItem(item)};
     }
 
-    auto owner = game.getObjectById(ownerId);
-    if (!owner)
+    auto giver = game.getObjectById(ownerId);
+    if (!giver)
         return {};
 
-    if (auto creature = std::dynamic_pointer_cast<Creature>(owner);
-        creature && item->isEquipped()) {
-        if (!creature->takeEquippedItem(item))
-            return {};
-    } else if (!owner->removeItemStack(item)) {
+    auto moving = releaseHeldItem(game, item);
+    if (!moving)
         return {};
+
+    if (loss != ItemLossNotice::None) {
+        moving->announceLoss(loss == ItemLossNotice::Told);
     }
 
-    return {true, receiver.addItem(item)};
+    game.party().noteItemReceived(*moving, receiver, giver.get());
+    return {true, receiver.addItem(moving)};
+}
+
+void announceAcquiredBy(
+    const std::shared_ptr<Item> &item,
+    const std::shared_ptr<Item> &held,
+    const Object &creature,
+    bool feedback) {
+    if (!held) {
+        return;
+    }
+    bool announced = true;
+    if (held != item) {
+        held->announceKept();
+    } else if (const auto possessor = held->inSharedInventory() ? held->possessor() : nullptr) {
+        held->announceAcquisition(script::kObjectInvalid, *possessor, feedback, feedback);
+    } else {
+        announced = false;
+    }
+    // Announced once, it is not announced again to the creature possessing it.
+    if (!announced || held->possessorId() != creature.id()) {
+        held->passTo(creature, true, feedback);
+    }
+}
+
+void announceStoredFor(
+    const std::shared_ptr<Item> &item,
+    const std::shared_ptr<Item> &held,
+    uint32_t previousPossessor,
+    const Object &creature) {
+    if (!held) {
+        return;
+    }
+    if (held != item) {
+        held->announceKept();
+    } else if (const auto possessor = held->possessor()) {
+        held->announceAcquisition(previousPossessor, *possessor, true, true);
+    }
+    if (held->possessorId() != creature.id()) {
+        held->passTo(creature, true, true);
+    }
+}
+
+ItemTransfer giveItemToCreature(
+    Game &game,
+    const std::shared_ptr<Item> &item,
+    Object &receiver,
+    const Object &creature,
+    bool feedback) {
+    const bool heldAlready = item->owner() == receiver.id() && !item->isEquipped();
+    auto transfer = transferItemTo(game, item, receiver);
+    if (!transfer) {
+        return transfer;
+    }
+    if (heldAlready) {
+        // An item the receiver holds already stays where it is and passes to
+        // the creature: kept when it possesses it, else lost by the one that
+        // did and acquired by the creature.
+        item->passTo(creature, true, feedback);
+    } else {
+        announceAcquiredBy(item, transfer.held, creature, feedback);
+    }
+    return transfer;
 }
 
 } // namespace game

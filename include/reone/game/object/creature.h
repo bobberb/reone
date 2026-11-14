@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023 The reone project contributors
+ * Copyright (c) 2020-2026 The reone project contributors
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -46,6 +46,7 @@
 #include "../menupresentation.h"
 #include "../object.h"
 #include "../pathfinder.h"
+#include "../portrait.h"
 #include "../runtimeref.h"
 
 #include "item.h"
@@ -280,6 +281,7 @@ inline ArmorClassParts armorClassParts(const ArmorClassCache &cache,
 }
 
 struct PowerMenuStatus;
+enum class PowerUnavailableReason;
 struct ContextAction;
 
 class CreatureClass;
@@ -307,11 +309,15 @@ struct SavingThrowBreakdown {
 
 /**
  * Where the clip a creature shows came from: its animation ID, -1 when
- * unknown, and whether it is a dialog animation.
+ * unknown, whether it is a dialog animation, whether it is only shown, the
+ * creature carrying on with what it does under it, and the speed it was asked
+ * to play at.
  */
 struct AnimationSource {
     int id {-1};
     bool dialog {false};
+    bool shownOnly {false};
+    float speed {1.0f};
 };
 
 /**
@@ -333,6 +339,8 @@ public:
     static constexpr int kNoFuryDamageBonus = -1;
     /** The most experience a creature holds; an addition past it is refused. */
     static constexpr int kMaxExperience = std::numeric_limits<int>::max();
+    /** The node of a character's body model its head is attached at. */
+    static constexpr char kHeadHookNode[] = "headhook";
 
     // AI state
 
@@ -386,6 +394,8 @@ public:
         std::map<uint32_t, RuntimeObjectRef<Object>> heard;
         /** Perceived creatures that are invisible to this one; kept while so. */
         std::map<uint32_t, RuntimeObjectRef<Object>> invisible;
+        /** The ids above, each once, in the order they were first perceived. */
+        std::vector<uint32_t> order;
 
         bool sees(uint32_t id) const {
             auto found = seen.find(id);
@@ -404,6 +414,20 @@ public:
             seen.clear();
             heard.clear();
             invisible.clear();
+            order.clear();
+        }
+        /**
+         * Keeps \p id's place in the order after a change: a creature newly
+         * perceived goes last, and one no longer perceived in any way leaves.
+         */
+        void reorder(uint32_t id) {
+            const auto found = std::find(order.begin(), order.end(), id);
+            const bool held = seen.count(id) != 0 || heard.count(id) != 0 || invisible.count(id) != 0;
+            if (held && found == order.end()) {
+                order.push_back(id);
+            } else if (!held && found != order.end()) {
+                order.erase(found);
+            }
         }
     };
 
@@ -441,6 +465,8 @@ public:
         std::string fallHard;
         std::string fallMetal;
         std::string fallWater;
+        /** The sound the creature loops wherever it is; empty for none. */
+        std::string looping;
     };
 
     /** The creature's part in combat: whether it fights, how it was drawn in, and its targets. */
@@ -468,6 +494,12 @@ public:
          * cannot hurt its target. It is saved with the round.
          */
         bool weaponIneffectiveReported {false};
+        /**
+         * The creature's round was last started as the master of an engaged
+         * exchange. Its round's end leaves this as it is, and it is saved
+         * with the round.
+         */
+        bool roundMaster {false};
         Timer expiryTimer;
         float decisionScriptTime {3.0f};
     };
@@ -477,6 +509,12 @@ public:
         std::string sceneName,
         Game &game,
         ServicesView &services);
+    /**
+     * The creature's loops end with it: its appearance's and its light
+     * source's loops and its rolling footstep, which the mixer would
+     * otherwise keep playing.
+     */
+    ~Creature();
 
     static bool classof(const Object *from) {
         return from->type() == ObjectType::Creature;
@@ -524,8 +562,23 @@ public:
      * may change the creature's appearance for good.
      */
     void updateArmourAppearance(const std::shared_ptr<Item> &armour);
+    /** Takes the texture variation of a body item of the body model type put on \p slot. */
+    void noteBodyLook(int slot, const Item &item);
+    /** The body variation and texture variation \p body is drawn with. */
+    std::pair<int, int> bodyLookOf(const Item &body) const;
+    /** Shows the texture variation \p other shows, as a preview of it does. */
+    void takeShownTextureVariation(const Creature &other) { _shownTextureVariation = other._shownTextureVariation; }
 
     void deserialize(
+        const resource::Gff &gff,
+        const SerializedIdentityContext &identityContext);
+    /**
+     * Reads the record of the creature under control as a party member's: it
+     * keeps none of the credits, components or chemicals the record holds,
+     * and the counted items it carries become the party's, the player told
+     * each gain.
+     */
+    void deserializeAsPartyMember(
         const resource::Gff &gff,
         const SerializedIdentityContext &identityContext);
 
@@ -568,6 +621,7 @@ public:
      */
     void applyDamageEffect(
         int amount,
+        int dealt,
         const std::shared_ptr<Object> &damager,
         std::optional<DamageReaction> reaction) override;
 
@@ -586,9 +640,19 @@ public:
     /**
      * Plays a sound-set sound, replacing the creature's last one. A dead
      * creature, or a party member at zero vitality, only plays its death
-     * sound.
+     * sound; a creature the player does not perceive plays none.
      */
     void playSound(resource::SoundSetEntry entry, bool positional = true);
+    /**
+     * A creature the player stops perceiving falls silent: its voice, its
+     * footsteps and the hum of its powered equipment stop. The hum starts
+     * again when the player perceives it again.
+     */
+    void setPresent(bool present) override;
+    /** Ends the creature's rolling footstep loop. */
+    void stopRollingFootstep();
+    /** Ends the creature's own loop and its light source's. */
+    void stopLoopingSounds();
     /** The leader is in the creature's area within 30 m, where it hears the creature's voice. */
     bool isHeardByLeader() const;
 
@@ -597,8 +661,22 @@ public:
      * without one it moves no lips. A new line starts the talk over.
      */
     void startTalking(const std::shared_ptr<graphics::LipAnimation> &animation);
+    /**
+     * The head speaks a line once, lip-synced to \p animation, over whatever
+     * pose the body shows, and stops when the line ends. It takes the head
+     * over from a line the creature was talking, which does not come back.
+     */
+    void talkOnce(const std::shared_ptr<graphics::LipAnimation> &animation);
     /** The talking head blends out. */
     void stopTalking();
+    /**
+     * A conversation puts away the items in the creature's hands, or gives
+     * them back. An item equipped into a hand while it is put away shows at
+     * once; the other hand stays put away.
+     */
+    void setHandItemsPutAwayForConversation(bool putAway);
+    /** A conversation puts away the item on the creature's head, or gives it back. */
+    void setHeadItemPutAwayForConversation(bool putAway);
 
     bool isSelectable() const override;
     int effectState() const { return _effectState; }
@@ -660,6 +738,8 @@ public:
     void healForcePoints(int amount);
     /** Adds to the ordinary Force pool without capping it at the maximum. */
     void addCurrentForcePoints(int amount);
+    /** Sets the ordinary Force pool, leaving temporary Force points alone. */
+    void setCurrentForcePoints(int amount) { _currentForce = amount; }
     /** The Force point maximum; none for a droid or a creature without a Force-using class. */
     int maxForcePoints() const;
     void setBodyFuel(bool active) { _bodyFuel = active; }
@@ -704,6 +784,11 @@ public:
      * creature has left: each pool stops at zero.
      */
     void paySpellForcePointCost(const Spell &spell);
+    /**
+     * What a cast of \p spell charges the creature now: its adjusted cost,
+     * shared with vitality under Force Body.
+     */
+    ForcePointCharge spellForcePointCharge(const Spell &spell) const;
     /**
      * The Force points a cast of \p spell is recorded as costing: its
      * adjusted cost, or under Force Body the share of it paid in vitality.
@@ -759,12 +844,21 @@ public:
     void setRunLimited(bool limited) { _runLimited = limited; }
     MovementType movementType() const { return _movementType; }
 
-    bool canCastSpells() const { return canExecuteActions(); }
     bool canMove() const { return canExecuteActions() && (_effectAIStateMask & kAIStateMove) != 0; }
     bool canAttack() const {
         constexpr int kAttackBits = kAIStateAttack | kAIStateAct;
-        return canExecuteActions() && (_effectAIStateMask & kAttackBits) == kAttackBits;
+        return canExecuteActions() && !isBodyHeld() && (_effectAIStateMask & kAttackBits) == kAttackBits;
     }
+    /** Whether a stun, paralysis or sleep holds the creature's body. */
+    bool isBodyHeld() const;
+    /**
+     * Whether the action is one done with the body while the body is held:
+     * an attack, a power, a use of an item, an object, a door, a trap, a
+     * lock, a skill, a feat or a talent, or a handling of items. Such an
+     * action waits until the body is free; what is said, played, walked or
+     * scripted is not held.
+     */
+    bool waitsForBody(const Action &action) const;
     bool isMovementRestricted() const { return _movementRestricted || !canMove(); }
     bool movementLockedByAction() const { return _movementRestricted; }
     /** Whether the AI state lets the creature take \p action. */
@@ -776,6 +870,23 @@ public:
      * nor a party member at zero vitality.
      */
     bool clicksTriggerInReach(const Object &target) const;
+    /**
+     * A walk heading for \p goal ends where the creature stands, whether or
+     * not the creature can move: \p goal is a linked door within use range,
+     * which the creature clicks when it is open and is blocked by when it is
+     * closed.
+     *
+     * @param pathOffset passed to useRange()
+     */
+    bool isLinkedDoorInReach(const Object &goal, std::optional<float> pathOffset = std::nullopt) const;
+    /**
+     * A walk heading for \p goal ends where this creature stands: \p goal is
+     * a trigger that is not a mine, or a linked door, already within use
+     * range.
+     *
+     * @param pathOffset the walk's, passed to isLinkedDoorInReach()
+     */
+    bool isWalkGoalInReach(const Object &goal, std::optional<float> pathOffset = std::nullopt) const;
     /**
      * Enough experience for the next level by the experience table, below the
      * title's maximum, neither dead nor downed.
@@ -813,15 +924,49 @@ public:
     const std::string &lastName() const { return _lastName.str(); }
     ModelType modelType() const { return _modelType; }
     int appearance() const { return _appearance; }
+    /**
+     * Whether the head is the appearance's backup head rather than its normal
+     * one: the record says so, or the creature wears it apart from the leader.
+     */
+    bool useBackupHead() const { return _useBackupHead || _wearsBackupHead; }
+    /**
+     * Wears the appearance's backup head until the creature is loaded again;
+     * the record's choice of head is kept and saved.
+     */
+    void wearBackupHead();
+    /**
+     * Wears the heads.2da row as its head in place of its appearance's. Rows
+     * from 255 up wrap to a byte, and 255 is the appearance's head again. The
+     * head is not saved.
+     */
+    void duplicateHead(int row);
     CreaturePresentation presentation() const;
     void setPresentation(const CreaturePresentation &presentation);
     uint16_t portraitId() const { return _portraitId; }
+    /** The portrait shown in play, its row's variant for the creature's good/evil. */
     std::shared_ptr<graphics::Texture> portrait() const { return _portrait; }
+    /** The resref of the portrait shown in play; empty for a creature without a portrait row. */
+    std::string portraitResRef() const;
     float walkSpeed() const;
-    /** The speed the player drives this creature at, and its appearance's limit. */
-    float driveSpeed() const { return _driveSpeed; }
-    float driveMaxSpeed() const { return _driveMaxSpeed; }
-    void setDriveSpeed(float speed) { _driveSpeed = speed; }
+    /** Whether the player drives this creature: a drive heads its queue. */
+    bool isDriven() const;
+    /** The speed the player drives this creature at, 0 while it is not driven. */
+    float driveSpeed() const;
+    /**
+     * The top speed the player drives this creature at when not sneaking: its
+     * appearance's top driving speed times its movement rate factor.
+     */
+    float driveTopSpeed() const;
+    /** The drive speed at which the walk clip keeps pace with the ground; also the top speed of a sneaking drive. */
+    float driveWalkClipSpeed() const { return _stealthWalkSpeed; }
+    /**
+     * Whether the player's drive shows the run clip: its speed, held to the
+     * walk clip's pace while sneaking, is beyond six tenths of the drive's top
+     * speed.
+     */
+    bool drivesAtRun() const;
+    /** How fast the player's driving gathers speed, metres a second each second at a standstill. */
+    float driveAcceleration() const;
     /**
      * Whether the creature last moved at a run under the player's direct
      * control. Running under an action or its AI does not count, and the
@@ -830,6 +975,13 @@ public:
      */
     bool isRunning() const { return _running; }
     void setRunning(bool running) { _running = running; }
+    /**
+     * Runs to the slot of a formation around the anchor, then turns the way
+     * the anchor faces. formations.2da gives each slot an angle in degrees,
+     * anticlockwise from the anchor's right, and a distance; a slot the table
+     * does not give moves no one.
+     */
+    void setFormation(const Object &anchor, int formation, int slot);
     float runSpeed() const;
     float personalSpace() const { return _personalSpace; }
     float creaturePersonalSpace() const { return _creaturePersonalSpace; }
@@ -880,6 +1032,14 @@ public:
      * controlled leader at rest is not driven to its rest pose.
      */
     void setEngagedExchange(bool engaged) { _engagedExchange = engaged; }
+    /**
+     * The creature is busy and not driven: it is in an engaged exchange, has
+     * actions pending other than the player's drive, or plays a dialog
+     * animation.
+     */
+    bool isDriveBlocked() const {
+        return _engagedExchange || (hasOrdinaryActionsPending() && !isDriven()) || isPlayingDialogAnimation();
+    }
 
     // Facing
 
@@ -913,8 +1073,10 @@ public:
     /**
      * Kills the creature; false when it cannot die. \p operation is the death effect that
      * kills it, if any.
+     *
+     * @param spectacular the death shows the overkill visual and leaves its encounter at once
      */
-    bool applyDeathEffect(const std::shared_ptr<Object> &damager, bool noFadeAway,
+    bool applyDeathEffect(const std::shared_ptr<Object> &damager, bool spectacular, bool noFadeAway,
                           std::optional<std::reference_wrapper<const EffectInstance>> operation = std::nullopt);
     /**
      * Raises the creature with \p hpPercent of its vitality in TSL; false when it cannot be
@@ -957,6 +1119,8 @@ public:
     RacialType racialType() const { return _race; }
     /** The creature's race: its names, ability adjustments and favoured class. */
     const Race &race() const;
+    /** Whether a player's character may take the creature's race. */
+    bool hasPlayerRace() const;
     /** Set the race; a race without a row of the race table is invalid. */
     void setRacialType(RacialType race);
     Subrace subrace() const { return _subrace; }
@@ -982,6 +1146,9 @@ public:
     int actsAsPCValue() const { return _actsAsPC; }
     /** Whether a click to talk leaves the creature facing the way it was. */
     bool isNotReorienting() const { return _notReorienting; }
+    void setNotReorienting(bool notReorienting) { _notReorienting = notReorienting; }
+    /** Queues a camera command that sets the facing alone. */
+    void queueCameraFacing(float facing);
     /** The character was made by the player (TSL item limitation). */
     bool isPlayerCreated() const { return _playerCreated; }
     bool isPartyInteract() const { return _partyInteract; }
@@ -1026,21 +1193,6 @@ public:
     CombatForm currentForm() const { return _currentForm; }
     CombatStance combatStance() const { return _combatStance; }
     void setCombatStance(CombatStance stance);
-    /** Whether the creature is in the Total Defense stance or its round takes it. */
-    bool isInTotalDefense() const;
-    /**
-     * The calendar day and time at which Total Defense last started the
-     * creature's round, 0/0 when unset. Set, it also marks the stance as
-     * already begun. It is not saved.
-     */
-    bool hasTotalDefenseStart() const { return _totalDefenseDay != 0 || _totalDefenseTime != 0; }
-    void markTotalDefenseStart(uint32_t day, uint32_t time) {
-        _totalDefenseDay = day;
-        _totalDefenseTime = time;
-    }
-    void clearTotalDefenseStart() { markTotalDefenseStart(0, 0); }
-    uint32_t totalDefenseDay() const { return _totalDefenseDay; }
-    uint32_t totalDefenseTime() const { return _totalDefenseTime; }
     /**
      * Releases the orientation lock, returns to the ready pose and strips
      * special attacks from the round.
@@ -1052,9 +1204,11 @@ public:
     /** Whether the current round has told this creature that its ranged weapon is ineffective. */
     bool weaponIneffectiveReported() const { return _combatState.weaponIneffectiveReported; }
     void setWeaponIneffectiveReported(bool reported) { _combatState.weaponIneffectiveReported = reported; }
+    /** Whether the creature's round was last started as the master of an engaged exchange. */
+    bool roundMaster() const { return _combatState.roundMaster; }
+    void setRoundMaster(bool master) { _combatState.roundMaster = master; }
     /** Queues the actions of \p stance; false for a creature that takes no command. */
-    bool addStanceActions(CombatStance stance, const std::shared_ptr<Object> &target,
-                          bool clearActions, bool toFront, bool fromRound);
+    bool addStanceActions(CombatStance stance);
     /**
      * Queues a weapon swap, after the round's work unless \p immediate; false for a creature
      * that takes no command.
@@ -1116,22 +1270,71 @@ public:
     void setPuppet(bool puppet) { _puppet = puppet; }
     void setCurrentForm(CombatForm form) { _currentForm = form; }
     bool isStealthed() const { return _stealthMode; }
-    /** Enters or leaves stealth, with its presentation. */
-    void setStealthMode(bool enabled);
+    /**
+     * Whether the creature, following the party's leader, was within 5 m of
+     * it at the party's last tick (see Party::runFollowerScripts). It starts
+     * clear as the creature joins, and saves keep it.
+     */
+    bool isWithinSafetyRange() const { return _withinSafetyRange; }
+    void setWithinSafetyRange(bool within) { _withinSafetyRange = within; }
+    /**
+     * Enters or leaves stealth, with its presentation. In KotOR the creature
+     * also plays its activate clip, unless \p quiet: stealth ended by
+     * restrict mode or the start of a conversation, or a loaded creature.
+     */
+    void setStealthMode(bool enabled, bool quiet = false);
+    /**
+     * Newly seeing \p seen: when it is the player character or the controlled
+     * creature, the area loses stealth experience in six seconds.
+     */
+    void startStealthXPTimer(const Creature &seen);
+    /**
+     * Attacking \p victim: when it is the player character or the controlled
+     * creature, a running stealth experience loss comes on the next update.
+     */
+    void hastenStealthXPTimer(const Creature &victim);
     /**
      * The latest of the creature's own shells, the stealth exit's flash or
      * else the stealth field, with the effect application order current when
      * it began; null without one.
      */
     std::shared_ptr<graphics::Texture> latestOwnShell(uint64_t &order) const;
-    /** Whether the creature may use its Stealth skill at all. */
-    bool canUseStealthSkill() const;
+    /**
+     * @param skill a skill, or a Demolitions sub-skill (100-102)
+     * @return whether the creature may use the skill, by
+     *         game::canCreatureUseSkill: a sub-skill as Demolitions, never
+     *         untrained; in TSL, Stealth also with the stealth feat from an
+     *         effect
+     */
+    bool canUseSkill(int skill) const;
+    /** Whether the creature may use \p skill; see canUseSkill(int). */
+    bool canUseSkill(SkillType skill) const { return canUseSkill(static_cast<int>(skill)); }
+    /** Whether the creature may use the skill; the controlled creature is told when it may not. */
+    bool admitSkillUse(SkillType skill) const;
+    /**
+     * Whether the creature may use the skill on \p target: not one it cannot
+     * use, nor a hostile skill on a creature that regards it as a friend. The
+     * controlled creature is told why it may not.
+     */
+    bool admitSkillUse(SkillType skill, const Object &target) const;
     /** Whether the player can put this creature into stealth. */
     bool isStealthCapable() const;
     /** The stealth skill: leave stealth, or enter it out of combat and conversation. */
     void toggleStealth();
-    /** Using the Stealth skill: a creature without it is told so, others toggle stealth. */
-    void useStealthSkill();
+    /**
+     * Use a skill on \p target, as a script, a target menu or a talent asks.
+     * The use is first admitted (admitSkillUse(SkillType, const Object &)):
+     * a creature that cannot use the skill is told so, and a hostile skill is
+     * refused against a friendly target. Stealth toggles at once; Security gives
+     * the unlock, with a spike when \p item is given; Demolitions and Treat
+     * Injury give the action that does the work; the other skills do nothing.
+     * Security first clears the actions of the creature the player controls
+     * unless it is busy, and so does mine work when that creature can be
+     * commanded.
+     *
+     * @return the action to queue, or null when there is none
+     */
+    std::shared_ptr<Action> useSkill(SkillType skill, std::shared_ptr<Object> target, int subSkill = 0, std::shared_ptr<Item> item = nullptr);
     /** Stealth holds the creature to a sneaking walk, unless TSL's Stealth Run frees it. */
     bool movesStealthily() const;
     /**
@@ -1149,11 +1352,11 @@ public:
     void interruptActivities(bool keepStealth = false);
     /** A creature that paused its conversation keeps its place in it until it resumes. */
     void setConversationPaused(bool paused) { _conversationPaused = paused; }
-    /**
-     * A cast or item use takes the round; unless \p interrupts is false it breaks off stealth
-     * and conversation as its kind does.
-     */
-    void beginSpellActivity(int spellId, bool itemCast, bool hostile, bool interrupts = true);
+    bool isConversationPaused() const { return _conversationPaused; }
+    /** A cast or item use takes the round. */
+    void beginSpellActivity(int spellId, bool itemCast);
+    /** A cast or item use breaks off stealth and conversation as its kind does. */
+    void interruptForSpell(int spellId, bool itemCast, bool hostile);
     /**
      * In TSL a creature under a mind trick shakes it off on noticing a hostile creature close
      * by.
@@ -1215,6 +1418,13 @@ public:
     /** Plays a script animation: a loop at once, a one-shot through the queue. */
     void playScriptAnimation(const ScriptAnimation &animation, float speed);
     int currentAnimationId() const { return _animationSource.id; }
+    /**
+     * The looping animation a script has the creature hold, as its animation
+     * ID; none while it shows its pause, moves, or talks.
+     */
+    std::optional<int> heldScriptLoop() const;
+    /** Takes up again the loop the creature was saved holding. */
+    void resumeSavedScriptLoop();
     bool isPlayingDialogAnimation() const { return _animationSource.dialog; }
 
     void playAnimation(AnimationType type, scene::AnimationProperties properties = scene::AnimationProperties()) override;
@@ -1273,13 +1483,11 @@ public:
      */
     void playFireForgetAnimation(const std::string &clip, AnimationSource source, float speed = 1.0f);
     /**
-     * A dialog animation by its type's clip: a loop plays at once; a one-shot
-     * makes the pause the loop first and is queued.
+     * A dialog animation by its clip: a loop plays at once; a one-shot makes
+     * the pause the loop first and is queued.
      *
      * @param looping the clip loops rather than playing once
      */
-    void playDialogAnimation(AnimationType type, bool looping, AnimationSource source);
-    /** A dialog animation by its clip, as playDialogAnimation(AnimationType, bool, AnimationSource) plays it. */
     void playDialogAnimation(const std::string &clip, bool looping, AnimationSource source);
     /** A weapon newly in hand is drawn; while play is paused the draw waits. */
     void playWeaponDraw();
@@ -1385,6 +1593,11 @@ public:
     /** Validate an equipment commit without changing ownership. */
     bool canEquip(int slot, const std::shared_ptr<Item> &item) const;
     bool equip(int slot, const std::shared_ptr<Item> &item);
+    /**
+     * Puts \p item in the empty \p slot without testing whether it fits
+     * there: its effects apply, and the creature owns and wears it.
+     */
+    void putInSlot(int slot, const std::shared_ptr<Item> &item);
     /** Validate an equipment replacement without changing ownership. */
     bool canReplaceEquipment(
         int slot,
@@ -1399,12 +1612,21 @@ public:
      * Without the presentation update the model keeps showing the item.
      */
     std::shared_ptr<Item> takeEquippedItem(const std::shared_ptr<Item> &item, bool updatePresentation = true);
-    /** Unequip an Item directly into an explicit owning inventory. */
-    bool moveEquippedItemTo(
+    /**
+     * Unequip an Item directly into an explicit owning inventory, joining its
+     * stacks or not as Object::addItem does.
+     *
+     * @return the Item as it lies in \p receiver, itself or the stack it
+     *         joined; none when it could not be moved
+     */
+    std::shared_ptr<Item> moveEquippedItemTo(
         const std::shared_ptr<Item> &item,
-        Object &receiver);
+        Object &receiver,
+        ItemStacking stacking = ItemStacking::Join);
 
     std::shared_ptr<Item> getEquippedItem(int slot) const;
+    /** The first item worn with tag \p tag, in slot order; KotOR has no second weapon set to search. */
+    std::shared_ptr<Item> getEquippedItemByTag(const std::string &tag) const;
     CreatureWieldType getWieldType() const;
     /**
      * The weapon class of the hands, which picks the ready and combat clips:
@@ -1436,7 +1658,7 @@ public:
     std::optional<int> appearanceBodyBagRow() const { return _appearanceBodyBag; }
     /** The appearance's delay in milliseconds before a destroyed body fades; blank keeps the corpse. */
     std::optional<int> fadeDelayOnDeath() const { return _fadeDelayOnDeath; }
-    /** The items a body leaves in its bag: droppable equipment of the first sixteen slots, then droppable inventory. */
+    /** The items a body leaves in its bag: droppable equipment of the first fourteen slots (sixteen in TSL), then droppable inventory. */
     std::vector<std::shared_ptr<Item>> dropableItems() const;
     /** The body shows no weapons in its hands; its equipment is unchanged. */
     void stripHandWeapons();
@@ -1474,7 +1696,6 @@ public:
      * millimetre), and from then on keeps them.
      */
     struct UseApproach {
-        uint32_t target {script::kObjectInvalid};
         UseRange use;
         bool fixed {false};
 
@@ -1495,9 +1716,12 @@ public:
      * the personal space, or from a tenth of a metre when it is locked and
      * wants precise use, that is not ignored, and the creature fits there. In
      * TSL, while a door saber is anywhere in the creature's queue, every door
-     * is used from exactly a metre.
+     * is used from exactly a metre. \p pathOffset is the desired offset of an
+     * attack's walk toward \p target: in KotOR it stands in for this
+     * creature's personal space toward a creature, and toward a door it is
+     * added to this creature's personal space, before any other rule.
      */
-    UseRange useRange(const Object &target, bool ignorePreciseUse = false) const;
+    UseRange useRange(const Object &target, bool ignorePreciseUse = false, std::optional<float> pathOffset = std::nullopt) const;
     /**
      * Whether \p target is within use range, lengthened by \p extra and a
      * tenth of a metre, of this creature, both in the same area, with a clear
@@ -1505,19 +1729,65 @@ public:
      * point. An object in no area is never within use range.
      * An area transition trigger is within use range while the creature
      * stands inside it.
+     *
+     * @param pathOffset passed to useRange()
      */
-    bool isInUseRange(const Object &target, float extra) const;
+    bool isInUseRange(const Object &target, float extra, std::optional<float> pathOffset = std::nullopt) const;
     /**
-     * Run, or walk unless \p run, toward the use point of \p target until
-     * within its use range lengthened by \p extra. True once \p target is
-     * within use range, so lengthened. A walk to a door or placeable sets out
+     * Whether a walk toward \p goal that closes to \p range ends where the
+     * creature stands: once within its use range of the goal's use point,
+     * measured in three dimensions. A walk that ends in a clear line (\p inClearLine) and closes to
+     * more than that use range also ends within its range of the use point
+     * with a clear eye line to it and no wall of a door or placeable beside
+     * that line at the creature's eye height; in KotOR, too, with the end of
+     * its path within its range, flat, and such a line to the eye height
+     * over the ground there. A walk all the way onto its point ends only by
+     * the use range.
+     *
+     * @param pathOffset passed to useRange()
+     */
+    bool endsWalkToward(const Object &goal, float range, bool inClearLine, std::optional<float> pathOffset = std::nullopt) const;
+    /**
+     * Walk toward \p dest, closing to \p range. A walk with a \p goal object
+     * also ends as endsWalkToward() says. A walk whose goal is a trigger that
+     * is not a mine, or a linked door, ends within use range of it, as it sets
+     * out, on the way or with its last step: the trigger or an open door is
+     * clicked, and at a closed door the creature runs its blocked script.
+     *
+     * @param pathTarget the object a planned path is recorded as heading for
+     * @param inClearLine passed to endsWalkToward()
+     * @param pathOffset passed to useRange()
+     * @return true once the walk has ended
+     */
+    bool walkToward(std::optional<std::reference_wrapper<const Object>> goal, const glm::vec3 &dest, bool run, float range, float dt,
+                    std::optional<std::reference_wrapper<const Object>> pathTarget, bool inClearLine,
+                    std::optional<float> pathOffset = std::nullopt);
+    /**
+     * Run, or walk unless \p run, toward the use point of \p target, closing
+     * to its use range lengthened by \p walkExtra. A walk toward the object as
+     * its goal (\p toGoal) also ends within use range of it, in three
+     * dimensions. True once \p target is within use range lengthened by
+     * \p extra, tested before the walk sets out and after it ends. A walk
+     * belongs to the action that sets it out; another action, even toward the
+     * same target, sets out afresh. A walk to a door or placeable sets out
      * for the use point and range of that moment and keeps them until it
-     * arrives, unless \p followsPoint lets it take them anew once.
-     */
-    /**
+     * ends, unless \p followsPoint lets it take them anew once. A placeable
+     * whose use point no path reaches is walked to the ground beside it, as
+     * walkablePointBeside() finds it, and counts as within use range there.
+     *
      * @param targetsPath whether a planned path is recorded as heading for the target
+     * @param inClearLine passed to walkToward()
      */
-    bool navigateToUse(const Object &target, float extra, float dt, bool run = true, bool followsPoint = false, bool targetsPath = true);
+    bool navigateToUse(const Object &target, float extra, float dt, bool run = true, bool followsPoint = false, bool targetsPath = true,
+                       bool toGoal = true, float walkExtra = 0.0f, bool inClearLine = false);
+    /**
+     * The walkable point within two metres of \p point, a use point of
+     * \p target that no path from this creature reaches, with a clear line to
+     * it at eye height: of the nearest ring of such points, a quarter of a
+     * metre apart, the one nearest the creature. Nothing when a path reaches
+     * the point, when there is no walkmesh or when the creature is off it.
+     */
+    std::optional<glm::vec3> walkablePointBeside(const Object &target, const glm::vec3 &point) const;
     void clearPath();
     void advanceOnPath(const glm::vec3 &dest, const glm::vec3 &dir, bool run, float distance, float dt);
     glm::vec3 computeSteeringForce(const Uniwalk &uni, const glm::vec3 &next, float dt);
@@ -1543,6 +1813,8 @@ public:
     void setObjectHeard(const std::shared_ptr<Object> &object, bool heard);
     /** Records whether \p object is invisible to the creature. */
     void setObjectInvisible(const std::shared_ptr<Object> &object, bool invisible);
+    /** Sees and hears \p object at once, unless the creature already perceives it. */
+    void perceiveAtOnce(const std::shared_ptr<Object> &object);
     /** Forgets having seen, heard or noticed the invisible \p id. */
     void forgetPerceived(uint32_t id);
     /** Record a perception change as the last one and run the notice script. */
@@ -1574,12 +1846,14 @@ public:
     void refreshPerceptionRolls();
     /** Whether this creature spots a creature now, reporting a spotted hider. */
     bool detectsBySight(const Creature &target, bool invisible) const;
-    /** Whether this creature hears a creature now, through what lies between them. */
+    /** Whether this creature hears a creature now, through what lies between them; a silenced one is never heard. */
     bool detectsBySound(const Creature &target, bool invisible) const;
     /** Whether a creature this one attacks is one it has detected. */
     bool hasDetectedTarget(const Object &target) const;
     /** Blinded, or in darkness without Ultravision. */
     bool isBlind() const;
+    /** Under a silence effect: no one hears it. */
+    bool isSilenced() const { return hasEffect(EffectType::Silence); }
 
     /**
      * Update priority 0-4. Only priority 0 changes behaviour: it slows the
@@ -1596,7 +1870,16 @@ public:
     float perceptionPassTime() const { return _perceptionPassTime; }
     void setPerceptionPassTime(float time) { _perceptionPassTime = time; }
     bool perceptionStarted() const { return _perceptionStarted; }
-    void setPerceptionStarted() { _perceptionStarted = true; }
+    /**
+     * Whether the creature waits a full interval for its first look around:
+     * in KotOR one created outside the party and any encounter, and in both
+     * games one restored with its creation script run.
+     */
+    bool firstLookWaits() const { return _firstLookWaits; }
+    void setPerceptionStarted() {
+        _perceptionStarted = true;
+        _firstLookWaits = false;
+    }
 
     static constexpr int kSeeInvisibleCounter = 0x01;
     static constexpr int kUltravisionCounter = 0x02;
@@ -1654,12 +1937,12 @@ public:
     /** A creature entering another module brings no hand power with it. */
     void resetHandPower();
     CombatActivation combatActivationType() const { return _combatState.activationType; }
-    bool clientCombatMode() const { return _clientCombatMode; }
-    /** Enters or leaves client combat mode, which the game takes up at once. */
-    void setClientCombatMode(bool active);
+    bool partyCombatMode() const { return _partyCombatMode; }
+    /** Enters or leaves party combat mode, which the game takes up at once. */
+    void setPartyCombatMode(bool active);
     /** Draws the creature, and its faction within sight, into combat with \p opponent. */
     void broadcastCombatState(uint32_t opponent);
-    /** Ends the ordinary invisibility and sanctuary effects an attack breaks. */
+    /** Ends the ordinary invisibility effects an attack breaks. */
     void removeCombatInvisibilityEffects();
     /**
      * In TSL ends the mind trick and droid scramble states, walking the
@@ -1667,6 +1950,13 @@ public:
      * freed is passed over.
      */
     void removeMindTrickEffects();
+    /**
+     * Damage taken while conjuring a power may break the creature's
+     * concentration (see CastSpellAction::breaksConcentration): the cast is
+     * lost, the creature flinches, and the power's Force points are spent all
+     * the same.
+     */
+    void disturbCast(int damage);
     uint32_t lastWeaponUsed() const { return _lastWeaponUsed; }
 
     bool isInCombat() const { return _combatState.active; }
@@ -1718,8 +2008,8 @@ public:
     /** The weapon of the off hand: a double-bladed right-hand weapon, else the left-hand weapon. */
     std::shared_ptr<Item> getEquippedOffhandWeapon() const;
 
-    /** The creature lies under a knockdown effect. */
-    bool isKnockedDown() const { return hasEffect(EffectType::Knockdown); }
+    /** The creature lies under a knockdown that took it down alive. */
+    bool isKnockedDown() const;
     /** Show the fall of a knockdown under the given animation ID. */
     void showKnockdownFall(int animationId);
 
@@ -1769,7 +2059,7 @@ public:
      * a spot is chosen, this creature stands on the line through a and b
      * where it passes nearest the other. The other drops what it was doing
      * and runs to a spot just off that line on its own side, unless it is
-     * already set on a move. Failing a spot it can walk straight to, it is
+     * already set on a move. Failing a spot with no door wall in its way, it is
      * placed at once behind this creature, against moverDir from b. True
      * when the other has been dealt with.
      */
@@ -1815,12 +2105,15 @@ public:
      *
      * @param handType the kind of attack whose hand-specific modifiers count;
      *        by default that of an attack with \p weapon in the given hand
+     * @param unarmedGloves the gloves an unarmed attack is made with, whose
+     *        base item names the Weapon Focus feat when \p weapon is empty
      */
     AttackBonusBreakdown getAttackBonusBreakdown(
         std::optional<std::reference_wrapper<const Creature>> target,
         const std::shared_ptr<Item> &weapon,
         bool offHand,
-        std::optional<AttackBonus> handType = std::nullopt) const;
+        std::optional<AttackBonus> handType = std::nullopt,
+        const std::shared_ptr<Item> &unarmedGloves = nullptr) const;
     int getAttackBonus(bool offHand = false) const;
     /** The touch-attack bonus: none when the right hand holds the other kind of weapon. */
     int getTouchAttackBonus(bool ranged) const;
@@ -1847,6 +2140,13 @@ public:
     int getEffectiveAbilityModifier(Ability ability) const;
     /** The race's adjustment to \p ability. */
     int racialAbilityAdjustment(Ability ability) const;
+    /**
+     * @param armourCapped whether the body armour's maximum Dexterity bonus
+     *        limits the modifier, as it does for defence
+     * @return the Dexterity modifier the rules use: a debilitated creature's
+     *         positive modifier counts as 0
+     */
+    int getDexterityModifier(bool armourCapped) const;
     bool hasEffectiveFeat(FeatType feat) const;
     /** The feats the creature's live bonus feat effects give it. */
     std::set<FeatType> effectFeats() const;
@@ -1857,11 +2157,6 @@ public:
      * without an attacker; \p touch for a touch attack.
      */
     DefenseBreakdown getDefenseBreakdown(std::optional<std::reference_wrapper<const Creature>> attacker, int damageFlags, bool touch = false) const;
-    /**
-     * The Dexterity modifier the defense counts: the effective modifier,
-     * limited by worn body armour, and at most 0 while debilitated.
-     */
-    int defenseDexterityModifier() const;
     int getDefense(std::optional<std::reference_wrapper<const Creature>> attacker, int damageFlags) const;
     int getDefense() const;
     /** Ordinary ranged defense consumes the same permission as active saber throws. */
@@ -1896,9 +2191,16 @@ public:
     SavingThrowResult getSavingThrowResult(
         int total, int difficultyClass, SavingThrowType type,
         std::optional<std::reference_wrapper<const Object>> versus = std::nullopt) const;
+    /**
+     * The physical damage bonus of a hit with \p weapon.
+     *
+     * @param unarmedGloves the gloves an unarmed attack is made with, whose
+     *        base item names the Weapon Specialization feat when \p weapon is empty
+     */
     PhysicalDamageBonus getPhysicalDamageBonus(
         const std::shared_ptr<Item> &weapon,
-        bool offHand) const;
+        bool offHand,
+        const std::shared_ptr<Item> &unarmedGloves = nullptr) const;
     /** The factor TSL's autobalance applies to the creature's physical damage, 1 without it. */
     int getPhysicalDamageAutoBalanceFactor() const;
     /**
@@ -1993,7 +2295,15 @@ public:
     int currentCombatAttackType() const;
     /** The result of the round's current attack. */
     AttackResultType currentCombatAttackResult() const;
+    /** The record of the creature's combat round is a ranged attack. */
+    bool isCurrentAttackRanged() const;
+    /** Ends the round's bookkeeping at once: releases its attackers, then records it. */
     void finishCombatRound();
+    /**
+     * Records the round as the last one: its attack target as the last hostile
+     * target, its action, feat and power.
+     */
+    void recordCombatRound();
     /**
      * Leaves combat: actions, round and targets end; \p runEndRound tells whether the
      * end-of-round script runs.
@@ -2030,13 +2340,22 @@ public:
     /** Record the weapon of a delivered attack as this attacker's last weapon. */
     void recordAttackWeapon(int weaponAttackType);
     /**
-     * A party member enters client combat mode from its own live attempted
-     * target and leaves it once nothing keeps it there. The stored target is
-     * the member's party-slot target; the leader also holds while a dead target
-     * is held. Returns true when the member left combat mode.
+     * A party member enters party combat mode from its own live attempted
+     * target and leaves it once nothing keeps it there. \p storedCreature is
+     * the creature stored as this member's last target, \p carriedObject the
+     * object other than a creature last stored by this or an earlier member
+     * in combat mode; the leader also holds while a dead target is held.
+     * Returns true when the member left combat mode.
      */
-    bool updateClientCombatMode(std::optional<std::reference_wrapper<const Object>> storedTarget, bool holdDeadTarget);
+    bool updatePartyCombatMode(const Creature *storedCreature, const Object *carriedObject, bool holdDeadTarget);
     void clearCurrentAttackTarget() { _combatState.attackTarget.reset(); }
+    /**
+     * At a round's end the creature forgets its attack and spell targets,
+     * current or attempted, that are gone or are dead creatures, so that a
+     * creature that died in the round is not recorded as its last hostile
+     * target; it lets go of its attackers too.
+     */
+    void forgetFallenCombatTargets();
     /**
      * An attacker that cannot see its target remembers where it stood. True
      * when it had already failed to see from this very spot.
@@ -2059,10 +2378,20 @@ public:
 
     // Gold
 
-    void giveGold(int amount);
     void takeGold(int amount);
 
     int gold() const { return _gold; }
+    /** A count the creature holds itself, which counts while it is outside the party. */
+    int heldCount(HeldCount count) const;
+    /** Sets a count the creature holds itself. */
+    void setHeldCount(HeldCount count, int value);
+    /**
+     * The creature holds no credits, components or chemicals of its own. A
+     * creature read as a party member keeps none of the counts its record
+     * holds: the creature under control is read so whenever the party enters
+     * a module from another module.
+     */
+    void clearHeldCounts();
 
     // END Gold
 
@@ -2136,6 +2465,10 @@ public:
      * when an event reaches the creature first.
      */
     void runSpawnScript();
+    /**
+     * Runs the blocked script with \p blockingDoorId as the blocking door; a
+     * creature the player controls runs none and keeps its last blocking door.
+     */
     void runBlockedScript(uint32_t blockingDoorId);
     void runEndRoundScript();
     /** In TSL restarts the three seconds to the next end-of-round decision. */
@@ -2157,6 +2490,11 @@ public:
     void setOnEndDialogue(std::string onEndDialogue) { _onEndDialogue = onEndDialogue; }
     /** Runs the end-of-conversation script. */
     void runEndDialogScript();
+    /**
+     * Runs the disturbed script: \p disturber added \p item to the creature's
+     * inventory or removed it, as \p type says.
+     */
+    void runOnDisturbed(uint32_t disturber, InventoryDisturbType type, uint32_t item);
     void setOnBlocked(std::string onBlocked) { _onBlocked = onBlocked; }
     const std::string &onDialogue() const { return _onDialogue; }
     void setOnDialogue(std::string onDialogue) { _onDialogue = onDialogue; }
@@ -2191,12 +2529,16 @@ public:
     void clearFuryState();
     /** In TSL a running Fury adds a point of damage, up to six. */
     void incrementFuryDamageBonus();
+    /** The party follow slot, 1 or 2, or -1 outside them. */
+    int followSlot() const;
 
 protected:
     bool canExecuteActions() const override;
     /** A party member at zero vitality takes up its actions too, which mostly fail. */
     bool takesUpActions() const override;
     glm::quat presentedOrientation() const override;
+    /** The party's inventory, which the actual player creature holds, keeps itself in order. */
+    bool keepsItemsInOrder() const override;
     /** Runs the conversation script, the fallback one for a creature with none or "default". */
     void runConversationScript() override;
 
@@ -2351,6 +2693,16 @@ private:
         scene::AnimationProperties properties;
         bool stateDriven {true};
         AnimationSource source;
+        /** A clip of another model, played as it is; none for the model's own. */
+        std::shared_ptr<graphics::Animation> external;
+    };
+
+    /** A talk or listen loop, shown as a layer over the loop beneath it. */
+    struct OverlayLoop {
+        std::string clip;
+        scene::AnimationProperties properties;
+        AnimationSource source;
+        bool shown {false};
     };
 
     /** The attack penalty of two-weapon fighting, and the part a light off-hand weapon gives back. */
@@ -2365,6 +2717,7 @@ private:
     int _appearance {0};
     int _appearanceBeforeDisguise {0};
     bool _disguised {false};
+    bool _useBackupHead {false};
     Gender _gender {Gender::Male};
     uint16_t _portraitId {0};
     /** The record's IsPC byte; any value but 0 marks a player character. */
@@ -2384,6 +2737,16 @@ private:
     EffectId _activePoisonEffectId {kUnassignedEffectId};
     bool _notReorienting {false};
     uint8_t _bodyVariation {0};
+    /** The texture variation a creature's look starts from. */
+    static constexpr int kFirstTextureVariation = 1;
+    /**
+     * The texture variation shown, which a body item of the body model type
+     * sets. A body item of another model type (a disguise, droid plating) is
+     * drawn with the first body model and this texture variation. It starts
+     * at kFirstTextureVariation, and again whenever the creature is read; it
+     * is not saved.
+     */
+    int _shownTextureVariation {kFirstTextureVariation};
     std::optional<CreaturePresentation> _presentation;
     uint8_t _textureVar {0};
     bool _partyInteract {false};
@@ -2472,8 +2835,28 @@ private:
     std::map<int, std::shared_ptr<Item>> _equipment;
     // END Serializable
 
+    /** The heads.2da row worn in place of the appearance's head; 255 for none. */
+    uint8_t _duplicatedHead {0xff};
+    bool _wearsBackupHead {false};
     ModelType _modelType {ModelType::Creature};
     std::shared_ptr<graphics::Texture> _portrait;
+    /** The portraits.2da row of the portrait, when it has one. */
+    std::optional<Portrait> _portraitRow;
+    /** The good/evil the portrait, body and head were last shown for. */
+    int _alignmentGoodEvil {0};
+    /** The good/evil texture the head shows; empty while it shows its own. */
+    std::string _headAlignmentTexture;
+    /** The evil texture the body shows; empty while it shows its own. */
+    std::string _bodyAlignmentTexture;
+    /** The appearance's evil body textures by appearance.2da column, empty for a blank cell. */
+    std::map<std::string, std::string> _evilBodyTextures;
+    /** The heads.2da model of the appearance's head; empty for none. */
+    std::string _headModelName;
+    /**
+     * The head's textures for good/evil of 10, 20, 30 and 40 and below, then
+     * of 70 and 90 and above; empty for a blank cell.
+     */
+    std::array<std::string, 6> _headAlignmentTextures;
 
     /**
      * The facing the model shows turns toward the facing wanted standing
@@ -2482,7 +2865,17 @@ private:
     float _presentationFacing {0.0f};
     float _desiredFacing {0.0f};
     float _movementFacing {0.0f};
+    /**
+     * The time this update covers on the creature's own clock, in
+     * milliseconds; 0 while the clock stands still.
+     */
     int _frameMilliseconds {0};
+    /**
+     * Milliseconds until a sighting of the player's creature costs the area
+     * stealth experience, 0 once the loss is due on the next update; none
+     * when the timer is not running. Not saved.
+     */
+    std::optional<int> _stealthXPTimer;
 
     // Current path that the creature is following, its velocity and position at
     // the previous frame.
@@ -2490,8 +2883,17 @@ private:
     bool _navigationFailed {false};
     /** The path under way walks all the way onto its destination. */
     bool _walksOntoPoint {false};
-    /** The walk of navigateToUse under way. */
-    std::optional<UseApproach> _useApproach;
+    /**
+     * The walk of navigateToUse under way: the queued action walking it and,
+     * toward a door or placeable, the use point and range it keeps; toward a
+     * placeable whose use point no path reaches, the ground beside it.
+     */
+    struct UseWalk {
+        std::weak_ptr<ActionQueueNode> walker;
+        std::optional<UseApproach> kept;
+        std::optional<glm::vec3> beside;
+    };
+    std::optional<UseWalk> _useWalk;
     RuntimeObjectRef<Object> _attemptedMovementTarget;
     glm::vec3 _pathVelocity;
     /**
@@ -2501,8 +2903,10 @@ private:
      */
     float _walkPace {1.0f};
     float _clipPace {0.0f};
-    /** Unset for a frame that has no step to compare with. */
+    /** Where the walk's current progress check began; unset when there is no step to compare with. */
     std::optional<glm::vec3> _previousPosition;
+    /** Seconds of walking since _previousPosition was taken. */
+    float _progressTime {0.0f};
     PathAvoidance _avoidance;
     // When there is no progress on the path, apply _stuckForce to steer the
     // creature in a random direction until the timer runs out.
@@ -2516,10 +2920,14 @@ private:
     /** How far one loop of the walk and run animations carries the appearance. */
     float _walkDistance {1.0f};
     float _runDistance {1.0f};
-    /** The appearance's own sneaking pace. */
+    /** The appearance's own sneaking pace, at which its walk clip keeps pace with the driven creature. */
     float _stealthWalkSpeed {0.0f};
-    float _driveSpeed {0.0f};
+    /** The drive speed at which the appearance's run clip keeps pace with the ground. */
+    float _driveRunClipSpeed {0.0f};
+    /** The appearance's top driving speed. */
     float _driveMaxSpeed {0.0f};
+    /** The appearance's driving acceleration. */
+    float _driveAcceleration {0.0f};
     bool _running {false};
     float _personalSpace {0.6f};
     float _creaturePersonalSpace {0.6f};
@@ -2560,7 +2968,7 @@ private:
     std::map<int, int> _effectIconCounts;
     CombatState _combatState;
     std::weak_ptr<Action> _currentCombatAction;
-    bool _clientCombatMode {false};
+    bool _partyCombatMode {false};
     float _mineCheckTime {0.0f};
     uint32_t _lastWeaponUsed {script::kObjectInvalid};
     SavedObjectReference _incomingAttacker;
@@ -2569,11 +2977,10 @@ private:
     AttackerList _attackerList;
     AttackHistory _receivedAttack;
     CombatStance _combatStance {CombatStance::None};
-    uint32_t _totalDefenseDay {0};
-    uint32_t _totalDefenseTime {0};
     /** The kind of the round action most recently dispatched. */
     int _roundActionKind {0};
     bool _stealthMode {false};
+    bool _withinSafetyRange {false};
     bool _treatInjuryWorkDone {false};
     bool _conversationPaused {false};
     /** Milliseconds of excitement left, counted down by the frame time; 0 when not excited. */
@@ -2600,6 +3007,7 @@ private:
     PerceptionRolls _perceptionRolls;
     float _perceptionPassTime {0.0f};
     bool _perceptionStarted {false};
+    bool _firstLookWaits {false};
     std::optional<PerceptionEvent> _lastPerception;
     float _blindSpot {120.0f};
     /**
@@ -2651,6 +3059,10 @@ private:
 
     uint32_t _footstepType {0};
     int _gold {0}; /**< aka credits */
+    /** TSL: the components the creature holds itself. */
+    int _components {0};
+    /** TSL: the chemicals the creature holds itself. */
+    int _chemicals {0};
     std::string _envmap;
     /** The appearance's death visual and the body node it goes off at. */
     std::optional<int> _deathVisual;
@@ -2677,6 +3089,20 @@ private:
 
     std::shared_ptr<audio::AudioSource> _audioSourceVoice;
     std::shared_ptr<audio::AudioSource> _audioSourceFootstep;
+    /** The loop a rolling footstep type plays while the creature walks or runs. */
+    std::shared_ptr<audio::AudioSource> _rollingFootstep;
+    /** The appearance's loop, playing since the creature's first update. */
+    std::shared_ptr<audio::AudioSource> _loopingSound;
+    /** The resource _loopingSound plays. */
+    std::string _loopingSoundResRef;
+    /** The loop of a lit light source the controlled creature holds in its left hand. */
+    std::shared_ptr<audio::AudioSource> _lightSourceSound;
+    /**
+     * Starts the appearance's loop once, where the creature is, 1.5 m up, and
+     * follows it there; a light source in the controlled creature's left hand
+     * loops while it holds it.
+     */
+    void updateLoopingSounds();
     bool _lightsaberIdlePowerDownPending {false};
     Timer _lightsaberIdlePowerDownTimer;
     PoweredHands _poweredHands;
@@ -2695,6 +3121,10 @@ private:
     bool _damageFlinchHeld {false};            /**< flinched since another animation was chosen */
     std::optional<std::string> _castAnimation; /**< held by a cast or an item use */
     bool _equipmentHidden {false};             /**< an animation that hides equipped items put the hand weapons away */
+    bool _rightHandPutAwayForConversation {false};
+    bool _leftHandPutAwayForConversation {false};
+    bool _headItemPutAwayForConversation {false};
+    bool _handWeaponsStripped {false}; /**< the body gave its weapons up to its bag */
     SpellCastVisuals _spellCastVisuals;
     SpecialAttackVisuals _specialAttackVisuals;
     bool _disableInjuredAnim {false};
@@ -2703,7 +3133,9 @@ private:
     std::deque<FireForgetEntry> _fireForgetQueue;
     std::optional<RunningOneShot> _oneShot;
     std::optional<StoredLoop> _storedLoop;
+    std::optional<OverlayLoop> _overlayLoop;
     AnimationSource _animationSource;        /**< the clip shown */
+    std::optional<int> _savedScriptLoop;     /**< the loop a load takes up again */
     std::optional<SwingAttack> _swingAttack; /**< the attack of the last swing started */
     bool _weaponDrawPending {false};         /**< a draw waiting for play to resume */
     /**
@@ -2757,7 +3189,12 @@ private:
     void updateDisguise();
     void updateEquipmentPresentation();
     void updateCombat(float dt);
+    /** Forgets an incoming attacker that is gone or dead, and the round's attackers. */
+    void releaseRoundAttackers();
     void updateLightsaberSoundPositions();
+    void updateRollingFootstep();
+    /** The footstep group of the controlled creature, or of a creature of the creature's size. */
+    int footstepSoundGroup() const;
 
     void runDeathScript();
     void runDamagedScript();
@@ -2782,8 +3219,21 @@ private:
                                      bool &side);
     /** Drop any walk under way and plan one along the straight line to a point. */
     void planStraightPath(const glm::vec3 &point);
+    /** A walk ends where the creature stands, and \p target hears that as a click by it. */
+    void clickInReach(const Object &target);
+    /**
+     * A walk heading for \p goal, a trigger that is not a mine or a linked
+     * door, ends within use range of it: the trigger or an open door hears a
+     * click by the creature, and at a closed door the creature runs its
+     * blocked script.
+     *
+     * @param pathOffset passed to useRange()
+     */
+    bool reachesWalkGoal(const Object &goal, std::optional<float> pathOffset);
     /** The walk or run clip \p model shows for the creature's movement. */
     MovementClip movementClip(const scene::ModelSceneNode &model) const;
+    /** The drive speed the clip of the driven creature follows: no faster than the walk clip's pace while sneaking. */
+    float drivenClipSpeed() const;
 
     /** The area whose music this creature drives: its own, when the player controls it. */
     std::shared_ptr<Area> battleMusicArea() const;
@@ -2801,8 +3251,6 @@ private:
     void updateExcitement();
     void updateForcedMove(float dt);
     AnimationUpdater animationUpdater() const;
-    /** The party follow slot, 1 or 2, or -1 outside them. */
-    int followSlot() const;
     void updateTurning();
     void rotateStep(float target);
     bool isHostileCombatTurn() const;
@@ -2836,11 +3284,22 @@ private:
     // Stealth
 
     void presentStealth(bool enabled, bool announce);
+    /**
+     * Shows the stealth state changing: the stealth sound, field and cue, and
+     * in KotOR, unless the change is quiet, the activate clip.
+     */
+    void presentStealthChange(bool enabled, bool quiet);
     void presentStealthField(bool enabled, bool announce);
     /** TSL's stealth feat or one of its Force Camouflage powers. */
     bool hasTSLStealthTalent() const;
     /** TSL Dampen Sound on an equipped item. */
     bool hasSilentMove() const;
+    /**
+     * Runs the stealth experience timer in an area paying stealth
+     * experience, by the frame time, and stops it elsewhere; when it runs
+     * out the area loses its decrement.
+     */
+    void updateStealthXPTimer();
 
     // END Stealth
 
@@ -2891,6 +3350,22 @@ private:
     std::string getBodyTextureName() const;
     std::string getHeadModelName() const;
     std::string getMaskModelName() const;
+    /** The heads.2da row of the head: the duplicated one, or the appearance's; -1 for none. */
+    int headRow(const resource::TwoDA &appearances) const;
+    /** Shows the head headRow() now gives. */
+    void refreshHead();
+    /** The head model and its good/evil textures, from the head's heads.2da row. */
+    void loadHeadProperties(const resource::TwoDA &appearances);
+    /** Shows the portrait for the creature's good/evil. */
+    void refreshPortrait();
+    /** The head's texture for the creature's good/evil; empty for its own. */
+    std::string getHeadAlignmentTextureName() const;
+    /** The body's evil texture for the creature's good/evil and armour; empty for its own. */
+    std::string getEvilBodyTextureName() const;
+    void applyHeadAlignment(scene::ModelSceneNode &head);
+    void applyBodyAlignment(scene::ModelSceneNode &body);
+    /** Shows the portrait, body and head for a good/evil that has changed. */
+    void updateAlignmentTextures();
 
     // END Appearance
 
@@ -2899,17 +3374,37 @@ private:
     bool doPlayAnimation(bool fireForget, const std::function<void()> &callback);
     /**
      * Records a loop arriving; a loop other than the stored one empties the
-     * queue. False while a one-shot runs: the loop waits for it.
+     * queue. False while a one-shot runs: the loop waits for it, but places
+     * the model at once.
      */
     bool storeLoop(const std::string &clip, const scene::AnimationProperties &properties, bool stateDriven,
-                   AnimationSource source);
+                   AnimationSource source, std::shared_ptr<graphics::Animation> external = nullptr);
     void returnToStoredLoop();
+    /**
+     * Shows a talk or listen loop over the loop beneath it, in place of the
+     * one shown; while a one-shot runs it waits for the one-shot to end. Like
+     * any loop it is a pose of a creature standing: one on the move shows none.
+     */
+    void playOverlayLoop(const std::string &clip, scene::AnimationProperties properties, AnimationSource source);
+    /** Shows the talk or listen loop that waited for a one-shot. */
+    void showWaitingOverlayLoop();
+    /** Takes away the talk or listen loop. */
+    void stopOverlayLoop();
     /**
      * The body shows \p clip: one that hides equipped items puts the hand
      * weapons away; the next one that does not, outside a conversation, brings
      * them back and takes away the creature's thrown lightsaber still in flight.
      */
     void presentEquippedItems(const std::string &clip);
+    /**
+     * The hands of \p body show their items unless an animation or a
+     * conversation has put them away, or the body has given its weapons up.
+     */
+    void presentHandItems(scene::ModelSceneNode &body) const;
+    /** The hand that \p slot holds is no longer put away for a conversation. */
+    void bringOutHandForConversation(int slot);
+    /** The head of \p body shows its item unless a conversation has put it away. */
+    void presentHeadItem(scene::ModelSceneNode &body) const;
     /**
      * A new clip is shown; any but the plain pause restarts the fidget time.
      * A world-space cut clip plays with the model at the world origin and
@@ -2935,7 +3430,9 @@ private:
     std::string hitSoundMaterial(const Object &target) const;
     /** A swing, clash or parry sound of the weapon the creature swings, one of \p variants. */
     void playSwingSound(const std::string &name, int variants);
-    /** Plays a weaponsounds.2da sound at the creature. */
+    /** Stops the creature's voice and footsteps. */
+    void stopVoiceAndFootsteps();
+    /** Plays a weaponsounds.2da sound at the creature, unless the player does not perceive it. */
     void playWeaponSound(int weaponSoundRow, const std::string &column);
     /** Plays the creature's body-fall sound for the surface under it. */
     void playFallSound();
@@ -3001,9 +3498,23 @@ private:
     // END Animation
 
     // Blueprint
+    /**
+     * Reads a record and, when it names one, the template it is placed from.
+     *
+     * @param partyMember whether the record is read as a party member's
+     */
+    void deserializeRecord(
+        const resource::Gff &gff,
+        const SerializedIdentityContext &identityContext,
+        bool partyMember);
     void deserializeAll(
         const resource::Gff &gff,
         const SerializedIdentityContext &identityContext);
+    /**
+     * The credits, components and chemicals a record says the creature holds
+     * itself, each a signed count held up to kMaxHeldCount.
+     */
+    void deserializeHeldCounts(const resource::Gff &gff);
     void deserializeName(const resource::Gff &gff);
     void deserializeSoundSet(const resource::Gff &gff);
     void deserializeAttributes(const resource::Gff &gff);
@@ -3012,6 +3523,11 @@ private:
     /** The skill rank, \p versus a creature or unopposed. */
     int skillRank(SkillType skill, bool baseOnly,
                   const std::optional<std::reference_wrapper<const Creature>> &versus) const;
+    /**
+     * Whether the creature counts as still for stealth detection: it shows no
+     * moving animation, or, under a clip that is only shown, it neither walks
+     * nor runs.
+     */
     bool isStationaryForDetection() const;
     void reportStealthDetection(const Creature &target, int spotRoll, int hideRoll, int aware, int rank,
                                 int observerStill, int targetStill, int distance, int facing, int run, int combat) const;
@@ -3026,7 +3542,10 @@ private:
         const std::map<int, std::shared_ptr<Item>> &loaded, bool &bodyRefused, bool reportRefusal);
     /**
      * Replaces the carried items and the equipment with those of the record's
-     * lists.
+     * lists. A creature read from a template, or placed by an area outside a
+     * saved game, acquires what it wears and carries: the module is told of
+     * each worn item before it is told it was put on, then of each carried
+     * item but those it counts, with nothing told to the party.
      *
      * @param placedTemplate whether the record is the template of a creature
      *        an area places: each entry then names its list's template and
@@ -3036,8 +3555,14 @@ private:
         const resource::Gff &gff,
         const SerializedIdentityContext &identityContext,
         bool placedTemplate);
-    /** Credits, chemicals, components and pazaak cards read into the inventory are acquired as counts. */
-    void countLoadedItems();
+    /**
+     * Credits, chemicals, components and pazaak cards read into the inventory
+     * are acquired as counts.
+     *
+     * @param partyMember whether the creature's record is read as a party
+     *        member's: its counts are then the party's
+     */
+    void countLoadedItems(bool partyMember);
     /**
      * Appends the effects \p item worn in \p slot gives; with
      * \p onlyDeferredEffects, only its armour class and disguise effects.
@@ -3059,8 +3584,18 @@ private:
      */
     bool hitPointsAtDeathThreshold() const;
     void restoreSerializedVitality();
-    void applyHitPointDamage(int amount, const std::shared_ptr<Object> &damager,
+    /**
+     * Takes \p amount from the creature's vitality. Its dealer, when it is
+     * the controlled creature, is shown \p dealt, the damage before the
+     * difficulty weighs it.
+     */
+    void applyHitPointDamage(int amount, int dealt, const std::shared_ptr<Object> &damager,
                              std::optional<DamageReaction> reaction = std::nullopt);
+    /**
+     * Whether the difficulty settings keep this creature at 1 hit point: they
+     * may for a player character whose record's IsPC is 1.
+     */
+    bool difficultyKeepsAtOneHitPoint() const;
     int consumeTemporaryHitPoints(int amount);
     void updateDeathFromCurrentHitPoints();
     // END Blueprint

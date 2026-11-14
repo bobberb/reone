@@ -59,6 +59,7 @@ public:
     }
 
     bool isEnabled() const { return _enabled; }
+    bool isRendered() const { return _rendered; }
     bool isCulled() const { return _culled; }
     bool isCullingEnabled() const { return _cullingEnabled; }
     bool isPoint() const { return _point; }
@@ -90,6 +91,7 @@ public:
     // Flags
 
     void setEnabled(bool enabled) { _enabled = enabled; }
+    void setRendered(bool rendered) { _rendered = rendered; }
     void setCulled(bool culled) { _culled = culled; }
     void setCullingEnabled(bool enabled) { _cullingEnabled = enabled; }
 
@@ -102,6 +104,14 @@ public:
     const glm::mat4 &absoluteTransformInverse() const { return _absTransformInv; }
 
     void setLocalTransform(glm::mat4 transform);
+
+    /**
+     * Sets the local transform and leaves the absolute transforms of this
+     * node and its subtree stale. The caller must recompute them from an
+     * ancestor before anything reads them, which lets an animated model pose
+     * every node and then recompute once.
+     */
+    void setLocalTransformDeferred(glm::mat4 transform) { _localTransform = std::move(transform); }
 
     // END Transformations
 
@@ -122,6 +132,7 @@ protected:
     // Flags
 
     bool _enabled {true};
+    bool _rendered {true}; /**< is this node drawn while enabled? */
     bool _culled {false}; /**< has this node been frustum- or distance-culled? */
     bool _point {true};   /**< is this node represented by a single point?  */
 

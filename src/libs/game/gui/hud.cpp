@@ -75,11 +75,37 @@ static float interfaceScalar(bool tsl, int screenWidth) {
     return tsl && screenWidth > 1022 ? 1.0f + ((screenWidth - 1022) / 1024) * 0.5f : 1.0f;
 }
 
+/**
+ * The state a party portrait shows, in order of precedence: fallen, able to
+ * level up, held helpless. A fallen member shows no mark; a pending level-up
+ * shows ahead of being held helpless.
+ */
+enum class PortraitState {
+    Normal,
+    Down,
+    LevelUp,
+    Debilitated
+};
+
+static PortraitState portraitState(const Creature &member) {
+    if (member.isDead() || member.isTemporarilyDead()) {
+        return PortraitState::Down;
+    }
+    if (member.isLevelUpPending()) {
+        return PortraitState::LevelUp;
+    }
+    if (member.isDebilitated()) {
+        return PortraitState::Debilitated;
+    }
+    return PortraitState::Normal;
+}
+
 // Effect stacks
 //
 // Each portrait shows one icon for every beneficial effect on its member and
-// one for every harmful effect, stacked over the portrait. The rules below lay
-// the icons out to the pixel as the game does.
+// one for every harmful effect, stacked over the portrait. A member who is
+// fallen, able to level up or held helpless shows no stacks. The icons are
+// laid out to the pixel by the rules below.
 
 /** The leader's portrait stacks at most nine icons of a kind; another member's at most five. */
 static constexpr int kLeaderEffectStackMax = 9;
@@ -206,6 +232,9 @@ static std::optional<PauseReasonText> pauseReasonText(PauseReason reason) {
 
 /** TSL's unpause prompt under the reason. */
 static constexpr int kK2PausePressStrRef = 136311;
+/** TSL's unpause prompts in a swoop race and in any other minigame. */
+static constexpr int kK2SwoopPausePressStrRef = 136309;
+static constexpr int kK2MinigamePausePressStrRef = 136318;
 /** The prompt sits this far below the reason, and the panel ends this far below its last line, before scaling. */
 static constexpr int kPausePromptGap = 2;
 static constexpr int kPausePanelBottomPadding = 5;
@@ -253,7 +282,7 @@ static constexpr char kNoticeBoxCorner[] = "uibit_brdr_16bct";
 static constexpr char kNoticeBoxEdge[] = "uibit_brdr_16bet";
 static constexpr char kNoticeBoxFill[] = "uibit_fill_2bt";
 static constexpr int kNoticeBoxBorderDimension = 16;
-static const glm::vec3 kNoticeBoxBorderColor {0.05f, 0.35f, 0.27f};
+static const glm::vec3 kNoticeBoxBorderColor = kTSLColorNewGreen;
 static const glm::vec3 kNoticeBoxTextColor {0.7f, 0.7f, 0.6f};
 static constexpr char kNoticeBoxFont[] = "dialogfont16x16";
 
@@ -268,7 +297,6 @@ static void tintHUDMenuButton(const std::shared_ptr<Button> &button, const glm::
         return;
     }
     button->setBorderColor(baseColor);
-    button->setTintBorderFill(true);
 }
 
 void HUD::preload(IGUI &gui) {
@@ -364,17 +392,19 @@ void HUD::onGUILoaded() {
     _controls.LBL_DEBILATATED1->setVisible(false);
     _controls.LBL_DEBILATATED2->setVisible(false);
     _controls.LBL_DEBILATATED3->setVisible(false);
-    _controls.LBL_DISABLE1->setVisible(false);
-    _controls.LBL_DISABLE2->setVisible(false);
-    _controls.LBL_DISABLE3->setVisible(false);
+    // Layouts name the disabled marks either way, or lack them.
+    for (auto &disabled : {_controls.LBL_DISABLED1, _controls.LBL_DISABLED2, _controls.LBL_DISABLED3,
+                           _controls.LBL_DISABLE1, _controls.LBL_DISABLE2, _controls.LBL_DISABLE3}) {
+        if (disabled) {
+            disabled->setVisible(false);
+        }
+    }
     _controls.LBL_JOURNAL->setVisible(false);
     _controls.LBL_HEALTHBG->setVisible(false);
     _controls.LBL_ITEMRCVD->setVisible(false);
     _controls.LBL_ITEMLOST->setVisible(false);
     _controls.LBL_LIGHTSHIFT->setVisible(false);
     _controls.LBL_MAP->setVisible(false);
-    _controls.LBL_MOULDING1->setVisible(false);
-    _controls.LBL_MOULDING3->setVisible(false);
     _controls.LBL_NAME->setVisible(false);
     _controls.LBL_NAMEBG->setVisible(false);
     _controls.LBL_PLOTXP->setVisible(false);
@@ -382,7 +412,10 @@ void HUD::onGUILoaded() {
     _controls.LBL_ARROW->setVisible(false);
     _controls.BTN_TARGET0->setVisible(false);
 
+    // KotOR shows its three mouldings; TSL only the second.
     if (_game.isTSL()) {
+        _controls.LBL_MOULDING1->setVisible(false);
+        _controls.LBL_MOULDING3->setVisible(false);
         // The weapon swap queues through the leader's combat round.
         _controls.BTN_SWAPWEAPONS->setOnClick([this]() {
             if (auto leader = _game.party().getLeader()) {
@@ -397,15 +430,9 @@ void HUD::onGUILoaded() {
         tintHUDMenuButton(_controls.BTN_JOU, _baseColor);
         tintHUDMenuButton(_controls.BTN_MAP, _baseColor);
         tintHUDMenuButton(_controls.BTN_OPT, _baseColor);
-        // The bar backings are colour masks like the rest of the TSL HUD.
-        for (auto &bar : {_controls.PB_VIT1, _controls.PB_VIT2, _controls.PB_VIT3,
-                          _controls.PB_FORCE1, _controls.PB_FORCE2, _controls.PB_FORCE3}) {
-            bar->setTintBorderFill(true);
-        }
     } else {
         _controls.LBL_COMBATBG1->setVisible(false);
         _controls.LBL_COMBATBG2->setVisible(false);
-        _controls.LBL_MOULDING2->setVisible(false);
     }
 
     _controls.BTN_EQU->setOnClick([this]() {
@@ -452,7 +479,7 @@ void HUD::onGUILoaded() {
     // It also takes the rejection message off the action bar.
     _controls.BTN_CLEARALL->setOnClick([this]() {
         const auto leader = _game.party().getLeader();
-        leader->setClientCombatMode(false);
+        leader->setPartyCombatMode(false);
         _game.combat().clearAllOrders(*leader);
         _actionBar.clearRejection();
     });
@@ -529,7 +556,6 @@ void HUD::loadNoticeBox() {
     border.dimension = kNoticeBoxBorderDimension;
     notice->setBorder(border);
     notice->setHilight(border);
-    notice->setTintBorderFill(true);
     notice->setTextFont(_services.resource.fonts.get(kNoticeBoxFont));
     notice->setTextAlignment(Control::TextAlign::LeftTop);
     notice->setTextColor(kNoticeBoxTextColor);
@@ -590,14 +616,34 @@ void HUD::updatePausePanel(float dt) {
         return;
     }
     const PauseReason reason = _game.pauseReason();
-    if (_pauseLayoutReason != reason) {
+    if (_pauseLayoutReason != reason || _pauseLayoutPlace != pausePlace()) {
         layoutPausePanel(reason);
     }
     _pauseGUI->update(dt);
 }
 
+int HUD::pausePlace() const {
+    switch (_game.currentScreen()) {
+    case Game::Screen::SwoopRace:
+        return 1;
+    case Game::Screen::Turret:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+void HUD::renderMinigamePause() {
+    if (isPausePanelShown() && _pauseLayoutReason) {
+        _pauseGUI->render();
+    }
+}
+
 void HUD::layoutPausePanel(PauseReason reason) {
     _pauseLayoutReason = reason;
+    _pauseLayoutPlace = pausePlace();
+    const bool swoop = _pauseLayoutPlace == 1;
+    const bool minigame = _pauseLayoutPlace != 0;
     const auto text = *pauseReasonText(reason);
     const bool tsl = _game.isTSL();
     auto &root = _pauseGUI->rootControl();
@@ -641,7 +687,8 @@ void HUD::layoutPausePanel(PauseReason reason) {
     if (text.press) {
         pressLabel.setExtent(pressExtent);
         if (tsl) {
-            pressLabel.setTextMessage(_game.getInterfaceText(kK2PausePressStrRef));
+            const int press = !minigame ? kK2PausePressStrRef : (swoop ? kK2SwoopPausePressStrRef : kK2MinigamePausePressStrRef);
+            pressLabel.setTextMessage(_game.getInterfaceText(press));
         }
         pressExtent.top = reasonExtent.top + reasonExtent.height + static_cast<int>(std::lround(kPausePromptGap * scale));
         pressExtent.height = textHeight(pressLabel);
@@ -651,11 +698,14 @@ void HUD::layoutPausePanel(PauseReason reason) {
     panelExtent.height = last.top + last.height + static_cast<int>(std::lround(kPausePanelBottomPadding * scale));
     Control::Extent unpauseExtent {reasonExtent.left, reasonExtent.top, reasonExtent.width, panelExtent.height};
 
-    // Top-right, just under the menu bar.
+    // Top-right, just under the menu bar; in a minigame, centred.
     const int screenWidth = _game.options().graphics.width;
     const auto &menuButton = _controls.BTN_EQU->extent();
     panelExtent.top = menuButton.top + menuButton.height - 1;
-    if (tsl) {
+    if (minigame) {
+        panelExtent.left = (screenWidth - panelExtent.width) / 2;
+        panelExtent.top = (_game.options().graphics.height - panelExtent.height) / 2;
+    } else if (tsl) {
         const float scalar = interfaceScalar(true, screenWidth);
         panelExtent.top += static_cast<int>(kK2PausePanelTop * scalar);
         panelExtent.left = static_cast<int>(static_cast<float>(screenWidth - panelExtent.width) - scalar * kK2PausePanelRight);
@@ -716,7 +766,7 @@ void HUD::presentAlignmentShift(const StatusSummaryBatch &batch) {
     if (dark == light) {
         return;
     }
-    _services.audio.mixer.play(_services.game.guiSounds.getAlignmentShift(light > dark), AudioType::Sound);
+    _services.game.guiSounds.play(_services.game.guiSounds.getAlignmentShift(light > dark));
     auto leader = _game.party().getLeader();
     if (!leader->isPlayerCreated()) {
         return;
@@ -728,6 +778,19 @@ void HUD::presentAlignmentShift(const StatusSummaryBatch &batch) {
     _game.bindEffectCreator(instance);
     instance.setDuration(DurationType::Instant, 0.0f);
     leader->applyEffect(std::move(instance));
+}
+
+void HUD::playSummarySounds(const StatusSummaryBatch &batch) {
+    auto &sounds = _services.game.guiSounds;
+    if (batch.levelUpSound) {
+        sounds.play(sounds.getOnLevelUpNotify());
+    }
+    if (batch.questNewSound) {
+        sounds.play(sounds.getQuestNewNotify());
+    }
+    if (batch.questCompleteSound) {
+        sounds.play(sounds.getQuestCompleteNotify());
+    }
 }
 
 void HUD::flashStatus(StatusSummaryCategory category) {
@@ -775,8 +838,7 @@ void HUD::resetStatusSummaryPresentation() {
 void HUD::onClick(const std::string &control) {
     // The pause, solo and stealth toggles click like checkboxes.
     if (control == "TB_PAUSE" || control == "TB_SOLO" || control == "TB_STEALTH") {
-        auto clip = _services.game.guiSounds.getCheckboxCheck();
-        _audioSource = _services.audio.mixer.play(std::move(clip), AudioType::Sound);
+        _audioSource = _services.game.guiSounds.play(_services.game.guiSounds.getCheckboxCheck());
         return;
     }
     // An action slot sounds its own acceptance or rejection, with no click before it.
@@ -826,18 +888,15 @@ void HUD::update(float dt) {
     auto &summary = _game.statusSummary();
     if (_statusSummary && !_game.feedbackOptions().statusSummary) {
         // With the summary option off, the pending rows only flash their
-        // indicators, a pending level-up chime plays, and the batch is
-        // dropped.
+        // indicators, the pending sounds play, and the batch is dropped.
         const auto &pending = summary.pending();
         for (auto category : pending.activeCategories()) {
             if (pending.flashes(category, _game.isTSL())) {
                 flashStatus(category);
             }
         }
+        playSummarySounds(pending);
         presentAlignmentShift(pending);
-        if (pending.levelUpSound) {
-            _services.audio.mixer.play(_services.game.guiSounds.getOnLevelUpNotify(), AudioType::Sound);
-        }
         const bool reported = !pending.empty();
         summary.discardPending();
         if (reported) {
@@ -846,14 +905,10 @@ void HUD::update(float dt) {
     } else if (_statusSummary && _statusSummary->presentPending()) {
         // The summary takes all input, releases included; steering stops.
         _game.stopMovement();
-        auto clip = _services.resource.audioClips.get("gui_quest");
-        _audioSource = _services.audio.mixer.play(std::move(clip), AudioType::Sound);
+        playSummarySounds(*summary.displayed());
         presentAlignmentShift(*summary.displayed());
-        if (summary.displayed()->levelUpSound) {
-            _services.audio.mixer.play(_services.game.guiSounds.getOnLevelUpNotify(), AudioType::Sound);
-        }
-    } else if (summary.takeLevelUpSound()) {
-        _services.audio.mixer.play(_services.game.guiSounds.getOnLevelUpNotify(), AudioType::Sound);
+    } else if (const auto sounds = summary.takeSoundBatch()) {
+        playSummarySounds(*sounds);
     }
 
     Party &party = _game.party();
@@ -902,11 +957,9 @@ void HUD::update(float dt) {
             LBL_CHAR.setVisible(true);
             LBL_CHAR.setBorderFill(member->portrait());
             LBL_BACK.setVisible(true);
-            // A fallen member shows no mark; otherwise a pending level-up
-            // shows ahead of being held helpless.
-            const bool down = member->isDead() || member->isTemporarilyDead();
-            const bool levelUp = !down && member->isLevelUpPending();
-            const bool debilitated = !down && !levelUp && member->isDebilitated();
+            const PortraitState state = portraitState(*member);
+            const bool levelUp = state == PortraitState::LevelUp;
+            const bool debilitated = state == PortraitState::Debilitated;
             // A member standing able to level up raises the level-up chime
             // once, until it levels up again.
             if (levelUp && member->isLevelUpChimeArmed()) {
@@ -952,7 +1005,7 @@ void HUD::update(float dt) {
     }
 
     // With no one under control there is no combat mode to show.
-    if (auto leader = party.getLeader(); leader && leader->clientCombatMode()) {
+    if (auto leader = party.getLeader(); leader && leader->partyCombatMode()) {
         toggleCombat(true);
         refreshActionQueueItems();
     } else {
@@ -961,11 +1014,16 @@ void HUD::update(float dt) {
 
     updateCombatMessage(dt);
     for (size_t i = 0; i < _statusFlashes.size(); ++i) {
-        auto label = statusFlashLabel(static_cast<StatusSummaryCategory>(i));
+        const auto category = static_cast<StatusSummaryCategory>(i);
+        auto label = statusFlashLabel(category);
         if (!label) {
             continue;
         }
-        _statusFlashes[i].update(dt);
+        // An indicator other than the journal's sounds the new quest notice
+        // as its flash gets under way; it plays with the next summary.
+        if (_statusFlashes[i].update(dt) && category != StatusSummaryCategory::Journal) {
+            summary.submitQuestSound(false);
+        }
         label->get().setVisible(_statusFlashes[i].visible());
     }
 
@@ -977,8 +1035,11 @@ void HUD::update(float dt) {
         _statusSummary->update(dt);
     }
 
-    // Hide minimap when there is no image to display
-    _controls.LBL_MAPBORDER->setVisible(_game.map().isLoaded());
+    // The minimap and its button show only while there is a map to show and
+    // the party's map isn't disabled.
+    const bool minimap = _game.map().isLoaded() && !_game.map().isDisabled();
+    _controls.LBL_MAPBORDER->setVisible(minimap);
+    _controls.BTN_MINIMAP->setVisible(minimap);
 
     if (_capturePresentation) {
         _controls.LBL_CHAR1->setVisible(true);
@@ -1010,7 +1071,7 @@ void HUD::showTransitionCapturePresentation(const std::string &destination) {
         throw std::runtime_error("Area-transition GUI is unavailable");
     }
     _captureTransitionPresentation = true;
-    _areaTransition->show(destination);
+    _areaTransition->show(destination, _game.party().isReadyToTravel());
 }
 
 void HUD::clearCapturePresentation() {
@@ -1034,7 +1095,7 @@ void HUD::updateTransitionPresentation() {
     }
     auto candidate = currentTransitionCandidate();
     if (candidate) {
-        _areaTransition->show(candidate->destination);
+        _areaTransition->show(candidate->destination, _game.party().isReadyToTravel());
     } else {
         _areaTransition->hide();
     }
@@ -1080,7 +1141,7 @@ void HUD::render() {
     if (_areaTransition && _areaTransition->isVisible()) {
         _areaTransition->render();
     }
-    _select.render();
+    _select.render(_actionBar.isLeaderDown());
     _actionBar.render(_gui->scale());
     _game.floatingText().render();
 }
@@ -1211,10 +1272,12 @@ void HUD::refreshActionQueueItems() const {
         *_controls.LBL_QUEUE1,
         *_controls.LBL_QUEUE2,
         *_controls.LBL_QUEUE3};
-    // The leader's round action under way, if any.
+    // The entry the leader's dispatcher last handed on, if any, and whether
+    // the leader's round action is under way.
     const auto current = _game.combat().currentRoundAction(*leader);
+    const bool running = _game.combat().isRoundActionUnderWay(*leader);
     // An icon takes the next slot and no icon takes none. The first slot is
-    // dimmed while nothing is under way.
+    // dimmed while no round action is under way.
     size_t shown = 0;
     auto show = [&](const std::shared_ptr<graphics::Texture> &icon) {
         if (!icon || shown == queueLabels.size()) {
@@ -1222,7 +1285,7 @@ void HUD::refreshActionQueueItems() const {
         }
         Label &label = queueLabels[shown].get();
         label.setBorderFill(icon);
-        label.setBorderAlpha(shown == 0 && !current ? kIdleActionQueueOpacity : 1.0f);
+        label.setBorderAlpha(shown == 0 && !running ? kIdleActionQueueOpacity : 1.0f);
         label.setVisible(true);
         ++shown;
     };
@@ -1265,10 +1328,10 @@ void HUD::refreshActionQueueItems() const {
 
     // Only attacks, casts, item uses and the round dispatcher show. The first
     // attack, cast or item use, or the dispatcher while a round action is
-    // under way, shows the action under way: an attack as that action, a cast
+    // under way, shows the entry last handed on: an attack as that entry, a cast
     // or item use as itself. Without one an attack shows nothing. The
     // dispatcher then shows each entry still pending, or with none pending
-    // and nothing shown yet, the stance or attack its round serves.
+    // and nothing shown yet, the attack its round serves.
     SmallVector<Combat::PendingEntry, kActionQueueSize> pending;
     _game.combat().pendingScheduled(*leader, pending);
     bool currentShown = false;
@@ -1282,7 +1345,7 @@ void HUD::refreshActionQueueItems() const {
         const SavedActionType type = node->type();
         const bool dispatcher = type == SavedActionType::CombatDispatch;
         const bool cast = type == SavedActionType::CastSpell || type == SavedActionType::ItemCastSpell;
-        if (((dispatcher && current) || cast || type == SavedActionType::AttackObject) && !currentShown) {
+        if (((dispatcher && running && current) || cast || type == SavedActionType::AttackObject) && !currentShown) {
             currentShown = true;
             if (cast) {
                 show(commandIcon(node->action->combatAction()));
@@ -1295,7 +1358,7 @@ void HUD::refreshActionQueueItems() const {
         }
         if (pending.empty()) {
             if (!currentShown) {
-                show(namedIcon(leader->isInTotalDefense() ? kDefensiveStanceIcon : g_attackIcon));
+                show(namedIcon(g_attackIcon));
             }
             continue;
         }
@@ -1339,6 +1402,9 @@ void HUD::renderEffectStacks() {
                 continue;
             }
             auto member = party.getMember(*memberIndex);
+            if (portraitState(*member) != PortraitState::Normal) {
+                continue;
+            }
             const bool leader = *memberIndex == 0;
             const auto &portrait = portraits[portraitIndex]->extent();
             auto counts = member->effectStackCounts();

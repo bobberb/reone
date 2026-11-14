@@ -29,6 +29,7 @@
 #include "reone/game/object/module.h"
 #include "reone/game/party.h"
 #include "reone/game/script/runner.h"
+#include "reone/game/shaperules.h"
 #include "reone/resource/2da.h"
 #include "reone/resource/di/services.h"
 #include "reone/resource/provider/2das.h"
@@ -43,18 +44,32 @@ namespace reone {
 
 namespace game {
 
+// The fields an encounter placed from its template takes from its area entry.
+static const std::vector<std::string> kEntryFields {"XPosition", "YPosition", "ZPosition", "Geometry", "SpawnPointList"};
+
+// An encounter placed from its template takes everything from the template
+// but what its entry gives: its position, 0 where the entry has none, and its
+// geometry and spawn points. A saved encounter takes everything from its
+// record.
 void Encounter::deserialize(
     const resource::Gff &gff,
     const SerializedIdentityContext &identityContext) {
     std::string templateRes;
+    std::shared_ptr<Gff> ute;
     if (!identityContext.isSerializedState() &&
         gff.readResRef(templateRes, "TemplateResRef")) {
-        if (auto ute = _services.resource.gffs.get(templateRes, ResType::Ute)) {
-            deserializeAll(*ute, SerializedIdentityContext::templateResource(templateRes));
-            captureAuthoredRecord(*ute, gff);
-        }
+        ute = _services.resource.gffs.get(templateRes, ResType::Ute);
     }
-    deserializeAll(gff, identityContext);
+    if (ute) {
+        deserializeAll(*ute, SerializedIdentityContext::templateResource(templateRes));
+        captureAuthoredRecord(*ute, gff, kEntryFields);
+        placeAtEntryPosition(gff);
+        deserializeGeometry(gff);
+        deserializeSpawnPoints(gff);
+        updateTransform();
+    } else {
+        deserializeAll(gff, identityContext);
+    }
     // The creature list is kept in descending challenge rating.
     std::stable_sort(_creatures.begin(), _creatures.end(), [](const auto &a, const auto &b) { return a._cr > b._cr; });
 }
@@ -160,7 +175,12 @@ void Encounter::deserializeCreatures(const resource::Gff &gff) {
     }
 }
 
+// A record with a geometry list, even an empty one, replaces the geometry.
 void Encounter::deserializeGeometry(const resource::Gff &gff) {
+    if (!gff.has("Geometry")) {
+        return;
+    }
+    _geometry.clear();
     for (const auto &pointGff : gff.getList("Geometry")) {
         glm::vec3 point;
         pointGff->readFloat(point[0], "X");
@@ -170,7 +190,13 @@ void Encounter::deserializeGeometry(const resource::Gff &gff) {
     }
 }
 
+// A record with a spawn point list, even an empty one, replaces the spawn
+// points.
 void Encounter::deserializeSpawnPoints(const resource::Gff &gff) {
+    if (!gff.has("SpawnPointList")) {
+        return;
+    }
+    _spawnPoints.clear();
     for (const auto &pointGff : gff.getList("SpawnPointList")) {
         SpawnPoint point;
         pointGff->readFloat(point.position[0], "X");
@@ -233,7 +259,17 @@ void Encounter::update(float dt) {
 }
 
 bool Encounter::contains(const glm::vec3 &point) const {
-    return isInPolygon2D(glm::vec2(point - _position), _geometry);
+    return isInPolygon2D(glm::vec2(point - _position), _geometry) && isAtLevel(point);
+}
+
+bool Encounter::crosses(const glm::vec3 &from, const glm::vec3 &to) const {
+    return shape::crossesOutline(glm::vec2(from - _position), glm::vec2(to - _position), _geometry) &&
+           (isAtLevel(from) || isAtLevel(to));
+}
+
+bool Encounter::isAtLevel(const glm::vec3 &point) const {
+    const auto area = spatialArea();
+    return !area || area->get().isAtLevelOf(point, _position.z);
 }
 
 void Encounter::setActive(bool active) {
@@ -243,19 +279,27 @@ void Encounter::setActive(bool active) {
     }
 }
 
-// A difficulty outside the table, or a blank one, leaves the encounter's as it was.
+// A difficulty outside the table leaves the encounter's as it was; a blank one
+// sets 0.
 void Encounter::setDifficulty(int difficultyIndex) {
-    if (const auto difficulty = _services.game.combatTables.encounterDifficulty(difficultyIndex)) {
-        _difficulty = *difficulty;
+    const auto &tables = _services.game.combatTables;
+    if (difficultyIndex < 0 || difficultyIndex >= tables.encounterDifficultyCount()) {
+        return;
     }
+    _difficulty = tables.encounterDifficulty(difficultyIndex).value_or(0);
 }
 
 // The creature signals the encounter when it enters or leaves; the signal is
 // handled with the other queued events rather than in the middle of its move.
-void Encounter::updateOccupancy(const std::shared_ptr<Creature> &creature, bool announce) {
+// A step that passes through the outline signals both, in the order it
+// crossed.
+void Encounter::updateOccupancy(const std::shared_ptr<Creature> &creature, bool announce, std::optional<glm::vec3> from) {
     const bool inside = contains(creature->position());
     const bool known = _occupants.count(creature->id()) != 0;
     if (inside == known) {
+        if (announce && from && crosses(*from, creature->position())) {
+            _game.queuePassage(*this, creature, inside);
+        }
         return;
     }
     if (inside) {

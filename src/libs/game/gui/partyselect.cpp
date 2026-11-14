@@ -17,6 +17,7 @@
 
 #include "reone/game/gui/partyselect.h"
 
+#include <array>
 #include <utility>
 
 #include "reone/game/di/services.h"
@@ -51,12 +52,26 @@ static constexpr int kMaxFollowerCount = 2;
 
 static int g_strRefAdd = 38455;
 static int g_strRefRemove = 38456;
+static constexpr int kStrRefCannotChangeHere = 108426;
+static constexpr int kStrRefCannotChangeInCombat = 126692;
+static constexpr int kStrRefCannotChangeWhileUnconscious = 126693;
+static constexpr int kStrRefMustStayInParty = 42406;
+static constexpr int kStrRefUnableToJoinParty = 42376;
+static constexpr int kTSLStrRefUnableToLeaveParty = 108425;
+
+// The portrait of a companion that cannot be selected is drawn faint.
+static constexpr float kUnselectablePortraitAlpha = 0.25f;
+
+static constexpr int kStrRefAvailableSlots = 1564;
 
 static glm::vec3 g_kotorColorOn = {0.984314f, 1.0f, 0};
-// Neither game specifies an in-party colour in the layout. K1 uses green
-// for an active companion.
+// KotOR's layout specifies no in-party colour. It uses green for an active
+// companion.
 static glm::vec3 g_kotorColorAdded = {0, 0.831373f, 0.090196f};
-static glm::vec3 g_tslColorAdded = {1.0f, 1.0f, 1.0f};
+// TSL tells a slot's states apart by its frame alone: the interface colour,
+// or the layout's border colour for a companion in the party, dimmed by this
+// much unless the slot is the chosen one.
+static constexpr float kTSLUnchosenFrameBrightness = 0.67f;
 
 PartySelection::PartySelection(Game &game, ServicesView &services) :
     GameGUI(game, services) {
@@ -77,26 +92,20 @@ void PartySelection::onGUILoaded() {
         // LBL_BAR1 and LBL_BAR2 are not a section-title strip here: they are
         // authored twenty pixels apart with the available-slot count centred
         // between them. Collapsing them the way the in-game menus do strands
-        // the count below the strip, so the bars keep their authored places
-        // and only take the shell tint.
-        tintK2InGameHeader();
-        for (auto &control : {
-                 _controls.LBL_NA0, _controls.LBL_NA1, _controls.LBL_NA2, _controls.LBL_NA3,
-                 _controls.LBL_NA4, _controls.LBL_NA5, _controls.LBL_NA6, _controls.LBL_NA7,
-                 _controls.LBL_NA8, _controls.LBL_NA9, _controls.LBL_NA10, _controls.LBL_NA11}) {
-            control->setTintBorderFill(true);
-        }
+        // the count below the strip, so the bars keep their authored places.
         useK2ShellTitle(_controls.LBL_TITLE);
         for (auto &button : {_controls.BTN_ACCEPT, _controls.BTN_DONE, _controls.BTN_BACK}) {
             enableK2ButtonBodyFill(button);
         }
     }
+    _acceptTextColor = _controls.BTN_ACCEPT->text().color;
 
     for (int i = 0; i < npcCount(); ++i) {
         ToggleButton &button = getNpcButton(i);
-        button.setOnColor(g_kotorColorOn);
-        button.setBorderColorOverride(_game.isTSL() ? g_tslColorAdded : g_kotorColorAdded);
-        button.setUseBorderColorOverride(false);
+        if (!_game.isTSL()) {
+            button.setOnColor(g_kotorColorOn);
+            button.setBorderColorOverride(g_kotorColorAdded);
+        }
     }
 
     bindEventHandlers();
@@ -113,7 +122,17 @@ void PartySelection::bindEventHandlers() {
                 selectedNpcs.push_back(npc);
             }
         }
+        std::array<bool, kMaxNpcCount> wasMember {};
+        for (int npc = 0; npc < npcCount(); ++npc) {
+            wasMember[npc] = _game.party().isMember(npc);
+        }
         _game.reconcilePartySelection(selectedNpcs);
+        // A companion that left the party goes with the screen.
+        for (int npc = 0; npc < npcCount(); ++npc) {
+            if (wasMember[npc] && !_game.party().isMember(npc)) {
+                _materialized[npc] = true;
+            }
+        }
         releaseMaterialized();
         _game.openInGame();
         if (!_context.exitScript.empty()) {
@@ -169,6 +188,10 @@ void PartySelection::bindEventHandlers() {
 }
 
 void PartySelection::prepare(const PartySelectionContext &ctx) {
+    // In KotOR the screen opens with the player character leading.
+    if (!_game.isTSL()) {
+        _game.party().leadWithPlayerCharacter();
+    }
     _gui->setEventListener(*this);
     bindEventHandlers();
     _game.requestTutorialWindow(kPartySelectionTutorial);
@@ -176,12 +199,10 @@ void PartySelection::prepare(const PartySelectionContext &ctx) {
     _context = ctx;
     _availableCount = kMaxFollowerCount;
     _selectedNpc = -1;
+    _controls.BTN_ACCEPT->setTextColor(_acceptTextColor);
 
     for (int i = 0; i < kMaxNpcCount; ++i) {
         _added[i] = false;
-    }
-    for (int i = 0; i < npcCount(); ++i) {
-        getNpcButton(i).setUseBorderColorOverride(false);
     }
     refreshNpcButtons();
 
@@ -242,20 +263,22 @@ void PartySelection::prepare(const PartySelectionContext &ctx) {
             BTN_NPC.setDisabled(false);
             BTN_NPC.setVisible(true);
             LBL_CHAR.setBorderFill(std::move(portrait));
+            LBL_CHAR.setBorderAlpha(party.isRosterSelectable({RosterKind::Npc, i}) ? 1.0f : kUnselectablePortraitAlpha);
             LBL_NA.setVisible(false);
         } else {
             BTN_NPC.setDisabled(true);
             BTN_NPC.setVisible(true);
             LBL_CHAR.setBorderFill(std::shared_ptr<Texture>(nullptr));
-            LBL_NA.setVisible(true);
+            LBL_CHAR.setBorderAlpha(1.0f);
+            // TSL shows an empty slot as its button's frame alone.
+            LBL_NA.setVisible(!_game.isTSL());
         }
     }
     if (_game.isTSL()) {
         // Handmaiden/Disciple and Mira/Hanharr are authored on one shared
-        // slot each. The not-available overlay belongs to the slot, not to
-        // each NPC: with one of the pair available, the other's overlay and
-        // disabled button frame would draw over the occupant's portrait, and
-        // with both away a single overlay is enough.
+        // slot each. With one of the pair available, the other's disabled
+        // button frame would draw over the occupant's portrait, and with both
+        // away a single frame is enough.
         static constexpr std::pair<int, int> kSharedSlots[] {
             {4, 11}, // Handmaiden, Disciple
             {7, 10}, // Mira, Hanharr
@@ -263,10 +286,9 @@ void PartySelection::prepare(const PartySelectionContext &ctx) {
         for (const auto &slot : kSharedSlots) {
             bool firstAvailable = party.isMemberAvailable(slot.first);
             bool secondAvailable = party.isMemberAvailable(slot.second);
-            naLabels[slot.first]->setVisible(!firstAvailable && !secondAvailable);
-            naLabels[slot.second]->setVisible(false);
-            getNpcButton(slot.first).setVisible(firstAvailable || !secondAvailable);
-            getNpcButton(slot.second).setVisible(secondAvailable);
+            const auto [firstVisible, secondVisible] = sharedSlotVisibility(firstAvailable, secondAvailable);
+            getNpcButton(slot.first).setVisible(firstVisible);
+            getNpcButton(slot.second).setVisible(secondVisible);
         }
     }
     refreshAvailableCount();
@@ -279,7 +301,7 @@ void PartySelection::addNpc(int npc) {
 
     --_availableCount;
     _added[npc] = true;
-    getNpcButton(npc).setUseBorderColorOverride(true);
+    refreshNpcButtons();
     refreshAvailableCount();
 }
 
@@ -308,16 +330,52 @@ int PartySelection::npcCount() const {
     return _game.isTSL() ? kTSLNpcCount : kKotorNpcCount;
 }
 
+std::optional<int> PartySelection::partyLockStrRef() const {
+    if (!_game.isTSL() || _context.openedByScript) {
+        return std::nullopt;
+    }
+    const Party &party = _game.party();
+    auto player = party.player();
+    if (_game.module()->area()->isUnescapable() || (player && !player->isPlayerCreated())) {
+        return kStrRefCannotChangeHere;
+    }
+    if (!party.isReadyToTravel()) {
+        return kStrRefCannotChangeWhileUnconscious;
+    }
+    if (party.isInCombat()) {
+        return kStrRefCannotChangeInCombat;
+    }
+    return std::nullopt;
+}
+
+std::optional<int> PartySelection::companionLockStrRef(int npc) const {
+    if (npc == _context.forceNpc1 || npc == _context.forceNpc2) {
+        return kStrRefMustStayInParty;
+    }
+    if (_game.party().isRosterSelectable({RosterKind::Npc, npc})) {
+        return std::nullopt;
+    }
+    return _game.isTSL() && _added[npc] ? kTSLStrRefUnableToLeaveParty : kStrRefUnableToJoinParty;
+}
+
 void PartySelection::onAcceptButtonClick() {
+    if (auto lockStrRef = partyLockStrRef()) {
+        _game.showMessagePopup(_services.resource.strings.getText(*lockStrRef));
+        return;
+    }
     if (_selectedNpc == -1)
         return;
+    if (auto lockStrRef = companionLockStrRef(_selectedNpc)) {
+        _game.showMessagePopup(_services.resource.strings.getText(*lockStrRef));
+        return;
+    }
 
     bool added = _added[_selectedNpc];
-    if (added && _context.forceNpc1 != _selectedNpc && _context.forceNpc2 != _selectedNpc) {
+    if (added) {
         removeNpc(_selectedNpc);
         refreshAcceptButton();
 
-    } else if (!added && _availableCount > 0) {
+    } else if (_availableCount > 0) {
         addNpc(_selectedNpc);
         refreshAcceptButton();
     }
@@ -329,7 +387,7 @@ void PartySelection::clearSelection() {
 }
 
 // Leaving the screen destroys each companion it brought into being that did
-// not join the party.
+// not join the party, and each that left the party.
 void PartySelection::releaseMaterialized() {
     for (int npc = 0; npc < npcCount(); ++npc) {
         if (_materialized[npc] && !_game.party().isMember(npc)) {
@@ -339,19 +397,24 @@ void PartySelection::releaseMaterialized() {
     }
 }
 
+// KotOR names the count in a label beside it; TSL's one label holds both.
 void PartySelection::refreshAvailableCount() {
-    _controls.LBL_COUNT->setTextMessage(std::to_string(_availableCount));
+    const bool tsl = _game.isTSL();
+    const std::string label = tsl ? _services.resource.strings.getText(kStrRefAvailableSlots) : "";
+    _controls.LBL_COUNT->setTextMessage(availableCountText(_availableCount, tsl, label));
 }
 
 void PartySelection::refreshAcceptButton() {
     std::string text(_services.resource.strings.getText(_added[_selectedNpc] ? g_strRefRemove : g_strRefAdd));
     _controls.BTN_ACCEPT->setTextMessage(text);
+    // The caption is greyed for a companion that cannot be changed.
+    _controls.BTN_ACCEPT->setTextColor(companionLockStrRef(_selectedNpc) ? _disabledColor : _acceptTextColor);
 }
 
 void PartySelection::removeNpc(int npc) {
     ++_availableCount;
     _added[npc] = false;
-    getNpcButton(npc).setUseBorderColorOverride(false);
+    refreshNpcButtons();
     refreshAvailableCount();
 }
 
@@ -366,15 +429,40 @@ void PartySelection::onNpcButtonClick(int npc) {
 }
 
 void PartySelection::refreshNpcButtons() {
+    const bool tsl = _game.isTSL();
     for (int i = 0; i < npcCount(); ++i) {
         ToggleButton &button = getNpcButton(i);
-
-        if ((i == _selectedNpc && !button.isOn()) ||
-            (i != _selectedNpc && button.isOn())) {
-
-            button.toggle();
+        const bool chosen = i == _selectedNpc;
+        if (tsl) {
+            button.setBorderColorOverride(tslFrameColor(_baseColor, button.border().color, _added[i], chosen));
+            button.setUseBorderColorOverride(true);
+            continue;
         }
+        button.setOn(chosen);
+        button.setUseBorderColorOverride(_added[i]);
     }
+}
+
+glm::vec3 PartySelection::tslFrameColor(
+    const glm::vec3 &baseColor,
+    const glm::vec3 &inPartyColor,
+    bool inParty,
+    bool chosen) {
+
+    const glm::vec3 color = inParty ? inPartyColor : baseColor;
+    return chosen ? color : color * kTSLUnchosenFrameBrightness;
+}
+
+std::pair<bool, bool> PartySelection::sharedSlotVisibility(bool firstAvailable, bool secondAvailable) {
+    return {firstAvailable || !secondAvailable, secondAvailable};
+}
+
+std::string PartySelection::availableCountText(int count, bool tsl, const std::string &label) {
+    std::string result(std::to_string(count));
+    if (tsl) {
+        result += " " + label;
+    }
+    return result;
 }
 
 } // namespace game

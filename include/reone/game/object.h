@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -54,6 +55,7 @@ class Action;
 class Area;
 class Game;
 class Item;
+class Lock;
 class ModuleSnapshotBuilder;
 class Room;
 class Trap;
@@ -100,12 +102,21 @@ public:
      * script runs nothing.
      */
     static constexpr char kFallbackConversationScript[] = "k_hen_dialogue01";
+    /** Sight and reach lines run between points this far above the objects' positions. */
+    static constexpr float kEyeHeight = 1.5f;
 
     enum class RuntimeState {
         Constructing,
         Live,
         Retired,
         Presentation,
+    };
+
+    /** An item handed over to another object, and the stack that now holds it. */
+    struct HandedOverItem {
+        std::shared_ptr<Item> item;
+        /** The item itself, the stack it joined, or none when it was counted. */
+        std::shared_ptr<Item> held;
     };
 
     virtual ~Object() = default;
@@ -119,6 +130,13 @@ public:
         const SerializedIdentityContext &identityContext);
     /** Places the object at a record's position, facing its orientation or bearing. */
     void deserializePlacement(const resource::Gff &gff);
+    /** Places the object at the position its area entry names; a coordinate the entry lacks is 0. */
+    void placeAtEntryPosition(const resource::Gff &entry);
+    /**
+     * Places the object at the point its area entry names by X, Y and Z,
+     * facing its bearing; a value the entry lacks is 0.
+     */
+    void placeAtEntryPoint(const resource::Gff &entry);
 
     virtual void update(float dt);
     /**
@@ -129,9 +147,13 @@ public:
     virtual void damage(
         int amount,
         const std::shared_ptr<Object> &damager);
-    /** \p reaction is set for damage other than a weapon hit. */
+    /**
+     * \p dealt is the damage before the difficulty weighs it, \p amount
+     * after. \p reaction is set for damage other than a weapon hit.
+     */
     virtual void applyDamageEffect(
         int amount,
+        int dealt,
         const std::shared_ptr<Object> &damager,
         std::optional<DamageReaction> reaction);
 
@@ -181,12 +203,22 @@ public:
 
     uint32_t id() const { return _id; }
     virtual std::string getOnSpellCastAt() const { return {}; }
+    /** The lock the object carries: a door's or a placeable's; none for any other object. */
+    virtual std::optional<std::reference_wrapper<Lock>> findLock() { return std::nullopt; }
+    /** The lock the object carries: a door's or a placeable's; none for any other object. */
+    virtual std::optional<std::reference_wrapper<const Lock>> findLock() const { return std::nullopt; }
     /** The trap the object carries: a door's, a placeable's or a trigger's; none for any other object. */
     virtual std::optional<std::reference_wrapper<Trap>> findTrap() { return std::nullopt; }
     /** The trap the object carries: a door's, a placeable's or a trigger's; none for any other object. */
     virtual std::optional<std::reference_wrapper<const Trap>> findTrap() const { return std::nullopt; }
     /** Shows \p text over the object for \p duration seconds; no duration clears it. */
     void setFeedbackText(std::string text, float duration);
+    /**
+     * Tell the player the object is locked: the locked sound of its \p lock,
+     * \p soundHeight above it, the locked text over it for five seconds, and
+     * the line in the log.
+     */
+    void presentLocked(const Lock &lock, float soundHeight);
     const std::string &feedbackText() const { return _feedbackText; }
     Game &game() const { return _game; }
     ServicesView &services() const { return _services; }
@@ -200,6 +232,7 @@ public:
     const std::string &blueprintResRef() const { return _blueprintResRef; }
     const std::string &name() const { return _name; }
     const std::string &conversation() const { return _conversation; }
+    /** Whether the object is plot. */
     bool plotFlag() const { return _plot; }
     /**
      * Damage immunity is kept per damage type. For several types in \p flags,
@@ -239,9 +272,15 @@ public:
     Room *room() const { return _room; }
     const glm::vec3 &position() const { return _position; }
     const glm::mat4 &transform() const { return _transform; }
+    /**
+     * Whether the object's model renders. A script can turn it off, and a TSL
+     * creature can start with it off; sight and selection do not read it.
+     */
     bool visible() const { return _visible; }
+    /** How far above the object's position a creature's look at it aims. */
+    virtual float canSeeHeight() const { return kEyeHeight; }
     /** Whether the player's side knows of this object, so it is drawn and can be picked. */
-    bool isClientPresent() const { return _clientPresent; }
+    bool isPresent() const { return _present; }
     std::shared_ptr<scene::SceneNode> sceneNode() const { return _sceneNode; }
 
     void setTag(std::string tag) { _tag = std::move(tag); }
@@ -256,7 +295,7 @@ public:
     /** Faces the object at once. */
     virtual void setFacing(float facing);
     void setVisible(bool visible);
-    void setClientPresent(bool present);
+    virtual void setPresent(bool present);
 
     // Animation
 
@@ -277,16 +316,27 @@ public:
      * counted.
      */
     std::shared_ptr<Item> addItem(const std::string &resRef, int stackSize = 1, std::optional<bool> dropable = true);
-    std::shared_ptr<Item> addItem(const std::shared_ptr<Item> &item);
+    /**
+     * The object takes a live item, as addItem above does. Keeping its own
+     * stack, the item joins none.
+     */
+    std::shared_ptr<Item> addItem(const std::shared_ptr<Item> &item, ItemStacking stacking = ItemStacking::Join);
+    /** One item of a stack leaves the object; the last one takes the stack, which is no longer new. */
     bool removeItem(const std::shared_ptr<Item> &item, bool &last);
     bool removeItemStack(const std::shared_ptr<Item> &item);
-    void moveDropableItemsTo(Object &other);
-    /** Every item moves to other, the last first. */
-    void moveAllItemsTo(Object &other);
+    /**
+     * Every item moves to other, the last first.
+     *
+     * @return each item moved, in the order moved
+     */
+    std::vector<HandedOverItem> moveAllItemsTo(Object &other);
 
     std::shared_ptr<Item> getFirstItem();
     std::shared_ptr<Item> getNextItem();
+    /** The first item with the tag, each item's own items searched right after it; none when no item has it. */
     std::shared_ptr<Item> getItemByTag(const std::string &tag);
+    /** The first item of the type, each item's own items searched before it; none when no item is of it. */
+    std::shared_ptr<Item> getItemByItemType(int itemType) const;
 
     const std::vector<std::shared_ptr<Item>> &items() const { return _items; }
 
@@ -424,8 +474,12 @@ public:
     void addAction(std::shared_ptr<Action> action, std::optional<int> group = std::nullopt);
     /** Queues \p action at the front, choosing its group as addAction() does. */
     void addActionOnTop(std::shared_ptr<Action> action, std::optional<int> group = std::nullopt);
+    /** Queues \p actions at the front as one new group, the first of them first. */
+    void addGroupOnTop(std::vector<std::shared_ptr<Action>> actions);
     /** Queues \p action just before \p parent, in its group; returns false when \p parent is not queued. */
     bool addActionBefore(const Action &parent, std::shared_ptr<Action> action);
+    /** The group of \p action's node, the one running it first; none when it is not queued. */
+    std::optional<int> actionGroup(const Action &action) const;
     /** Drops the actions queued directly behind one, while they match. */
     void removeActionsBehind(const Action &action, const std::function<bool(const Action &)> &matches);
     /**
@@ -542,10 +596,20 @@ public:
         SaveRecordOrigin origin = {});
     /**
      * Keep the record an object placed from a blueprint was made from: the
-     * blueprint's fields, with those the placement gives in their place. A
-     * save writes the object over it.
+     * blueprint's fields, with every field the placement gives in their place.
+     * A save writes the object over it.
      */
     void captureAuthoredRecord(const resource::Gff &blueprint, const resource::Gff &placement);
+    /**
+     * Keep the record an object placed from a blueprint was made from: the
+     * blueprint's fields, with those of \p placementFields the placement gives
+     * in their place. The object takes these fields, and only these, from its
+     * placement. A save writes the object over the record.
+     */
+    void captureAuthoredRecord(
+        const resource::Gff &blueprint,
+        const resource::Gff &placement,
+        const std::vector<std::string> &placementFields);
     const std::optional<SaveRecordProvenance> &saveRecordProvenance() const {
         return _saveRecordProvenance;
     }
@@ -593,10 +657,16 @@ public:
     struct ConversationEvent {
         /** The one who spoke. */
         uint32_t speaker {script::kObjectInvalid};
-        /** The number of the pattern that matched; 0 for a request to talk. */
+        /** The number of the pattern that matched; -1 for a request to talk. */
         int32_t patternNumber {0};
         /** The pieces of the match, after the whole string. */
         std::vector<std::string> matchedPieces;
+        /** The dialog a request to talk names. */
+        std::string conversation;
+        /** A request to talk asks for a private conversation. */
+        bool privateConversation {false};
+        /** A request to talk ignores its start range, as a script's does. */
+        bool ignoreStartRange {false};
     };
 
     /** A pattern the object listens for and the number it answers with. */
@@ -627,22 +697,39 @@ public:
     uint32_t lastSpeaker() const { return _lastSpeaker; }
     int32_t listenPatternNumber() const { return _listenPatternNumber; }
     const std::vector<std::string> &matchedSubstrings() const { return _matchedSubstrings; }
+    /** The dialog the last conversation event named. */
+    const std::string &lastConversation() const { return _lastConversation; }
+    /** Whether the last conversation event asked for a private conversation. */
+    bool isPrivateConversation() const { return _privateConversation; }
     /**
      * A conversation event: a shout the object heard, or a request to talk.
-     * The speaker becomes the last speaker, and the event's pattern number
-     * and pieces the object's own; then its conversation script runs.
+     * The speaker becomes the last speaker, the event's pattern number,
+     * pieces, dialog and privacy the object's own, and its dialog the game's
+     * last conversation; the next conversation begun may start even while
+     * one is under way. Then its conversation script runs.
      */
     void receiveConversationEvent(ConversationEvent event);
 
     // END Listening
 
 protected:
+    /**
+     * Gives a door or placeable its hardness: a resistance to every kind of
+     * damage by that much, unseen by scripts and not saved, as each load
+     * gives it again.
+     */
+    void applyHardness(int hardness);
+
     friend class Game;
     friend class ModuleSnapshotBuilder;
     friend class TestGameModule;
 
-    /** An item taken out of this object's inventory goes to other. */
-    void handOverItem(const std::shared_ptr<Item> &item, Object &other);
+    /**
+     * An item taken out of this object's inventory goes to other.
+     *
+     * @return the stack now holding the item, or null when it was counted
+     */
+    std::shared_ptr<Item> handOverItem(const std::shared_ptr<Item> &item, Object &other);
 
     /**
      * Drops a node of a removed action group, bypassing commandability,
@@ -665,13 +752,26 @@ protected:
      */
     void recordReceivedAttack(uint32_t attackerId, int weaponAttackType);
 
-    // Add one privately constructed Item to a candidate owned graph using the
-    // same stacking rules as runtime inventory insertion. Authoritative saved
-    // identities can be preserved as distinct records during restoration.
+    /**
+     * Adds one privately constructed Item to a candidate owned graph with the
+     * stacking rules of runtime inventory insertion; a loaded item joins an
+     * identical stack whatever saved identity either carries. An item taken
+     * in whole by a stack is discarded, so its saved identity names nothing.
+     *
+     * @return the stack now holding the item
+     */
     std::shared_ptr<Item> appendOwnedItemCandidate(
         std::vector<std::shared_ptr<Item>> &items,
-        const std::shared_ptr<Item> &item,
-        bool preserveSerializedIdentities);
+        const std::shared_ptr<Item> &item);
+    /**
+     * Where a new item goes among the object's items: by base item, then by
+     * name among items of one base item, when the object keeps its items in
+     * order; otherwise first, or last while the items are read from a record,
+     * which keeps the record's order.
+     */
+    size_t itemInsertPosition(const std::vector<std::shared_ptr<Item>> &items, const Item &item) const;
+    /** Puts \p item among \p items where itemInsertPosition places it. */
+    void placeItem(std::vector<std::shared_ptr<Item>> &items, std::shared_ptr<Item> item) const;
     /** Atomically replace canonical effect state and run exact lifecycle hooks. */
     void replaceEffectState(std::deque<EffectInstance> replacement) noexcept;
 
@@ -690,6 +790,7 @@ protected:
     std::string _onHeartbeat;
     std::string _onUserDefined;
     bool _minOneHP {false};
+    /** Whether the object is plot: a record's value or a script's argument sets it when not 0. */
     bool _plot {false};
     bool _commandable {true};
     bool _interruptable {false};
@@ -699,6 +800,19 @@ protected:
     glm::vec3 _position {0.0f};
     glm::quat _orientation {1.0f, 0.0f, 0.0f, 0.0f};
     std::vector<std::shared_ptr<Item>> _items; // FIXME: deserialize
+    /** Whether the object is reading its items from a record, whose order they keep. */
+    bool _loadingItems {false};
+
+    /** Marks the object as reading its items for as long as it lives. */
+    class ItemLoadScope {
+    public:
+        explicit ItemLoadScope(Object &object) :
+            _object(object) { _object._loadingItems = true; }
+        ~ItemLoadScope() { _object._loadingItems = false; }
+
+    private:
+        Object &_object;
+    };
     // END Serializable
 
     /**
@@ -724,7 +838,7 @@ protected:
     RuntimeObjectRef<Object> _dialogOwner;
     glm::mat4 _transform {1.0f};
     bool _visible {true};
-    bool _clientPresent {true};
+    bool _present {true};
     /** Non-owning; Area detachment/destruction clears this before releasing ownership. */
     Area *_spatialArea {nullptr};
     Room *_room {nullptr};
@@ -799,7 +913,11 @@ protected:
     std::vector<SavedScheduledAction> _savedScheduledActions;
     std::vector<bool> _savedScheduledReferencesBound;
     float _savedScheduledTime {0.0f};
-    /** The round hold of a creature owning no round, in seconds, and who holds it. */
+    /**
+     * The round hold of a creature owning no round, in seconds, and who holds
+     * it. A hold comes back from a save with an end of its own: the seconds
+     * it had left.
+     */
     float _savedOwnerHold {0.0f};
     SavedObjectReference _savedOwnerHoldBy;
     /** The creature's saved rounds that no queued command carries. */
@@ -824,6 +942,8 @@ protected:
     uint32_t _lastSpeaker {script::kObjectInvalid};
     int32_t _listenPatternNumber {0};
     std::vector<std::string> _matchedSubstrings;
+    std::string _lastConversation;
+    bool _privateConversation {false};
 
     /** Runs the object's conversation script, as a conversation event does. */
     virtual void runConversationScript() {}
@@ -834,6 +954,11 @@ protected:
            Game &game, ServicesView &services);
 
     virtual void updateTransform();
+    /**
+     * Keeps the model in the scene, animated, while the object is present, and
+     * draws it only while the object renders.
+     */
+    void updateSceneNodeEnabled();
     /** The orientation the scene node shows. */
     virtual glm::quat presentedOrientation() const { return _orientation; }
     virtual bool canExecuteActions() const { return true; }
@@ -842,13 +967,30 @@ protected:
      * running or failing by its own rule; by default, while it can act.
      */
     virtual bool takesUpActions() const { return canExecuteActions(); }
+    /** Whether the object's inventory keeps itself in order. */
+    virtual bool keepsItemsInOrder() const { return false; }
 
+    /**
+     * Replaces the object's items with those of a record's ItemList.
+     *
+     * @param originOwner the owner a saved item's record is kept under; the object's id when empty
+     * @param placedTemplate whether the record is the template of an object an
+     *        area places, whose entries are each their InventoryRes template alone
+     */
     void deserializeOwnedItems(
         const resource::Gff &gff,
         const SerializedIdentityContext &identityContext,
         SaveRecordOriginKind originKind,
-        bool forceDropable = false,
-        std::string originOwner = {});
+        std::string originOwner = {},
+        bool placedTemplate = false);
+    /**
+     * Reads the plot flag of a record. An Invulnerable value takes precedence
+     * over Plot, an explicit zero included; a record holding neither keeps the
+     * current value.
+     *
+     * @param readInvulnerable whether the record's Invulnerable value is read
+     */
+    void deserializePlot(const resource::Gff &gff, bool readInvulnerable);
 
     // Actions
 
@@ -867,6 +1009,8 @@ protected:
      * record it was restored from, else a new group.
      */
     int chooseActionGroup(const Action &action, std::optional<int> group);
+    /** The node holding \p action, the one running it first. */
+    OrdinaryActionQueue::Nodes::const_iterator findActionNode(const Action &action) const;
     /**
      * Any action queued takes a queued random walk off the queue, with the
      * moves and pauses the walk queued in its group. \p incoming is the action
@@ -887,7 +1031,7 @@ protected:
      */
     std::vector<std::pair<size_t, OrdinaryActionQueue::Node>> keptSavedActionAnchors() const;
 
-    void executeActions(float dt);
+    bool executeActions(float dt);
     void executeActionsIfAble(float dt);
 
     // END Actions
